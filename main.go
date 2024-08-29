@@ -122,7 +122,7 @@ func resetDiceState() {
 	defer mutex.Unlock()
 	resultsWaitGroup.Wait() // Ensure all dice roll results are processed
 	diceList = []*Dice{}
-	isPokerRolling, isTriRolling, isBJRolling, isHitting, isClosing = false, false, false, false, false
+	isPokerRolling, isTriRolling, isBJRolling, is13Rolling, isHitting, is13Hitting, isClosing = false, false, false, false, false, false, false
 }
 
 // Handle the throwing of a dice

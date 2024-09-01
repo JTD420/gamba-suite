@@ -1,25 +1,25 @@
 package main
 
 import (
+	"context"
+	"embed"
+	"encoding/json"
+	"fmt"
 	"log"
+	"math/rand"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"golang.org/x/exp/rand"
+	"github.com/wailsapp/wails/v2/pkg/runtime"
 	g "xabbo.b7c.io/goearth"
 	"xabbo.b7c.io/goearth/shockwave/in"
 	"xabbo.b7c.io/goearth/shockwave/out"
 )
-
-var ext = g.NewExt(g.ExtInfo{
-	Title:       "[AIO] Gamba Suite",
-	Description: "Pkr, 13/21 and Tri dice automated rolling and resetting with in-chat hand evaluation. The all-in-one dice management plugin.",
-	Author:      "JTD", //Nanobyte for the original Poker Extension <3
-	Version:     "1.0",
-})
 
 // Global variables for dice management, rolling state, mutex, and wait group
 var (
@@ -39,38 +39,138 @@ var (
 	rollDelay        = 550 * time.Millisecond
 )
 
-func main() {
-	logrus.SetLevel(logrus.InfoLevel)
-	ext.Initialized(onInitialized)
-	ext.Connected(onConnected)
-	ext.Disconnected(onDisconnected)
-	ext.Intercept(out.CHAT, out.SHOUT, out.WHISPER).With(onChatMessage)
-	ext.Intercept(out.THROW_DICE).With(handleThrowDice)
-	ext.Intercept(out.DICE_OFF).With(handleDiceOff)
-	ext.Intercept(in.DICE_VALUE).With(handleDiceResult)
-	ext.Run()
+type App struct {
+	ext      *g.Ext
+	assets   embed.FS
+	log      []string
+	logMu    sync.Mutex
+	configMu sync.Mutex
+	ctx      context.Context
 }
 
-func onInitialized(e g.InitArgs) {
-	log.Println("Extension initialized")
+const appFolderName = "Gamba-Suite"
+const configFileName = "config.json"
+const configFilePath = "./poker_display_config.json"
+
+type PokerDisplayConfig struct {
+	FiveOfAKind  string `json:"five_of_a_kind"`
+	FourOfAKind  string `json:"four_of_a_kind"`
+	FullHouse    string `json:"full_house"`
+	HighStraight string `json:"high_straight"`
+	LowStraight  string `json:"low_straight"`
+	ThreeOfAKind string `json:"three_of_a_kind"`
+	TwoPair      string `json:"two_pair"`
+	OnePair      string `json:"one_pair"`
+	Nothing      string `json:"nothing"`
 }
 
-func onConnected(e g.ConnectArgs) {
-	log.Printf("Game connected (%s)\n", e.Host)
+var defaultConfig = PokerDisplayConfig{
+	FiveOfAKind:  "Five of a kind: %s",
+	FourOfAKind:  "Four of a kind: %s",
+	FullHouse:    "Full House: %s",
+	HighStraight: "High Str8",
+	LowStraight:  "Low Str8",
+	ThreeOfAKind: "Three of a kind: %s",
+	TwoPair:      "Two Pair: %ss",
+	OnePair:      "One Pair: %ss",
+	Nothing:      "Nothing",
 }
 
-func onDisconnected() {
-	log.Println("Game disconnected")
+func NewApp(ext *g.Ext, assets embed.FS) *App {
+	return &App{
+		ext:    ext,
+		assets: assets,
+	}
 }
 
-// onChatMessage processes chat commands to trigger dice actions
-func onChatMessage(e *g.Intercept) {
+func (a *App) startup(ctx context.Context) {
+	a.ctx = ctx
+	a.setupExt()
+	go func() {
+		a.runExt()
+	}()
+}
+
+func (a *App) LoadConfig() *PokerDisplayConfig {
+	configFilePath := getConfigFilePath()
+
+	file, err := os.Open(configFilePath)
+	if err != nil {
+		a.AddLogMsg("Config file not found, loading default values")
+		return &PokerDisplayConfig{
+			FiveOfAKind:  "default_five_of_a_kind",
+			FourOfAKind:  "default_four_of_a_kind",
+			FullHouse:    "default_full_house",
+			HighStraight: "default_high_straight",
+			LowStraight:  "default_low_straight",
+			ThreeOfAKind: "default_three_of_a_kind",
+			TwoPair:      "default_two_pair",
+			OnePair:      "default_one_pair",
+			Nothing:      "default_nothing",
+		}
+	}
+	defer file.Close()
+
+	var config PokerDisplayConfig
+	if err := json.NewDecoder(file).Decode(&config); err != nil {
+		a.AddLogMsg("Error decoding config file: " + err.Error())
+		return nil
+	}
+
+	// Config file loaded successfully
+	return &config
+}
+
+func (a *App) SaveConfig(config *PokerDisplayConfig) {
+	configFilePath := getConfigFilePath()
+
+	file, err := os.Create(configFilePath)
+	if err != nil {
+		a.AddLogMsg("Error creating config file: " + err.Error())
+		return
+	}
+	defer file.Close()
+
+	if err := json.NewEncoder(file).Encode(config); err != nil {
+		a.AddLogMsg("Error encoding config file: " + err.Error())
+		return
+	}
+
+	a.AddLogMsg("Config file saved successfully")
+}
+
+func getConfigFilePath() string {
+	configDir, _ := os.UserConfigDir()
+	configPath := filepath.Join(configDir, "Gamba-Suite")
+	os.MkdirAll(configPath, 0700)
+	return filepath.Join(configPath, "poker_display_config.json")
+}
+
+func (a *App) setupExt() {
+	a.ext.Intercept(out.CHAT, out.SHOUT, out.WHISPER).With(a.onChatMessage)
+	a.ext.Intercept(out.THROW_DICE).With(a.handleThrowDice)
+	a.ext.Intercept(out.DICE_OFF).With(a.handleDiceOff)
+	a.ext.Intercept(in.DICE_VALUE).With(a.handleDiceResult)
+	a.ext.Intercept(out.CHAT).With(a.handleTalk)
+	a.ext.Intercept(out.SHOUT).With(a.handleTalk)
+}
+
+func (a *App) runExt() {
+	defer os.Exit(0)
+	a.ext.Run()
+}
+
+func (a *App) ShowWindow() {
+	runtime.WindowShow(a.ctx)
+}
+
+func (a *App) onChatMessage(e *g.Intercept) {
 	msg := e.Packet.ReadString()
 
 	// Process commands based on the message prefix and suffix
 	if strings.HasPrefix(msg, ":") {
 		// Check if already rolling or closing
-		if isPokerRolling || isTriRolling || isBJRolling || isHitting || isClosing {
+		if isPokerRolling || isTriRolling || isBJRolling || is13Rolling || isHitting || is13Hitting || isClosing {
 			log.Println("Already rolling or closing...")
 			e.Block()
 			return
@@ -84,28 +184,36 @@ func onChatMessage(e *g.Intercept) {
 		case strings.HasSuffix(command, "roll"):
 			e.Block()
 			isPokerRolling = true
-			go rollPokerDice()
+			logRollResult := fmt.Sprintf("Poker Roll:\n")
+			a.AddLogMsg(logRollResult)
+			go a.rollPokerDice()
 		case strings.HasSuffix(command, "tri"):
 			e.Block()
 			isTriRolling = true
-			go rollTriDice()
+			logRollResult := fmt.Sprint("Tri Roll:\n")
+			a.AddLogMsg(logRollResult)
+			go a.rollTriDice()
 		case strings.HasSuffix(command, "close"):
 			e.Block()
-			go closeAllDice()
+			go a.closeAllDice()
 		case strings.HasSuffix(command, "21"):
 			e.Block()
 			isBJRolling = true
-			go rollBjDice()
+			logRollResult := fmt.Sprintf("21 Roll:\n")
+			a.AddLogMsg(logRollResult)
+			go a.rollBjDice()
 		case strings.HasSuffix(command, "13"):
 			e.Block()
 			is13Rolling = true
-			go roll13Dice()
+			logRollResult := fmt.Sprintf("13 Roll:\n")
+			a.AddLogMsg(logRollResult)
+			go a.roll13Dice()
 		case strings.HasSuffix(command, "verify"):
 			e.Block()
 			go verifyResult()
 		case strings.HasSuffix(command, "commands"):
 			e.Block()
-			go showCommands()
+			go a.ShowCommands()
 		case strings.HasSuffix(command, "chaton"):
 			e.Block()
 			ChatIsDisabled = false
@@ -125,8 +233,7 @@ func resetDiceState() {
 	isPokerRolling, isTriRolling, isBJRolling, is13Rolling, isHitting, is13Hitting, isClosing = false, false, false, false, false, false, false
 }
 
-// Handle the throwing of a dice
-func handleThrowDice(e *g.Intercept) {
+func (a *App) handleThrowDice(e *g.Intercept) {
 	packet := e.Packet
 	rawData := string(packet.Data)
 	logrus.WithFields(logrus.Fields{"raw_data": rawData}).Debug("Raw packet data")
@@ -156,11 +263,16 @@ func handleThrowDice(e *g.Intercept) {
 		newDice := &Dice{ID: diceID, IsRolling: true, IsClosed: false}
 		diceList = append(diceList, newDice)
 		log.Printf("Dice %d added\n", diceID)
+
+		if len(diceList) == 5 {
+			message := "Dice setup sucessful! Run :roll to confirm"
+			a.AddLogMsg(message)
+		}
 	}
 }
 
-// Handle the turning off of a dice
-func handleDiceOff(e *g.Intercept) {
+// handle the turning off of a dice
+func (a *App) handleDiceOff(e *g.Intercept) {
 	packet := e.Packet
 	diceIDStr := string(packet.Data)
 
@@ -194,7 +306,7 @@ func handleDiceOff(e *g.Intercept) {
 }
 
 // Handle the result of a dice roll
-func handleDiceResult(e *g.Intercept) {
+func (a *App) handleDiceResult(e *g.Intercept) {
 	packet := e.Packet
 	rawData := string(packet.Data)
 	logrus.WithFields(logrus.Fields{"raw_data": rawData}).Debug("Raw packet data")
@@ -231,6 +343,8 @@ func handleDiceResult(e *g.Intercept) {
 
 			if isPokerRolling || isTriRolling || isBJRolling || is13Rolling || is13Hitting || isHitting {
 				log.Printf("Dice %d rolled: %d\n", diceID, adjustedDiceValue)
+				logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceID, adjustedDiceValue)
+				a.AddLogMsg(logRollResult)
 			}
 			break
 		}
@@ -239,7 +353,7 @@ func handleDiceResult(e *g.Intercept) {
 }
 
 // Close the dice and send the packets to the game server
-func closeAllDice() {
+func (a *App) closeAllDice() {
 	mutex.Lock()
 	isClosing = true
 	mutex.Unlock()
@@ -256,7 +370,7 @@ func closeAllDice() {
 }
 
 // Roll the poker dice by sending packets and waiting for results
-func rollPokerDice() {
+func (a *App) rollPokerDice() {
 	mutex.Lock()
 
 	if len(diceList) < 5 {
@@ -278,12 +392,12 @@ func rollPokerDice() {
 
 	time.Sleep(1000 * time.Millisecond)
 	resultsWaitGroup.Wait()
-	evaluatePokerHand()
+	a.evaluatePokerHand()
 	isPokerRolling = false
 }
 
 // Evaluate the poker hand and send the result to the chat
-func rollTriDice() {
+func (a *App) rollTriDice() {
 	mutex.Lock()
 
 	if len(diceList) < 5 {
@@ -304,13 +418,13 @@ func rollTriDice() {
 	time.Sleep(1000 * time.Millisecond)
 	resultsWaitGroup.Wait()
 
-	evaluateTriHand()
+	a.evaluateTriHand()
 	isTriRolling = false
 }
 
 // Roll dice for blackjack-style game
-func rollBjDice() {
-	go closeAllDice()
+func (a *App) rollBjDice() {
+	go a.closeAllDice()
 	time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
 	mutex.Lock()
 
@@ -340,11 +454,11 @@ func rollBjDice() {
 	}
 	mutex.Unlock()
 
-	evaluateBlackjackHand()
+	a.evaluateBlackjackHand()
 	isBJRolling = false
 }
 
-func hitBjDice() {
+func (a *App) hitBjDice() {
 	mutex.Lock()
 
 	if len(diceList) < 5 {
@@ -369,7 +483,7 @@ func hitBjDice() {
 			mutex.Unlock()
 
 			// Re-evaluate the hand after hitting
-			evaluateBlackjackHand()
+			a.evaluateBlackjackHand()
 
 			isBJRolling = false
 			isHitting = false
@@ -395,15 +509,15 @@ func hitBjDice() {
 	log.Printf("Hit: Re-rolled dice %d = %d (old value was %d)\n", diceList[4].ID, newValue, oldValue)
 
 	// Re-evaluate the hand with the updated sum
-	evaluateBlackjackHand()
+	a.evaluateBlackjackHand()
 
 	isHitting = false
 	isBJRolling = false
 }
 
 // Roll dice for blackjack-style game
-func roll13Dice() {
-	go closeAllDice()
+func (a *App) roll13Dice() {
+	go a.closeAllDice()
 	time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
 	mutex.Lock()
 
@@ -433,11 +547,11 @@ func roll13Dice() {
 	}
 	mutex.Unlock()
 
-	evaluate13Hand()
+	a.evaluate13Hand()
 	is13Rolling = false
 }
 
-func hit13Dice() {
+func (a *App) hit13Dice() {
 	mutex.Lock()
 
 	if len(diceList) < 5 {
@@ -462,7 +576,7 @@ func hit13Dice() {
 			mutex.Unlock()
 
 			// Re-evaluate the hand after hitting
-			evaluate13Hand()
+			a.evaluate13Hand()
 
 			is13Rolling = false
 			is13Hitting = false
@@ -488,7 +602,7 @@ func hit13Dice() {
 	log.Printf("Hit: Re-rolled dice %d = %d (old value was %d)\n", diceList[4].ID, newValue, oldValue)
 
 	// Re-evaluate the hand with the updated sum
-	evaluate13Hand()
+	a.evaluate13Hand()
 
 	is13Hitting = false
 	is13Rolling = false
@@ -502,7 +616,7 @@ func verifyResult() {
 	mutex.Unlock()
 }
 
-func showCommands() {
+func (a *App) ShowCommands() {
 	commandList :=
 		"Thanks for using my plugin!\nBelow is it's list of commands. \n" +
 			"------------------------------------\n" +
@@ -537,4 +651,29 @@ func showCommands() {
 
 	time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
 	ext.Send(in.SYSTEM_BROADCAST, commandList)
+}
+
+// QDave's Logging function for frontend
+func (a *App) AddLogMsg(msg string) {
+	a.logMu.Lock()
+	defer a.logMu.Unlock()
+	// Get the current time and format it as a timestamp
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	// Prepend the timestamp to the message
+	timestampedMsg := fmt.Sprintf("[%s] %s", timestamp, msg)
+
+	a.log = append(a.log, timestampedMsg)
+	if len(a.log) > 100 {
+		a.log = a.log[1:]
+	}
+	runtime.EventsEmit(a.ctx, "logUpdate", strings.Join(a.log, "\n"))
+}
+
+// Thanks QDave <3
+func (a *App) handleTalk(e *g.Intercept) {
+	msg := e.Packet.ReadString()
+	if msg == "#gsuite" {
+		runtime.WindowShow(a.ctx)
+		e.Block()
+	}
 }

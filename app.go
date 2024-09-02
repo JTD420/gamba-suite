@@ -39,7 +39,7 @@ func main() {
 		},
 		StartHidden:       true,
 		HideWindowOnClose: true,
-		DisableResize:     true,
+		DisableResize:     false,
 		MinWidth:          500,
 		MaxWidth:          500,
 		MinHeight:         890,

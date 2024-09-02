@@ -131,15 +131,15 @@ func (a *App) toPokerString(dices []*Dice) string {
 		// Use default values if no config is found
 		fmt.Println("Using default configuration")
 		config = &PokerDisplayConfig{
-			FiveOfAKind:  "default_five_of_a_kind",
-			FourOfAKind:  "default_four_of_a_kind",
-			FullHouse:    "default_full_house",
-			HighStraight: "default_high_straight",
-			LowStraight:  "default_low_straight",
-			ThreeOfAKind: "default_three_of_a_kind",
-			TwoPair:      "default_two_pair",
-			OnePair:      "default_one_pair",
-			Nothing:      "default_nothing",
+			FiveOfAKind:  "F%s",
+			FourOfAKind:  "Q%s",
+			FullHouse:    "FH %s",
+			HighStraight: "High Stright",
+			LowStraight:  "Lo Stright",
+			ThreeOfAKind: "T%s",
+			TwoPair:      "%s",
+			OnePair:      "%s",
+			Nothing:      "Nothing",
 		}
 	}
 

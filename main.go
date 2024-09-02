@@ -48,10 +48,6 @@ type App struct {
 	ctx      context.Context
 }
 
-const appFolderName = "Gamba-Suite"
-const configFileName = "config.json"
-const configFilePath = "./poker_display_config.json"
-
 type PokerDisplayConfig struct {
 	FiveOfAKind  string `json:"five_of_a_kind"`
 	FourOfAKind  string `json:"four_of_a_kind"`
@@ -62,18 +58,6 @@ type PokerDisplayConfig struct {
 	TwoPair      string `json:"two_pair"`
 	OnePair      string `json:"one_pair"`
 	Nothing      string `json:"nothing"`
-}
-
-var defaultConfig = PokerDisplayConfig{
-	FiveOfAKind:  "Five of a kind: %s",
-	FourOfAKind:  "Four of a kind: %s",
-	FullHouse:    "Full House: %s",
-	HighStraight: "High Str8",
-	LowStraight:  "Low Str8",
-	ThreeOfAKind: "Three of a kind: %s",
-	TwoPair:      "Two Pair: %ss",
-	OnePair:      "One Pair: %ss",
-	Nothing:      "Nothing",
 }
 
 func NewApp(ext *g.Ext, assets embed.FS) *App {
@@ -98,15 +82,15 @@ func (a *App) LoadConfig() *PokerDisplayConfig {
 	if err != nil {
 		a.AddLogMsg("Config file not found, loading default values")
 		return &PokerDisplayConfig{
-			FiveOfAKind:  "default_five_of_a_kind",
-			FourOfAKind:  "default_four_of_a_kind",
-			FullHouse:    "default_full_house",
-			HighStraight: "default_high_straight",
-			LowStraight:  "default_low_straight",
-			ThreeOfAKind: "default_three_of_a_kind",
-			TwoPair:      "default_two_pair",
-			OnePair:      "default_one_pair",
-			Nothing:      "default_nothing",
+			FiveOfAKind:  "Five of a kind: %s",
+			FourOfAKind:  "Four of a kind: %s",
+			FullHouse:    "Full House: %s",
+			HighStraight: "High Str8",
+			LowStraight:  "Low Str8",
+			ThreeOfAKind: "Three of a kind: %s",
+			TwoPair:      "Two Pair: %ss",
+			OnePair:      "One Pair: %ss",
+			Nothing:      "Nothing",
 		}
 	}
 	defer file.Close()

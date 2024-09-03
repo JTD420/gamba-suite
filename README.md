@@ -134,6 +134,10 @@ If you encounter persistent issues, please check the roll logs in the GUI or ope
 
 Contributions are welcome! Please submit a pull request or open an issue to discuss any changes.
 
+## Special Thanks
+
+Special thanks to Nanobyte for his original [Poker](https://github.com/boydmeyer/poker) Extension!
+
 ## License
 
 This project is licensed under the MIT License.

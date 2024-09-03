@@ -119,7 +119,7 @@ Locate and click the **red door icon** with the red arrow. This will close the p
 
 - **Step 3:**
 You shoud now see the following arrow and a red x. Click on the **arrow** underlined in blue.
-![alt text](image.png)
+![alt text](images/image.png)
 
 - **Step 4:**
 Ensure that all five dice are rolled and confirm with `:roll` to complete the setup process.

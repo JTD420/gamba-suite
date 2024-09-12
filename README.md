@@ -136,7 +136,7 @@ Contributions are welcome! Please submit a pull request or open an issue to disc
 
 ## Special Thanks
 
-Special thanks to Nanobyte for his original [Poker](https://github.com/boydmeyer/poker) Extension!
+Special thanks to Nanobyte for his original [Poker](https://github.com/boydmeyer/poker) Extension!  
 Special thanks to Eduard for his work on the poker hand evaluation!
 
 ## License

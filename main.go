@@ -24,6 +24,8 @@ import (
 // Global variables for dice management, rolling state, mutex, and wait group
 var (
 	diceList         []*Dice
+	mutedDuration    int
+	isMuted          bool
 	currentSum       int
 	commandList      string
 	isPokerRolling   bool
@@ -40,12 +42,11 @@ var (
 )
 
 type App struct {
-	ext      *g.Ext
-	assets   embed.FS
-	log      []string
-	logMu    sync.Mutex
-	configMu sync.Mutex
-	ctx      context.Context
+	ext    *g.Ext
+	assets embed.FS
+	log    []string
+	logMu  sync.Mutex
+	ctx    context.Context
 }
 
 type PokerDisplayConfig struct {
@@ -137,6 +138,9 @@ func (a *App) setupExt() {
 	a.ext.Intercept(in.DICE_VALUE).With(a.handleDiceResult)
 	a.ext.Intercept(out.CHAT).With(a.handleTalk)
 	a.ext.Intercept(out.SHOUT).With(a.handleTalk)
+	a.ext.InterceptAll(func(e *g.Intercept) {
+		handleMutePacket(e)
+	})
 }
 
 func (a *App) runExt() {
@@ -146,6 +150,48 @@ func (a *App) runExt() {
 
 func (a *App) ShowWindow() {
 	runtime.WindowShow(a.ctx)
+}
+
+func startMuteTimer(duration int) {
+	for duration > 0 {
+		log.Printf("Remaining mute time: %d seconds", duration)
+		time.Sleep(1 * time.Second) // Sleep for 1 second
+		duration--
+	}
+
+	// Mute duration finished
+	handleMuteEnd()
+}
+
+func handleMuteEnd() {
+	isMuted = false
+	log.Println("Mute finished, sending queued messages...")
+
+	// ToDo:
+	// // Send all queued messages
+	// for _, message := range messageQueue {
+	// 	sendMessageWithDelay(message)
+	// }
+
+	// // Clear the message queue
+	// messageQueue = []string{}
+}
+
+// Mute detection logic (called within InterceptAll)
+func handleMutePacket(e *g.Intercept) {
+	// Check for the "first muted" packet with header 4069
+	if e.Packet.Header.Value == 4069 {
+		mutedDuration = e.Packet.ReadInt() // Read the mute duration in seconds
+		log.Printf("You are muted for %d seconds.", mutedDuration)
+		isMuted = true
+		go startMuteTimer(mutedDuration) // Start the mute timer
+	}
+
+	// Check for the "trying to chat while muted" packet with header 3285
+	if e.Packet.Header.Value == 3285 {
+		remainingMuteDuration := e.Packet.ReadInt() // Read the remaining mute duration
+		log.Printf("Mute still active, remaining time: %d seconds.", remainingMuteDuration)
+	}
 }
 
 func (a *App) onChatMessage(e *g.Intercept) {
@@ -192,6 +238,10 @@ func (a *App) onChatMessage(e *g.Intercept) {
 			logRollResult := fmt.Sprintf("13 Roll:\n")
 			a.AddLogMsg(logRollResult)
 			go a.roll13Dice()
+		case strings.HasPrefix(command, "@"):
+			e.Block()
+			extra := strings.TrimSpace(strings.TrimPrefix(command, "at"))
+			go a.evalAt(extra)
 		case strings.HasSuffix(command, "verify"):
 			e.Block()
 			go verifyResult()
@@ -206,6 +256,14 @@ func (a *App) onChatMessage(e *g.Intercept) {
 			ChatIsDisabled = true
 		}
 	}
+}
+
+func (a *App) evalAt(msg string) {
+	mutex.Lock()
+	at := "@" + msg
+	ext.Send(out.SHOUT, at)
+	a.AddLogMsg(at)
+	mutex.Unlock()
 }
 
 // Reset all saved dice states
@@ -604,34 +662,37 @@ func (a *App) ShowCommands() {
 	commandList :=
 		"Thanks for using my plugin!\nBelow is it's list of commands. \n" +
 			"------------------------------------\n" +
-			"\n:reset \n" +
+			":reset \n" +
 			"Forgets dice list for when you\nchange booth.\n" +
 			"------------------------------------\n" +
-			"\n:roll \n" +
+			":roll \n" +
 			"Rolls 5 dice and if chat is enabled \nsays the results in chat. \n" +
 			"------------------------------------\n" +
-			"\n:close\n" +
+			":close\n" +
 			"Closes any of your open dice. \n" +
 			"------------------------------------\n" +
-			"\n:21 \n" +
+			":21 \n" +
 			"Auto rolls and if chat is enabled \nsays the sum in chat when > 15. \n" +
 			"------------------------------------\n" +
-			"\n:13 \n" +
+			":13 \n" +
 			"Auto rolls and if chat is enabled \nsays the sum in chat when > 8. \n" +
 			"------------------------------------\n" +
-			"\n:tri \n" +
+			":tri \n" +
 			"Auto rolls 3 dice in Tri Formation \nif chat is enabled says the \nresults in chat. \n" +
 			"------------------------------------\n" +
-			"\n:verify \n" +
+			":verify \n" +
 			"Will say the previous result in\nchat. Use if you were muted and\ndont know the results of 21/13.\n" +
 			"------------------------------------\n" +
-			"\n:chaton \n" +
+			":chaton \n" +
 			"Enables chat announcement \nof game results. \n" +
 			"------------------------------------\n" +
-			"\n:chatoff \n" +
+			":chatoff \n" +
 			"Disables chat announcement \nof game results. \n" +
 			"------------------------------------\n" +
-			"\n:commands - This help screen :)"
+			":@ <amount> \n" +
+			"Stores @ amount in roll log \nwith the result and will announce \nit in chat. \n" +
+			"------------------------------------\n" +
+			":commands - This help screen :)"
 
 	time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
 	ext.Send(in.SYSTEM_BROADCAST, commandList)

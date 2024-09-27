@@ -12,15 +12,35 @@ import (
 	"xabbo.b7c.io/goearth/shockwave/out"
 )
 
+// Send message with a delay to simulate user typing/waiting
+func sendMessageWithDelay(message string) {
+	// sleep random between 250 and 500ms
+	time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
+	ext.Send(out.SHOUT, message)
+	log.Printf("Sent message: %s", message)
+}
+
 // Wait for all dice results and evaluate the poker hand
 func (a *App) evaluatePokerHand() {
 	if !ChatIsDisabled {
 		hand := a.toPokerString(diceList)
-
-		// sleep random between 250 and 500ms
-		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
-		ext.Send(out.SHOUT, hand)
 		logRollResult := fmt.Sprintf("Poker Result: %s\n", hand)
+		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
+		a.AddLogMsg(logRollResult)
+
+		if !isMuted {
+			// If the user is not muted, send the message
+			sendMessageWithDelay(hand)
+		} else {
+			// If the user is muted, queue the message to send later
+			log.Printf("User is muted. Queuing message: %s", hand)
+			// ToDo:
+			// messageQueue = append(messageQueue, hand)
+		}
+	} else {
+		hand := a.toPokerString(diceList)
+		logRollResult := fmt.Sprintf("Poker Result: %s\n", hand)
+		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
 		a.AddLogMsg(logRollResult)
 	}
 	isPokerRolling = false
@@ -43,11 +63,34 @@ func (a *App) evaluateBlackjackHand() {
 
 		// Convert sum to string and send to chat
 		hand := strconv.Itoa(currentSum)
-
-		// sleep random between 250 and 500ms
-		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
-		ext.Send(out.SHOUT, hand)
 		logRollResult := fmt.Sprintf("21 Result: %s\n", hand)
+		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
+		a.AddLogMsg(logRollResult)
+
+		if !isMuted {
+			// If the user is not muted, send the message
+			sendMessageWithDelay(hand)
+		} else {
+			// If the user is muted, queue the message to send later
+			log.Printf("User is muted. Queuing message: %s", hand)
+			// ToDo:
+			// messageQueue = append(messageQueue, hand)
+		}
+	} else {
+		// Log the current sum for debugging purposes
+		log.Printf("Evaluating hand: Current sum = %d\n", currentSum)
+
+		// If sum is less than 15, call hitBjDice to roll another dice
+		if currentSum < 15 {
+			log.Println("Sum is less than 15. Hitting another dice.")
+			a.hitBjDice() // This will hit the dice and then re-evaluate the hand
+			return        // Return early after hitting, so we don't send a message yet
+		}
+
+		// Convert sum to string and send to chat
+		hand := strconv.Itoa(currentSum)
+		logRollResult := fmt.Sprintf("21 Result: %s\n", hand)
+		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
 		a.AddLogMsg(logRollResult)
 	}
 	isBJRolling = false
@@ -71,11 +114,33 @@ func (a *App) evaluate13Hand() {
 
 		// Convert sum to string and send to chat
 		hand := strconv.Itoa(currentSum)
-
-		// sleep random between 250 and 500ms
-		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
-		ext.Send(out.SHOUT, hand)
 		logRollResult := fmt.Sprintf("13 Result: %s\n", hand)
+		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
+		a.AddLogMsg(logRollResult)
+		if !isMuted {
+			// If the user is not muted, send the message
+			sendMessageWithDelay(hand)
+		} else {
+			// If the user is muted, queue the message to send later
+			log.Printf("User is muted. Queuing message: %s", hand)
+			// ToDo:
+			// messageQueue = append(messageQueue, hand)
+		}
+	} else {
+		// Log the current sum for debugging purposes
+		log.Printf("Evaluating hand: Current sum = %d\n", currentSum)
+
+		// If sum is less than 15, call hitBjDice to roll another dice
+		if currentSum < 7 {
+			log.Println("Sum is less than 7. Hitting another dice.")
+			a.hit13Dice() // This will hit the dice and then re-evaluate the hand
+			return        // Return early after hitting, so we don't send a message yet
+		}
+
+		// Convert sum to string and send to chat
+		hand := strconv.Itoa(currentSum)
+		logRollResult := fmt.Sprintf("13 Result: %s\n", hand)
+		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
 		a.AddLogMsg(logRollResult)
 	}
 	is13Rolling = false
@@ -90,11 +155,27 @@ func (a *App) evaluateTriHand() {
 			diceList[2].Value,
 			diceList[4].Value,
 		})
-
-		// sleep random between 250 and 500ms
-		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
-		ext.Send(out.SHOUT, hand)
 		logRollResult := fmt.Sprintf("Tri Result: %s\n", hand)
+		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
+		a.AddLogMsg(logRollResult)
+
+		if !isMuted {
+			// If the user is not muted, send the message
+			sendMessageWithDelay(hand)
+		} else {
+			// If the user is muted, queue the message to send later
+			log.Printf("User is muted. Queuing message: %s", hand)
+			// ToDo:
+			// messageQueue = append(messageQueue, hand)
+		}
+	} else {
+		hand := sumHand([]int{
+			diceList[0].Value,
+			diceList[2].Value,
+			diceList[4].Value,
+		})
+		logRollResult := fmt.Sprintf("Tri Result: %s\n", hand)
+		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
 		a.AddLogMsg(logRollResult)
 	}
 	isTriRolling = false

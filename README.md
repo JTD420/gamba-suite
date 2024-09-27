@@ -101,6 +101,7 @@ Gamba Suite is a powerful tool for managing, rolling, and resetting dice with au
 - `:13` - Rolls all dice as needed in the 13 game and announces the total sum once it's 7 or higher.
 - `:21` - Rolls all dice as needed in the 21 game and announces the total sum once it's 15 or higher.
 - `:verify` - Re-announces the most recent total sum for 13/21 in chat. Useful if the user was muted during the original announcement.
+- `:@ <amount>` - Logs the @ amount in your Roll Logs under the result and then announces it in chat.
 - `:close` - Closes all dice.
 - `:reset` - Clears any previously stored dice data for a fresh start.
 - `:chaton` - Enables announcing the results of the dice rolls

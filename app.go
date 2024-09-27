@@ -16,11 +16,19 @@ var assets embed.FS
 var ext = g.NewExt(g.ExtInfo{
 	Title:       "[AIO] Gamba Suite",
 	Description: "Pkr, 13/21 and Tri dice automated rolling and resetting with in-chat hand evaluation. The all-in-one dice management plugin.",
-	Version:     "2.0.0",
+	Version:     "2.0.1",
 	Author:      "JTD",
 })
 
+var (
+	CurrentVersion = "2.0.0"
+)
+
 var app *App
+
+func (a *App) GetCurrentVersion() string {
+	return CurrentVersion
+}
 
 func main() {
 	app = NewApp(ext, assets)
@@ -39,7 +47,7 @@ func main() {
 		},
 		StartHidden:       true,
 		HideWindowOnClose: true,
-		DisableResize:     false,
+		DisableResize:     true,
 		MinWidth:          500,
 		MaxWidth:          500,
 		MinHeight:         890,

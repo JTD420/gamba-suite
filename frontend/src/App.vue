@@ -9,7 +9,12 @@
       <button type="submit" class="save-button">Save</button>
     </form>
 
-  <button @click="handleShowCommands" class="show-commands-button save-button">Show Commands</button>
+    <button @click="handleShowCommands" class="show-commands-button save-button">Show Commands</button>
+
+    <!-- Update notice -->
+    <div v-if="isOutdated" class="update-notice">
+      A new version of this application is available. Please update to the latest version.
+    </div>
 
     <h2 class="section-title">Roll Logs</h2>
     <div id="log" ref="logbox" class="log-section">
@@ -34,6 +39,8 @@ export default {
         nothing: '',
       },
       log: [],
+      isOutdated: false, // Add this line to initialize isOutdated
+      currentVersion: "", // Will be fetched from backend
     };
   },
   methods: {
@@ -82,12 +89,39 @@ export default {
         box.scrollTop = box.scrollHeight;
       });
     },
+    async checkForUpdates() {
+      try {
+        const response = await fetch(
+          "https://raw.githubusercontent.com/JTD420/G-ExtensionStore/repo/1.5.3/store/extensions/%5BAIO%5D%20Gamba%20Suite/extension.json"
+        );
+        const data = await response.json();
+        const latestVersion = data.version;
+
+        if (this.currentVersion !== latestVersion) {
+          this.isOutdated = true;
+        }
+      } catch (error) {
+        this.addLogMsg('Error checking for updates');
+        console.error(error);
+      }
+    },
+    async fetchCurrentVersion() {
+      try {
+        const version = await window.go.main.App.GetCurrentVersion(); // Fetch version from Go
+        this.currentVersion = version;
+      } catch (error) {
+        this.addLogMsg('Error fetching current version');
+        console.error(error);
+      }
+    },
     fetch() {
       this.loadConfig();
     },
   },
-  mounted() {
+  async mounted() {
+    await this.fetchCurrentVersion();
     this.fetch();
+    await this.checkForUpdates();
     window.runtime.EventsOn("logUpdate", (message) => {
       this.log = message.split('\n');
       this.scrolldown();
@@ -180,5 +214,16 @@ input[type="text"]::placeholder {
 /* Add some padding to each log message for readability */
 .log-section div {
   padding: 2px 0;
+}
+
+/* Update notice style */
+.update-notice {
+  margin-top: 15px;
+  padding: 10px;
+  background-color: #ffcc00;
+  color: #000;
+  text-align: center;
+  border-radius: 4px;
+  font-weight: bold;
 }
 </style>

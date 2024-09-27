@@ -4,6 +4,8 @@ import {main} from '../models';
 
 export function AddLogMsg(arg1:string):Promise<void>;
 
+export function GetCurrentVersion():Promise<string>;
+
 export function LoadConfig():Promise<main.PokerDisplayConfig>;
 
 export function SaveConfig(arg1:main.PokerDisplayConfig):Promise<void>;

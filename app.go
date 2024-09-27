@@ -21,7 +21,7 @@ var ext = g.NewExt(g.ExtInfo{
 })
 
 var (
-	CurrentVersion = "2.0.0"
+	CurrentVersion = "2.0.1"
 )
 
 var app *App

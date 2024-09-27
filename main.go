@@ -240,7 +240,7 @@ func (a *App) onChatMessage(e *g.Intercept) {
 			go a.roll13Dice()
 		case strings.HasPrefix(command, "@"):
 			e.Block()
-			extra := strings.TrimSpace(strings.TrimPrefix(command, "at"))
+			extra := strings.TrimSpace(strings.TrimPrefix(command, "@"))
 			go a.evalAt(extra)
 		case strings.HasSuffix(command, "verify"):
 			e.Block()

@@ -787,8 +787,8 @@ func (a *App) sendTradeCompletionMessage() {
 	a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE] sending: %q", message))
 	log.Printf("[TRADE_MESSAGE] sending: %q", message)
 	
-	// Send the message via chat
-	ext.Send(out.CHAT, message)
+	// Send the message via shout
+	ext.Send(out.SHOUT, message)
 }
 
 func formatTradeItemName(name string) string {

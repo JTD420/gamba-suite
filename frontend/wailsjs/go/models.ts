@@ -28,6 +28,22 @@ export namespace main {
 	        this.nothing = source["nothing"];
 	    }
 	}
+	export class TradeItem {
+	    Name: string;
+	    Quantity: number;
+	    RawData: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new TradeItem(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.Name = source["Name"];
+	        this.Quantity = source["Quantity"];
+	        this.RawData = source["RawData"];
+	    }
+	}
 
 }
 

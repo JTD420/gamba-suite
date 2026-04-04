@@ -6,9 +6,15 @@ export function AddChatLog(arg1:string):Promise<void>;
 
 export function AddLogMsg(arg1:string):Promise<void>;
 
+export function ClearTradeItems():Promise<void>;
+
+export function GetCurrentTradeItems():Promise<Array<main.TradeItem>>;
+
 export function GetCurrentVersion():Promise<string>;
 
 export function GetLastTradePartnerName():Promise<string>;
+
+export function GetTradeItemsJSON():Promise<string>;
 
 export function LoadConfig():Promise<main.PokerDisplayConfig>;
 
@@ -19,3 +25,5 @@ export function SaveConfig(arg1:main.PokerDisplayConfig):Promise<void>;
 export function ShowCommands():Promise<void>;
 
 export function ShowWindow():Promise<void>;
+
+export function SkipDiceSetupForTesting():Promise<void>;

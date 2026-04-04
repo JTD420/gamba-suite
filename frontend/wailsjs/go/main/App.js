@@ -10,12 +10,24 @@ export function AddLogMsg(arg1) {
   return window['go']['main']['App']['AddLogMsg'](arg1);
 }
 
+export function ClearTradeItems() {
+  return window['go']['main']['App']['ClearTradeItems']();
+}
+
+export function GetCurrentTradeItems() {
+  return window['go']['main']['App']['GetCurrentTradeItems']();
+}
+
 export function GetCurrentVersion() {
   return window['go']['main']['App']['GetCurrentVersion']();
 }
 
 export function GetLastTradePartnerName() {
   return window['go']['main']['App']['GetLastTradePartnerName']();
+}
+
+export function GetTradeItemsJSON() {
+  return window['go']['main']['App']['GetTradeItemsJSON']();
 }
 
 export function LoadConfig() {
@@ -36,4 +48,8 @@ export function ShowCommands() {
 
 export function ShowWindow() {
   return window['go']['main']['App']['ShowWindow']();
+}
+
+export function SkipDiceSetupForTesting() {
+  return window['go']['main']['App']['SkipDiceSetupForTesting']();
 }

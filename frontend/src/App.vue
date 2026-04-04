@@ -15,6 +15,10 @@
       Open Last Trade: {{ lastTradePartnerName }}
     </button>
 
+    <button @click="handleSkipDiceSetup" class="save-button">
+      Skip Dice Setup (Testing)
+    </button>
+
     <!-- Update notice -->
     <div v-if="isOutdated" class="update-notice">
       A new version of this application is available. Please update to the latest version.
@@ -106,6 +110,14 @@ export default {
         await this.refreshLastTradePartnerName();
       } catch (error) {
         this.addLogMsg('Error opening last trade');
+        console.error(error);
+      }
+    },
+    async handleSkipDiceSetup() {
+      try {
+        await window.go.main.App.SkipDiceSetupForTesting();
+      } catch (error) {
+        this.addLogMsg('Error skipping dice setup');
         console.error(error);
       }
     },

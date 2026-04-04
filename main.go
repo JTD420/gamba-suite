@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
@@ -37,6 +38,12 @@ var (
 	tradeCloseCount   int
 	lastTradePartnerID int
 	lastTradePartnerName string
+	lastTradePartnerToken string
+	tradeAutoFlowID    int
+	tradeAutoAccepted  bool
+	tradeAutoConfirmed bool
+	tradeAutoAcceptPending bool
+	tradeAutoConfirmPending bool
 	lastTradeOpenData string
 	lastTradeOpen     string
 	isPokerRolling   bool
@@ -58,7 +65,17 @@ var (
 	headerSniffUntil time.Time
 	headerSniffSeen  = map[uint16]bool{}
 	headerSniffMu    sync.Mutex
+	currentTradeItems []TradeItem
+	tradeItemsMu     sync.Mutex
+	knownDiceIDs     = map[int]struct{}{}
+	fakeDiceTestingMode bool
 )
+
+type TradeItem struct {
+	Name     string
+	Quantity int
+	RawData  string // Store raw field for debugging
+}
 
 type App struct {
 	ext    *g.Ext
@@ -153,6 +170,8 @@ func getConfigFilePath() string {
 }
 
 func (a *App) setupExt() {
+	registerCustomTradeHeaders(a)
+
 	a.ext.Intercept(out.CHAT, out.SHOUT, out.WHISPER).With(a.onChatMessage)
 	a.ext.Intercept(out.THROW_DICE).With(a.handleThrowDice)
 	a.ext.Intercept(out.DICE_OFF).With(a.handleDiceOff)
@@ -169,6 +188,15 @@ func (a *App) setupExt() {
 		handleUsers28Packet(a, e)
 		handleIncomingHeaderSniff(a, e)
 	})
+}
+
+func registerCustomTradeHeaders(a *App) {
+	confirmID := g.Out.Id("TRADE_CONFIRM_ACCEPT")
+	if _, ok := a.ext.Headers().TryGet(confirmID); !ok {
+		a.ext.Headers().Add("TRADE_CONFIRM_ACCEPT", g.Header{Dir: g.Out, Value: 402})
+		a.AddLogMsg("[TRADE_HEADERS] registered outgoing TRADE_CONFIRM_ACCEPT -> 402")
+		log.Printf("[TRADE_HEADERS] registered outgoing TRADE_CONFIRM_ACCEPT -> 402")
+	}
 }
 
 func (a *App) runExt() {
@@ -224,10 +252,63 @@ func handleMutePacket(e *g.Intercept) {
 
 // Trade detection logic (called within InterceptAll)
 func handleTradePacket(a *App, e *g.Intercept) {
+	// TRADE_ACCEPT incoming 109 - wait 2 seconds then send TRADE_ACCEPT (69)
+	if e.Packet.Header.Value == 109 {
+		scheduleAutoTradeAccept(a, string(e.Packet.Data))
+		return
+	}
+
+	// TRADE_CONFIRM incoming 111 - wait 4 seconds then send TRADE_CONFIRM_ACCEPT (402)
+	if e.Packet.Header.Value == 111 {
+		scheduleAutoTradeConfirm(a, string(e.Packet.Data))
+		return
+	}
+
+	// TRADE_ITEMS header 108 - parse individual items being traded
+	if e.Packet.Header.Value == 108 {
+		payload := string(e.Packet.Data)
+		if !isTradeItemsFromPartner(payload) {
+			a.AddLogMsg("[TRADE_ITEMS #108] ignored: packet is not partner-side items")
+			log.Printf("[TRADE_ITEMS #108] ignored: packet is not partner-side items")
+			return
+		}
+
+		items := parseTradeItemsPacket(e.Packet.Data)
+		
+		tradeItemsMu.Lock()
+		currentTradeItems = items
+		tradeItemsMu.Unlock()
+		
+		// Log the parsed items
+		a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] received %d items", len(items)))
+		log.Printf("[TRADE_ITEMS #108] received %d items", len(items))
+		
+		for i, item := range items {
+			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] item[%d] name=%q quantity=%d raw=%q", i, item.Name, item.Quantity, item.RawData))
+			log.Printf("[TRADE_ITEMS #108] item[%d] name=%q quantity=%d raw=%q", i, item.Name, item.Quantity, item.RawData)
+		}
+		
+		return
+	}
+	
+	// TRADE_COMPLETED header 112 - send chat message with the traded items
+	if e.Packet.Header.Value == 112 {
+		tradeAutoConfirmed = true
+		tradeAutoConfirmPending = false
+		a.AddLogMsg("[TRADE_COMPLETED #112] trade completed, sending trade summary")
+		log.Printf("[TRADE_COMPLETED #112] trade completed, sending trade summary")
+		
+		// Send the trade items summary to chat
+		a.sendTradeCompletionMessage()
+		return
+	}
+	
 	if e.Packet.Header.Value == 104 {
 		if !awaitingTradeOpen {
 			return
 		}
+
+		resetTradeAutoFlow()
 
 		for _, decodeLine := range decodeTradeOpenPacket(e.Packet) {
 			a.AddLogMsg("[TRADE_OPEN_DECODE] " + decodeLine)
@@ -241,6 +322,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 		if len(e.Packet.Data) >= 4 {
 			tradeToken := string(e.Packet.Data[:4])
+			lastTradePartnerToken = tradeToken
 			if name, ok := lookupUsers28Token(tradeToken); ok {
 				a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] token %q matched user %q", tradeToken, name))
 				log.Printf("[TRADE_OPEN] token %q matched user %q", tradeToken, name)
@@ -290,6 +372,8 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 	// TRADE_CLOSE appears as incoming header 110 in your client logs.
 	if e.Packet.Header.Value == 110 {
+		tradeAutoConfirmed = true
+		tradeAutoConfirmPending = false
 		tradeClosePayload := strings.TrimSpace(string(e.Packet.Data))
 		if tradeClosePayload == "" {
 			tradeClosePayload = "(empty payload)"
@@ -299,6 +383,11 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		closeLog := fmt.Sprintf("Incoming[%d] -> %s", e.Packet.Header.Value, tradeClosePayload)
 		log.Printf("[TRADE_CLOSE #%d] %s", tradeCloseCount, closeLog)
 		a.AddLogMsg(fmt.Sprintf("[TRADE_CLOSE #%d] %s", tradeCloseCount, closeLog))
+		resetTradeAutoFlow()
+		lastTradePartnerToken = ""
+		
+		// Clear trade items when trade closes
+		a.ClearTradeItems()
 
 		partnerID := lastTradePartnerID
 		if partnerID <= 0 {
@@ -310,6 +399,112 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		a.AddLogMsg(fmt.Sprintf("[TRADE_REOPEN] ready for manual reopen -> %s (%d)", lastTradePartnerName, partnerID))
 		log.Printf("[TRADE_REOPEN] ready for manual reopen -> %s (%d)", lastTradePartnerName, partnerID)
 	}
+}
+
+func resetTradeAutoFlow() {
+	tradeAutoFlowID++
+	tradeAutoAccepted = false
+	tradeAutoConfirmed = false
+	tradeAutoAcceptPending = false
+	tradeAutoConfirmPending = false
+}
+
+func scheduleAutoTradeAccept(a *App, payload string) {
+	if strings.TrimSpace(lastTradePartnerToken) == "" {
+		return
+	}
+	if tradeAutoAccepted || tradeAutoAcceptPending {
+		return
+	}
+
+	tradeAutoAcceptPending = true
+	flowID := tradeAutoFlowID
+	a.AddLogMsg(fmt.Sprintf("[TRADE_ACCEPT #109] detected (%q), auto-accept in 2s", payload))
+	log.Printf("[TRADE_ACCEPT #109] detected (%q), auto-accept in 2s", payload)
+
+	go func(flow int) {
+		time.Sleep(2 * time.Second)
+
+		if flow != tradeAutoFlowID || strings.TrimSpace(lastTradePartnerToken) == "" {
+			tradeAutoAcceptPending = false
+			return
+		}
+
+		ext.Send(out.TRADE_ACCEPT)
+		tradeAutoAcceptPending = false
+		tradeAutoAccepted = true
+		a.AddLogMsg("[TRADE_ACCEPT] sent outgoing[69]")
+		log.Printf("[TRADE_ACCEPT] sent outgoing[69]")
+	}(flowID)
+}
+
+func scheduleAutoTradeConfirm(a *App, payload string) {
+	if tradeAutoConfirmed || tradeAutoConfirmPending {
+		return
+	}
+
+	tradeAutoConfirmPending = true
+	flowID := tradeAutoFlowID
+	a.AddLogMsg(fmt.Sprintf("[TRADE_CONFIRM #111] detected (%q), auto-confirm starts in 4s with up to 10 attempts", payload))
+	log.Printf("[TRADE_CONFIRM #111] detected (%q), auto-confirm starts in 4s with up to 10 attempts", payload)
+
+	go func(flow int) {
+		defer func() {
+			if r := recover(); r != nil {
+				tradeAutoConfirmPending = false
+				a.AddLogMsg(fmt.Sprintf("[TRADE_CONFIRM_ACCEPT] recovered from panic: %v", r))
+				log.Printf("[TRADE_CONFIRM_ACCEPT] recovered from panic: %v", r)
+			}
+		}()
+
+		for attempt := 1; attempt <= 10; attempt++ {
+			time.Sleep(4 * time.Second)
+
+			if flow != tradeAutoFlowID || tradeAutoConfirmed {
+				tradeAutoConfirmPending = false
+				return
+			}
+
+			ext.Send(g.Out.Id("TRADE_CONFIRM_ACCEPT"))
+			a.AddLogMsg(fmt.Sprintf("[TRADE_CONFIRM_ACCEPT] sent outgoing[402] attempt %d/10", attempt))
+			log.Printf("[TRADE_CONFIRM_ACCEPT] sent outgoing[402] attempt %d/10", attempt)
+		}
+
+		tradeAutoConfirmPending = false
+		if flow == tradeAutoFlowID && !tradeAutoConfirmed {
+			handleTradeConfirmTimeout(a)
+		}
+	}(flowID)
+}
+
+func handleTradeConfirmTimeout(a *App) {
+	partnerName := strings.TrimSpace(lastTradePartnerName)
+	if partnerName == "" {
+		partnerName = "Unknown"
+	}
+
+	a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] max attempts reached; sending trade close")
+	log.Printf("[TRADE_CONFIRM_ACCEPT] max attempts reached; sending trade close")
+	ext.Send(out.TRADE_CLOSE)
+
+	closeMsg := fmt.Sprintf("Trade Closed with: %s", partnerName)
+	if !isMuted {
+		sendMessageWithDelay(closeMsg)
+		sendMessageWithDelay("Dealer Open, Trade Away.")
+	} else {
+		a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] user muted; skipped timeout close announcement")
+		log.Printf("[TRADE_CONFIRM_ACCEPT] user muted; skipped timeout close announcement")
+	}
+
+	awaitingTradeOpen = true
+	tradeAutoConfirmed = true
+}
+
+func isTradeItemsFromPartner(payload string) bool {
+	if strings.TrimSpace(lastTradePartnerToken) == "" {
+		return false
+	}
+	return strings.Contains(payload, lastTradePartnerToken)
 }
 
 func extractTradePartnerID(payload string) (int, bool) {
@@ -425,6 +620,94 @@ func lookupUsers28Token(token string) (string, bool) {
 	return name, ok
 }
 
+// parseTradeItemsPacket extracts trade items from TRADE_ITEMS packet (header 108)
+// Items are separated by \x02 bytes and may contain item names and quantities
+func parseTradeItemsPacket(data []byte) []TradeItem {
+	counts := map[string]int{}
+	rawByName := map[string]string{}
+
+	// Split on \x02 separator byte.
+	fields := bytes.Split(data, []byte{0x02})
+	for _, field := range fields {
+		if len(field) == 0 {
+			continue
+		}
+
+		fieldStr := strings.TrimSpace(string(field))
+		itemName, ok := extractTradeItemName(fieldStr)
+		if !ok {
+			continue
+		}
+
+		counts[itemName]++
+		if _, exists := rawByName[itemName]; !exists {
+			rawByName[itemName] = fieldStr
+		}
+	}
+
+	if len(counts) == 0 {
+		return []TradeItem{}
+	}
+
+	names := make([]string, 0, len(counts))
+	for name := range counts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	items := make([]TradeItem, 0, len(names))
+	for _, name := range names {
+		items = append(items, TradeItem{
+			Name:     name,
+			Quantity: counts[name],
+			RawData:  rawByName[name],
+		})
+	}
+
+	return items
+}
+
+func extractTradeItemName(field string) (string, bool) {
+	if !strings.Contains(field, "|") {
+		return "", false
+	}
+
+	parts := strings.Split(field, "|")
+	if len(parts) < 2 {
+		return "", false
+	}
+
+	name := strings.TrimSpace(parts[len(parts)-1])
+	if name == "" || isCoordinatePattern(name) {
+		return "", false
+	}
+
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			continue
+		}
+		return "", false
+	}
+
+	return name, true
+}
+
+// isCoordinatePattern checks if a string looks like coordinates (e.g., "0,0,0")
+func isCoordinatePattern(s string) bool {
+	if !strings.Contains(s, ",") {
+		return false
+	}
+	
+	parts := strings.Split(s, ",")
+	for _, part := range parts {
+		if _, err := strconv.Atoi(strings.TrimSpace(part)); err != nil {
+			return false
+		}
+	}
+	
+	return len(parts) >= 2
+}
+
 func (a *App) OpenLastTrade() {
 	if lastTradePartnerID <= 0 {
 		a.AddLogMsg("Open Last Trade failed: no last trader cached yet")
@@ -445,6 +728,78 @@ func (a *App) GetLastTradePartnerName() string {
 		return "Unknown"
 	}
 	return lastTradePartnerName
+}
+
+// GetCurrentTradeItems returns the list of items currently in the trade
+func (a *App) GetCurrentTradeItems() []TradeItem {
+	tradeItemsMu.Lock()
+	defer tradeItemsMu.Unlock()
+	
+	// Return a copy to prevent external modifications
+	itemsCopy := make([]TradeItem, len(currentTradeItems))
+	copy(itemsCopy, currentTradeItems)
+	return itemsCopy
+}
+
+// GetTradeItemsJSON returns the current trade items as a JSON string for the frontend
+func (a *App) GetTradeItemsJSON() string {
+	items := a.GetCurrentTradeItems()
+	jsonData, err := json.Marshal(items)
+	if err != nil {
+		a.AddLogMsg(fmt.Sprintf("[ERROR] failed to marshal trade items: %v", err))
+		return "[]"
+	}
+	return string(jsonData)
+}
+
+// ClearTradeItems removes all current trade items
+func (a *App) ClearTradeItems() {
+	tradeItemsMu.Lock()
+	defer tradeItemsMu.Unlock()
+	currentTradeItems = []TradeItem{}
+	a.AddLogMsg("[TRADE_ITEMS] cleared current trade items")
+	log.Printf("[TRADE_ITEMS] cleared current trade items")
+}
+
+// sendTradeCompletionMessage builds and sends a chat message with the items from the completed trade
+func (a *App) sendTradeCompletionMessage() {
+	items := a.GetCurrentTradeItems()
+	
+	if len(items) == 0 {
+		a.AddLogMsg("[TRADE_MESSAGE] no items in trade, skipping message")
+		log.Printf("[TRADE_MESSAGE] no items in trade, skipping message")
+		return
+	}
+	
+	// Build the message
+	var msgParts []string
+	for i, item := range items {
+		displayName := formatTradeItemName(item.Name)
+		msgParts = append(msgParts, fmt.Sprintf("%d x %s", item.Quantity, displayName))
+		
+		// Log each item
+		a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE] item[%d] %s (qty: %d)", i, item.Name, item.Quantity))
+		log.Printf("[TRADE_MESSAGE] item[%d] %s (qty: %d)", i, item.Name, item.Quantity)
+	}
+	
+	message := fmt.Sprintf("Traded: %s", strings.Join(msgParts, ", "))
+	
+	a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE] sending: %q", message))
+	log.Printf("[TRADE_MESSAGE] sending: %q", message)
+	
+	// Send the message via chat
+	ext.Send(out.CHAT, message)
+}
+
+func formatTradeItemName(name string) string {
+	parts := strings.Split(name, "_")
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		parts[i] = strings.ToUpper(part[:1]) + part[1:]
+	}
+	return strings.Join(parts, " ")
 }
 
 type user28Entry struct {
@@ -847,7 +1202,28 @@ func resetDiceState() {
 	resultsWaitGroup.Wait() // Ensure all dice roll results are processed
 	diceList = []*Dice{}
 	awaitingTradeOpen = false
+	fakeDiceTestingMode = false
 	isPokerRolling, isTriRolling, isBJRolling, is13Rolling, isHitting, is13Hitting, isClosing = false, false, false, false, false, false, false
+}
+
+func rememberDiceID(diceID int) {
+	if diceID <= 0 {
+		return
+	}
+	knownDiceIDs[diceID] = struct{}{}
+}
+
+func (a *App) SkipDiceSetupForTesting() {
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	diceList = make([]*Dice, 0, 5)
+	for i := 1; i <= 5; i++ {
+		diceList = append(diceList, &Dice{ID: 100000 + i, Value: rand.Intn(6) + 1, IsRolling: false, IsClosed: false})
+	}
+	fakeDiceTestingMode = true
+	awaitingTradeOpen = true
+	a.AddLogMsg("Dice setup bypass enabled for testing. Using 5 fake dice values.")
 }
 
 func (a *App) handleThrowDice(e *g.Intercept) {
@@ -862,6 +1238,7 @@ func (a *App) handleThrowDice(e *g.Intercept) {
 		logrus.WithFields(logrus.Fields{"dice_id_str": diceIDStr, "error": err}).Warn("Failed to parse dice ID")
 		return
 	}
+	rememberDiceID(diceID)
 
 	mutex.Lock()
 	defer mutex.Unlock()
@@ -908,6 +1285,7 @@ func (a *App) handleDiceOff(e *g.Intercept) {
 		}).Warn("Failed to parse dice ID")
 		return
 	}
+	rememberDiceID(diceID)
 
 	mutex.Lock()
 	defer mutex.Unlock()
@@ -946,6 +1324,7 @@ func (a *App) handleDiceResult(e *g.Intercept) {
 		logrus.WithFields(logrus.Fields{"dice_id_str": diceIDStr, "error": err}).Warn("Failed to parse dice ID")
 		return
 	}
+	rememberDiceID(diceID)
 
 	diceValueStr := diceData[1]
 	diceValue, err := strconv.Atoi(diceValueStr)
@@ -978,6 +1357,18 @@ func (a *App) handleDiceResult(e *g.Intercept) {
 
 // Close the dice and send the packets to the game server
 func (a *App) closeAllDice() {
+	if fakeDiceTestingMode {
+		mutex.Lock()
+		isClosing = true
+		for _, dice := range diceList {
+			dice.IsClosed = true
+			dice.Value = 0
+		}
+		isClosing = false
+		mutex.Unlock()
+		return
+	}
+
 	mutex.Lock()
 	isClosing = true
 	mutex.Unlock()
@@ -995,6 +1386,26 @@ func (a *App) closeAllDice() {
 
 // Roll the poker dice by sending packets and waiting for results
 func (a *App) rollPokerDice() {
+	if fakeDiceTestingMode {
+		mutex.Lock()
+		if len(diceList) < 5 {
+			mutex.Unlock()
+			log.Println("Not enough dice to roll")
+			isPokerRolling = false
+			return
+		}
+		for i := range diceList {
+			diceList[i].Value = rand.Intn(6) + 1
+			diceList[i].IsClosed = false
+			logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceList[i].ID, diceList[i].Value)
+			a.AddLogMsg(logRollResult)
+		}
+		mutex.Unlock()
+		a.evaluatePokerHand()
+		isPokerRolling = false
+		return
+	}
+
 	mutex.Lock()
 
 	if len(diceList) < 5 {
@@ -1022,6 +1433,26 @@ func (a *App) rollPokerDice() {
 
 // Evaluate the poker hand and send the result to the chat
 func (a *App) rollTriDice() {
+	if fakeDiceTestingMode {
+		mutex.Lock()
+		if len(diceList) < 5 {
+			mutex.Unlock()
+			log.Println("Not enough dice to roll")
+			isTriRolling = false
+			return
+		}
+		for _, index := range []int{0, 2, 4} {
+			diceList[index].Value = rand.Intn(6) + 1
+			diceList[index].IsClosed = false
+			logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceList[index].ID, diceList[index].Value)
+			a.AddLogMsg(logRollResult)
+		}
+		mutex.Unlock()
+		a.evaluateTriHand()
+		isTriRolling = false
+		return
+	}
+
 	mutex.Lock()
 
 	if len(diceList) < 5 {
@@ -1048,6 +1479,28 @@ func (a *App) rollTriDice() {
 
 // Roll dice for blackjack-style game
 func (a *App) rollBjDice() {
+	if fakeDiceTestingMode {
+		mutex.Lock()
+		if len(diceList) < 5 {
+			mutex.Unlock()
+			log.Println("Not enough dice to roll")
+			isBJRolling = false
+			return
+		}
+		currentSum = 0
+		for _, index := range []int{0, 1, 2} {
+			diceList[index].Value = rand.Intn(6) + 1
+			diceList[index].IsClosed = false
+			currentSum += diceList[index].Value
+			logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceList[index].ID, diceList[index].Value)
+			a.AddLogMsg(logRollResult)
+		}
+		mutex.Unlock()
+		a.evaluateBlackjackHand()
+		isBJRolling = false
+		return
+	}
+
 	go a.closeAllDice()
 	time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
 	mutex.Lock()
@@ -1083,6 +1536,44 @@ func (a *App) rollBjDice() {
 }
 
 func (a *App) hitBjDice() {
+	if fakeDiceTestingMode {
+		mutex.Lock()
+		if len(diceList) < 5 {
+			mutex.Unlock()
+			log.Println("Not enough dice to roll")
+			isBJRolling = false
+			isHitting = false
+			return
+		}
+
+		rolled := false
+		for i := 3; i < 5; i++ {
+			if diceList[i].Value == 0 {
+				diceList[i].Value = rand.Intn(6) + 1
+				diceList[i].IsClosed = false
+				currentSum += diceList[i].Value
+				rolled = true
+				logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceList[i].ID, diceList[i].Value)
+				a.AddLogMsg(logRollResult)
+				break
+			}
+		}
+
+		if !rolled {
+			diceList[4].Value = rand.Intn(6) + 1
+			diceList[4].IsClosed = false
+			currentSum += diceList[4].Value
+			logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceList[4].ID, diceList[4].Value)
+			a.AddLogMsg(logRollResult)
+		}
+		mutex.Unlock()
+
+		a.evaluateBlackjackHand()
+		isHitting = false
+		isBJRolling = false
+		return
+	}
+
 	mutex.Lock()
 
 	if len(diceList) < 5 {
@@ -1141,6 +1632,28 @@ func (a *App) hitBjDice() {
 
 // Roll dice for blackjack-style game
 func (a *App) roll13Dice() {
+	if fakeDiceTestingMode {
+		mutex.Lock()
+		if len(diceList) < 5 {
+			mutex.Unlock()
+			log.Println("Not enough dice to roll")
+			is13Rolling = false
+			return
+		}
+		currentSum = 0
+		for _, index := range []int{0, 1} {
+			diceList[index].Value = rand.Intn(6) + 1
+			diceList[index].IsClosed = false
+			currentSum += diceList[index].Value
+			logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceList[index].ID, diceList[index].Value)
+			a.AddLogMsg(logRollResult)
+		}
+		mutex.Unlock()
+		a.evaluate13Hand()
+		is13Rolling = false
+		return
+	}
+
 	go a.closeAllDice()
 	time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
 	mutex.Lock()
@@ -1176,6 +1689,44 @@ func (a *App) roll13Dice() {
 }
 
 func (a *App) hit13Dice() {
+	if fakeDiceTestingMode {
+		mutex.Lock()
+		if len(diceList) < 5 {
+			mutex.Unlock()
+			log.Println("Not enough dice to roll")
+			is13Rolling = false
+			is13Hitting = false
+			return
+		}
+
+		rolled := false
+		for i := 2; i < 5; i++ {
+			if diceList[i].Value == 0 {
+				diceList[i].Value = rand.Intn(6) + 1
+				diceList[i].IsClosed = false
+				currentSum += diceList[i].Value
+				rolled = true
+				logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceList[i].ID, diceList[i].Value)
+				a.AddLogMsg(logRollResult)
+				break
+			}
+		}
+
+		if !rolled {
+			diceList[4].Value = rand.Intn(6) + 1
+			diceList[4].IsClosed = false
+			currentSum += diceList[4].Value
+			logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceList[4].ID, diceList[4].Value)
+			a.AddLogMsg(logRollResult)
+		}
+		mutex.Unlock()
+
+		a.evaluate13Hand()
+		is13Hitting = false
+		is13Rolling = false
+		return
+	}
+
 	mutex.Lock()
 
 	if len(diceList) < 5 {

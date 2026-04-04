@@ -44,6 +44,8 @@ var (
 	tradeAutoConfirmed bool
 	tradeAutoAcceptPending bool
 	tradeAutoConfirmPending bool
+	tradeCompleted bool
+	tradeCloseAnnounced bool
 	lastTradeOpenData string
 	lastTradeOpen     string
 	isPokerRolling   bool
@@ -69,6 +71,8 @@ var (
 	tradeItemsMu     sync.Mutex
 	knownDiceIDs     = map[int]struct{}{}
 	fakeDiceTestingMode bool
+	dealerOpenHeartbeatID int
+	dealerOpenHeartbeatActive bool
 )
 
 type TradeItem struct {
@@ -293,6 +297,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 	
 	// TRADE_COMPLETED header 112 - send chat message with the traded items
 	if e.Packet.Header.Value == 112 {
+		tradeCompleted = true
 		tradeAutoConfirmed = true
 		tradeAutoConfirmPending = false
 		a.AddLogMsg("[TRADE_COMPLETED #112] trade completed, sending trade summary")
@@ -307,6 +312,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		if !awaitingTradeOpen {
 			return
 		}
+		stopDealerOpenHeartbeat()
 
 		resetTradeAutoFlow()
 
@@ -367,13 +373,36 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		awaitingTradeOpen = false
 		log.Printf("[TRADE_OPEN #%d] %s", tradeOpenCount, lastTradeOpen)
 		a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #%d] %s", tradeOpenCount, lastTradeOpen))
+
+		partnerName := strings.TrimSpace(lastTradePartnerName)
+		if partnerName == "" {
+			partnerName = "Unknown"
+		}
+		openMsg := fmt.Sprintf("Trade Opened: \"%s\"", partnerName)
+		a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] shouting: %q", openMsg))
+		log.Printf("[TRADE_OPEN] shouting: %q", openMsg)
+		ext.Send(out.SHOUT, openMsg)
 		return
 	}
 
 	// TRADE_CLOSE appears as incoming header 110 in your client logs.
 	if e.Packet.Header.Value == 110 {
+		wasCompleted := tradeCompleted
 		tradeAutoConfirmed = true
 		tradeAutoConfirmPending = false
+		partnerName := strings.TrimSpace(lastTradePartnerName)
+		if partnerName == "" {
+			partnerName = "Unknown"
+		}
+
+		if !tradeCompleted && !tradeCloseAnnounced {
+			closeMsg := fmt.Sprintf("Trade Closed: \"%s\"", partnerName)
+			a.AddLogMsg(fmt.Sprintf("[TRADE_CLOSE] shouting: %q", closeMsg))
+			log.Printf("[TRADE_CLOSE] shouting: %q", closeMsg)
+			ext.Send(out.SHOUT, closeMsg)
+			tradeCloseAnnounced = true
+		}
+
 		tradeClosePayload := strings.TrimSpace(string(e.Packet.Data))
 		if tradeClosePayload == "" {
 			tradeClosePayload = "(empty payload)"
@@ -388,6 +417,14 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		
 		// Clear trade items when trade closes
 		a.ClearTradeItems()
+
+		if !wasCompleted {
+			awaitingTradeOpen = true
+			a.AddLogMsg("[TRADE_REOPEN] trade closed before completion, restarting dealer cycle")
+			log.Printf("[TRADE_REOPEN] trade closed before completion, restarting dealer cycle")
+			go sendMessageWithDelay("Dealer Open, Trade Away.")
+			startDealerOpenHeartbeat(a)
+		}
 
 		partnerID := lastTradePartnerID
 		if partnerID <= 0 {
@@ -407,6 +444,42 @@ func resetTradeAutoFlow() {
 	tradeAutoConfirmed = false
 	tradeAutoAcceptPending = false
 	tradeAutoConfirmPending = false
+	tradeCompleted = false
+	tradeCloseAnnounced = false
+}
+
+func startDealerOpenHeartbeat(a *App) {
+	dealerOpenHeartbeatID++
+	heartbeatID := dealerOpenHeartbeatID
+	dealerOpenHeartbeatActive = true
+
+	go func(id int) {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			if id != dealerOpenHeartbeatID {
+				return
+			}
+
+			if !awaitingTradeOpen {
+				dealerOpenHeartbeatActive = false
+				return
+			}
+
+			a.AddLogMsg("[TRADE_REOPEN] no new trade yet, re-announcing dealer open")
+			log.Printf("[TRADE_REOPEN] no new trade yet, re-announcing dealer open")
+			sendMessageWithDelay("Dealer Open, Trade Away.")
+		}
+	}(heartbeatID)
+}
+
+func stopDealerOpenHeartbeat() {
+	if !dealerOpenHeartbeatActive {
+		return
+	}
+	dealerOpenHeartbeatID++
+	dealerOpenHeartbeatActive = false
 }
 
 func scheduleAutoTradeAccept(a *App, payload string) {
@@ -487,8 +560,9 @@ func handleTradeConfirmTimeout(a *App) {
 	log.Printf("[TRADE_CONFIRM_ACCEPT] max attempts reached; sending trade close")
 	ext.Send(out.TRADE_CLOSE)
 
-	closeMsg := fmt.Sprintf("Trade Closed with: %s", partnerName)
+	closeMsg := fmt.Sprintf("Trade Closed: \"%s\"", partnerName)
 	if !isMuted {
+		tradeCloseAnnounced = true
 		sendMessageWithDelay(closeMsg)
 		sendMessageWithDelay("Dealer Open, Trade Away.")
 	} else {

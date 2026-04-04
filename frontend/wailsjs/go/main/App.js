@@ -14,6 +14,10 @@ export function ClearTradeItems() {
   return window['go']['main']['App']['ClearTradeItems']();
 }
 
+export function GetCatalogItemValue(arg1) {
+  return window['go']['main']['App']['GetCatalogItemValue'](arg1);
+}
+
 export function GetCurrentTradeItems() {
   return window['go']['main']['App']['GetCurrentTradeItems']();
 }
@@ -30,12 +34,20 @@ export function GetTradeItemsJSON() {
   return window['go']['main']['App']['GetTradeItemsJSON']();
 }
 
+export function LoadCatalog() {
+  return window['go']['main']['App']['LoadCatalog']();
+}
+
 export function LoadConfig() {
   return window['go']['main']['App']['LoadConfig']();
 }
 
 export function OpenLastTrade() {
   return window['go']['main']['App']['OpenLastTrade']();
+}
+
+export function SaveCatalog(arg1) {
+  return window['go']['main']['App']['SaveCatalog'](arg1);
 }
 
 export function SaveConfig(arg1) {

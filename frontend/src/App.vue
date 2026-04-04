@@ -1,44 +1,82 @@
 <template>
   <div class="poker-config-section">
-    <h2 class="section-title">Poker Hand Configurations</h2>
-    <form @submit.prevent="saveConfig">
-      <div class="form-group" v-for="(value, key) in config" :key="key">
-        <label :for="key">{{ formatLabel(key) }}:</label>
-        <input v-model="config[key]" type="text" :id="key" />
-      </div>
-      <button type="submit" class="save-button">Save</button>
-    </form>
 
-    <button @click="handleShowCommands" class="show-commands-button save-button">Show Commands</button>
-
-    <button @click="handleOpenLastTrade" class="save-button">
-      Open Last Trade: {{ lastTradePartnerName }}
-    </button>
-
-    <button @click="handleSkipDiceSetup" class="save-button">
-      Skip Dice Setup (Testing)
-    </button>
-
-    <!-- Update notice -->
-    <div v-if="isOutdated" class="update-notice">
-      A new version of this application is available. Please update to the latest version.
+    <!-- Tab bar -->
+    <div class="tab-bar">
+      <button
+        v-for="tab in ['Config', 'Catalog', 'Logs']"
+        :key="tab"
+        :class="['tab-btn', { active: activeTab === tab }]"
+        @click="activeTab = tab"
+      >{{ tab }}</button>
     </div>
 
-    <div class="log-grid">
-      <div>
-        <h2 class="section-title">Roll Logs</h2>
-        <div id="log" ref="logbox" class="log-section">
-          <div v-for="(msg, index) in log" :key="`roll-${index}`">{{ msg }}</div>
+    <!-- Config tab -->
+    <div v-if="activeTab === 'Config'">
+      <h2 class="section-title">Poker Hand Configurations</h2>
+      <form @submit.prevent="saveConfig">
+        <div class="form-group" v-for="(value, key) in config" :key="key">
+          <label :for="key">{{ formatLabel(key) }}:</label>
+          <input v-model="config[key]" type="text" :id="key" />
         </div>
-      </div>
+        <button type="submit" class="save-button">Save</button>
+      </form>
 
-      <div>
-        <h2 class="section-title">Chat Logs</h2>
-        <div ref="chatlogbox" class="log-section chat-log-section">
-          <div v-for="(msg, index) in chatLog" :key="`chat-${index}`">{{ msg }}</div>
+      <button @click="handleShowCommands" class="save-button">Show Commands</button>
+      <button @click="handleOpenLastTrade" class="save-button">
+        Open Last Trade: {{ lastTradePartnerName }}
+      </button>
+      <button @click="handleSkipDiceSetup" class="save-button">
+        Skip Dice Setup (Testing)
+      </button>
+
+      <div v-if="isOutdated" class="update-notice">
+        A new version of this application is available. Please update to the latest version.
+      </div>
+    </div>
+
+    <!-- Catalog tab -->
+    <div v-if="activeTab === 'Catalog'">
+      <h2 class="section-title">Item Catalog</h2>
+
+      <table class="catalog-table">
+        <thead>
+          <tr>
+            <th>Item Name</th>
+            <th>Display Name</th>
+            <th>Value (credits)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="(item, index) in catalog" :key="index">
+            <td><span class="catalog-label">{{ item.name }}</span></td>
+            <td><span class="catalog-label">{{ item.display_name }}</span></td>
+            <td><input v-model.number="item.value" type="number" class="catalog-input catalog-value" min="0" /></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <button @click="saveCatalog" class="save-button">Save Catalog</button>
+    </div>
+
+    <!-- Logs tab -->
+    <div v-if="activeTab === 'Logs'">
+      <div class="log-grid">
+        <div>
+          <h2 class="section-title">Roll Logs</h2>
+          <div id="log" ref="logbox" class="log-section">
+            <div v-for="(msg, index) in log" :key="`roll-${index}`">{{ msg }}</div>
+          </div>
+        </div>
+        <div>
+          <h2 class="section-title">Chat Logs</h2>
+          <div ref="chatlogbox" class="log-section chat-log-section">
+            <div v-for="(msg, index) in chatLog" :key="`chat-${index}`">{{ msg }}</div>
+          </div>
         </div>
       </div>
     </div>
+
   </div>
 </template>
 
@@ -46,6 +84,7 @@
 export default {
   data() {
     return {
+      activeTab: 'Config',
       config: {
         five_of_a_kind: '',
         four_of_a_kind: '',
@@ -57,10 +96,11 @@ export default {
         one_pair: '',
         nothing: '',
       },
+      catalog: [],
       log: [],
       chatLog: [],
-      isOutdated: false, // Add this line to initialize isOutdated
-      currentVersion: "", // Will be fetched from backend
+      isOutdated: false,
+      currentVersion: '',
       lastTradePartnerName: 'None',
       tradeNamePollTimer: null,
     };
@@ -165,8 +205,25 @@ export default {
         console.error(error);
       }
     },
+    async loadCatalog() {
+      try {
+        const items = await window.go.main.App.LoadCatalog();
+        this.catalog = items || [];
+      } catch (error) {
+        console.error('Error loading catalog', error);
+      }
+    },
+    async saveCatalog() {
+      try {
+        await window.go.main.App.SaveCatalog(this.catalog);
+        await this.loadCatalog();
+      } catch (error) {
+        console.error('Error saving catalog', error);
+      }
+    },
     fetch() {
       this.loadConfig();
+      this.loadCatalog();
     },
   },
   async mounted() {
@@ -302,5 +359,66 @@ input[type="text"]::placeholder {
   text-align: center;
   border-radius: 4px;
   font-weight: bold;
+}
+
+/* Tab navigation */
+.tab-bar {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 16px;
+}
+.tab-btn {
+  flex: 1;
+  padding: 8px;
+  background-color: #2f2f2f;
+  color: #c0c0c0;
+  border: 1px solid #444;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+}
+.tab-btn:hover {
+  background-color: #1e1e1e;
+}
+.tab-btn.active {
+  background-color: #444;
+  color: #fff;
+  border-color: #888;
+}
+
+/* Catalog table */
+.catalog-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+.catalog-table th {
+  text-align: left;
+  padding: 6px 8px;
+  color: #c0c0c0;
+  border-bottom: 1px solid #444;
+}
+.catalog-table td {
+  padding: 4px 4px;
+}
+.catalog-input {
+  width: 100%;
+  padding: 5px 6px;
+  background-color: #2e2e2e;
+  border: 1px solid #444;
+  border-radius: 4px;
+  color: #fff;
+  font-size: 13px;
+  box-sizing: border-box;
+}
+.catalog-value {
+  width: 80px;
+}
+.catalog-label {
+  display: block;
+  padding: 5px 6px;
+  color: #aaa;
+  font-size: 13px;
 }
 </style>

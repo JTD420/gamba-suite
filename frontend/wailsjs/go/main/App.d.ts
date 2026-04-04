@@ -8,6 +8,8 @@ export function AddLogMsg(arg1:string):Promise<void>;
 
 export function ClearTradeItems():Promise<void>;
 
+export function GetCatalogItemValue(arg1:string):Promise<number|boolean>;
+
 export function GetCurrentTradeItems():Promise<Array<main.TradeItem>>;
 
 export function GetCurrentVersion():Promise<string>;
@@ -16,9 +18,13 @@ export function GetLastTradePartnerName():Promise<string>;
 
 export function GetTradeItemsJSON():Promise<string>;
 
+export function LoadCatalog():Promise<Array<main.CatalogItem>>;
+
 export function LoadConfig():Promise<main.PokerDisplayConfig>;
 
 export function OpenLastTrade():Promise<void>;
+
+export function SaveCatalog(arg1:Array<main.CatalogItem>):Promise<void>;
 
 export function SaveConfig(arg1:main.PokerDisplayConfig):Promise<void>;
 

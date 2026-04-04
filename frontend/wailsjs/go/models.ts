@@ -1,5 +1,21 @@
 export namespace main {
 	
+	export class CatalogItem {
+	    name: string;
+	    display_name: string;
+	    value: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new CatalogItem(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.display_name = source["display_name"];
+	        this.value = source["value"];
+	    }
+	}
 	export class PokerDisplayConfig {
 	    five_of_a_kind: string;
 	    four_of_a_kind: string;

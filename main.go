@@ -29,7 +29,6 @@ var (
 	currentSum       int
 	commandList      string
 	awaitingTradeOpen bool
-	roomUsers        = map[int]string{}
 	isPokerRolling   bool
 	isTriRolling     bool
 	isBJRolling      bool
@@ -63,19 +62,6 @@ type PokerDisplayConfig struct {
 	TwoPair      string `json:"two_pair"`
 	OnePair      string `json:"one_pair"`
 	Nothing      string `json:"nothing"`
-}
-
-type RoomUser struct {
-	Index      int
-	Name       string
-	Figure     string
-	Gender     string
-	Custom     string
-	X, Y       int
-	Z          float64
-	PoolFigure string
-	BadgeCode  string
-	Type       int
 }
 
 func NewApp(ext *g.Ext, assets embed.FS) *App {
@@ -153,8 +139,6 @@ func (a *App) setupExt() {
 	a.ext.Intercept(out.THROW_DICE).With(a.handleThrowDice)
 	a.ext.Intercept(out.DICE_OFF).With(a.handleDiceOff)
 	a.ext.Intercept(in.DICE_VALUE).With(a.handleDiceResult)
-	a.ext.Intercept(in.USERS).With(a.handleUsers)
-	a.ext.Intercept(in.LOGOUT).With(a.handleUserLogout)
 	a.ext.Intercept(in.CHAT, in.CHAT_2, in.CHAT_3).With(a.handleIncomingChat)
 	a.ext.Intercept(out.CHAT).With(a.handleTalk)
 	a.ext.Intercept(out.SHOUT).With(a.handleTalk)
@@ -162,26 +146,6 @@ func (a *App) setupExt() {
 		handleMutePacket(e)
 		handleTradePacket(a, e)
 	})
-}
-
-func (a *App) handleUsers(e *g.Intercept) {
-	count := e.Packet.ReadInt()
-	for range count {
-		var user RoomUser
-		e.Packet.Read(&user)
-		if user.Type == 1 {
-			roomUsers[user.Index] = user.Name
-		}
-	}
-}
-
-func (a *App) handleUserLogout(e *g.Intercept) {
-	s := e.Packet.ReadString()
-	index, err := strconv.Atoi(s)
-	if err != nil {
-		return
-	}
-	delete(roomUsers, index)
 }
 
 func (a *App) runExt() {
@@ -243,15 +207,9 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 	// TRADE_OPEN appears as incoming header 104 in your client logs.
 	if e.Packet.Header.Value == 104 {
-		tradePartnerIndex := e.Packet.ReadInt()
-		tradePartnerName := roomUsers[tradePartnerIndex]
-		if tradePartnerName == "" {
-			tradePartnerName = "unknown"
-		}
-
 		awaitingTradeOpen = false
 		log.Println("TRADE_OPEN detected")
-		a.AddLogMsg(fmt.Sprintf("Trade opened by %s (%d)", tradePartnerName, tradePartnerIndex))
+		a.AddLogMsg("Trade opened")
 	}
 }
 

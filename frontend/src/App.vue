@@ -16,9 +16,20 @@
       A new version of this application is available. Please update to the latest version.
     </div>
 
-    <h2 class="section-title">Roll Logs</h2>
-    <div id="log" ref="logbox" class="log-section">
-      <div v-for="(msg, index) in log" :key="index">{{ msg }}</div>
+    <div class="log-grid">
+      <div>
+        <h2 class="section-title">Roll Logs</h2>
+        <div id="log" ref="logbox" class="log-section">
+          <div v-for="(msg, index) in log" :key="`roll-${index}`">{{ msg }}</div>
+        </div>
+      </div>
+
+      <div>
+        <h2 class="section-title">Chat Logs</h2>
+        <div ref="chatlogbox" class="log-section chat-log-section">
+          <div v-for="(msg, index) in chatLog" :key="`chat-${index}`">{{ msg }}</div>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -39,6 +50,7 @@ export default {
         nothing: '',
       },
       log: [],
+      chatLog: [],
       isOutdated: false, // Add this line to initialize isOutdated
       currentVersion: "", // Will be fetched from backend
     };
@@ -75,18 +87,21 @@ export default {
     },
     addLogMsg(msg) {
       this.log.push(msg);
-      this.$nextTick(() => {
-        const logbox = this.$refs.logbox;
-        logbox.scrollTop = logbox.scrollHeight;
-      });
+      this.scrollBox('logbox');
+    },
+    addChatLogMsg(msg) {
+      this.chatLog.push(msg);
+      this.scrollBox('chatlogbox');
     },
     formatLabel(key) {
       return key.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
     },
-    scrolldown() {
+    scrollBox(refName) {
       this.$nextTick(() => {
-        const box = this.$refs.logbox;
-        box.scrollTop = box.scrollHeight;
+        const box = this.$refs[refName];
+        if (box) {
+          box.scrollTop = box.scrollHeight;
+        }
       });
     },
     async checkForUpdates() {
@@ -124,7 +139,11 @@ export default {
     await this.checkForUpdates();
     window.runtime.EventsOn("logUpdate", (message) => {
       this.log = message.split('\n');
-      this.scrolldown();
+      this.scrollBox('logbox');
+    });
+    window.runtime.EventsOn("chatLogUpdate", (message) => {
+      this.chatLog = message.split('\n');
+      this.scrollBox('chatlogbox');
     });
   }
 };
@@ -214,6 +233,17 @@ input[type="text"]::placeholder {
 /* Add some padding to each log message for readability */
 .log-section div {
   padding: 2px 0;
+}
+
+.log-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+}
+
+.chat-log-section {
+  color: #7dd3fc;
+  border-color: #7dd3fc;
 }
 
 /* Update notice style */

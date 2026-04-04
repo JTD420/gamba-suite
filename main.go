@@ -28,6 +28,8 @@ var (
 	isMuted          bool
 	currentSum       int
 	commandList      string
+	awaitingTradeOpen bool
+	roomUsers        = map[int]string{}
 	isPokerRolling   bool
 	isTriRolling     bool
 	isBJRolling      bool
@@ -46,6 +48,8 @@ type App struct {
 	assets embed.FS
 	log    []string
 	logMu  sync.Mutex
+	chatLog   []string
+	chatLogMu sync.Mutex
 	ctx    context.Context
 }
 
@@ -59,6 +63,19 @@ type PokerDisplayConfig struct {
 	TwoPair      string `json:"two_pair"`
 	OnePair      string `json:"one_pair"`
 	Nothing      string `json:"nothing"`
+}
+
+type RoomUser struct {
+	Index      int
+	Name       string
+	Figure     string
+	Gender     string
+	Custom     string
+	X, Y       int
+	Z          float64
+	PoolFigure string
+	BadgeCode  string
+	Type       int
 }
 
 func NewApp(ext *g.Ext, assets embed.FS) *App {
@@ -136,11 +153,35 @@ func (a *App) setupExt() {
 	a.ext.Intercept(out.THROW_DICE).With(a.handleThrowDice)
 	a.ext.Intercept(out.DICE_OFF).With(a.handleDiceOff)
 	a.ext.Intercept(in.DICE_VALUE).With(a.handleDiceResult)
+	a.ext.Intercept(in.USERS).With(a.handleUsers)
+	a.ext.Intercept(in.LOGOUT).With(a.handleUserLogout)
+	a.ext.Intercept(in.CHAT, in.CHAT_2, in.CHAT_3).With(a.handleIncomingChat)
 	a.ext.Intercept(out.CHAT).With(a.handleTalk)
 	a.ext.Intercept(out.SHOUT).With(a.handleTalk)
 	a.ext.InterceptAll(func(e *g.Intercept) {
 		handleMutePacket(e)
+		handleTradePacket(a, e)
 	})
+}
+
+func (a *App) handleUsers(e *g.Intercept) {
+	count := e.Packet.ReadInt()
+	for range count {
+		var user RoomUser
+		e.Packet.Read(&user)
+		if user.Type == 1 {
+			roomUsers[user.Index] = user.Name
+		}
+	}
+}
+
+func (a *App) handleUserLogout(e *g.Intercept) {
+	s := e.Packet.ReadString()
+	index, err := strconv.Atoi(s)
+	if err != nil {
+		return
+	}
+	delete(roomUsers, index)
 }
 
 func (a *App) runExt() {
@@ -194,8 +235,29 @@ func handleMutePacket(e *g.Intercept) {
 	}
 }
 
+// Trade detection logic (called within InterceptAll)
+func handleTradePacket(a *App, e *g.Intercept) {
+	if !awaitingTradeOpen {
+		return
+	}
+
+	// TRADE_OPEN appears as incoming header 104 in your client logs.
+	if e.Packet.Header.Value == 104 {
+		tradePartnerIndex := e.Packet.ReadInt()
+		tradePartnerName := roomUsers[tradePartnerIndex]
+		if tradePartnerName == "" {
+			tradePartnerName = "unknown"
+		}
+
+		awaitingTradeOpen = false
+		log.Println("TRADE_OPEN detected")
+		a.AddLogMsg(fmt.Sprintf("Trade opened by %s (%d)", tradePartnerName, tradePartnerIndex))
+	}
+}
+
 func (a *App) onChatMessage(e *g.Intercept) {
 	msg := e.Packet.ReadString()
+	a.AddChatLog("[OUT] " + msg)
 
 	// Process commands based on the message prefix and suffix
 	if strings.HasPrefix(msg, ":") {
@@ -213,10 +275,7 @@ func (a *App) onChatMessage(e *g.Intercept) {
 			resetDiceState()
 		case strings.HasSuffix(command, "roll"):
 			e.Block()
-			isPokerRolling = true
-			logRollResult := fmt.Sprintf("Poker Roll:\n")
-			a.AddLogMsg(logRollResult)
-			go a.rollPokerDice()
+			a.startPokerRoll()
 		case strings.HasSuffix(command, "tri"):
 			e.Block()
 			isTriRolling = true
@@ -266,12 +325,20 @@ func (a *App) evalAt(msg string) {
 	mutex.Unlock()
 }
 
+func (a *App) startPokerRoll() {
+	isPokerRolling = true
+	logRollResult := fmt.Sprintf("Poker Roll:\n")
+	a.AddLogMsg(logRollResult)
+	go a.rollPokerDice()
+}
+
 // Reset all saved dice states
 func resetDiceState() {
 	mutex.Lock()
 	defer mutex.Unlock()
 	resultsWaitGroup.Wait() // Ensure all dice roll results are processed
 	diceList = []*Dice{}
+	awaitingTradeOpen = false
 	isPokerRolling, isTriRolling, isBJRolling, is13Rolling, isHitting, is13Hitting, isClosing = false, false, false, false, false, false, false
 }
 
@@ -309,6 +376,12 @@ func (a *App) handleThrowDice(e *g.Intercept) {
 		if len(diceList) == 5 {
 			message := "Dice setup sucessful! Run :roll to confirm"
 			a.AddLogMsg(message)
+			awaitingTradeOpen = true
+			if !isMuted {
+				go sendMessageWithDelay("Dealer Open, Trade Away.")
+			} else {
+				log.Printf("User is muted. Skipping dealer open prompt message.")
+			}
 		}
 	}
 }
@@ -714,6 +787,20 @@ func (a *App) AddLogMsg(msg string) {
 	runtime.EventsEmit(a.ctx, "logUpdate", strings.Join(a.log, "\n"))
 }
 
+func (a *App) AddChatLog(msg string) {
+	a.chatLogMu.Lock()
+	defer a.chatLogMu.Unlock()
+
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	timestampedMsg := fmt.Sprintf("[%s] %s", timestamp, msg)
+
+	a.chatLog = append(a.chatLog, timestampedMsg)
+	if len(a.chatLog) > 100 {
+		a.chatLog = a.chatLog[1:]
+	}
+	runtime.EventsEmit(a.ctx, "chatLogUpdate", strings.Join(a.chatLog, "\n"))
+}
+
 // Thanks QDave <3
 func (a *App) handleTalk(e *g.Intercept) {
 	msg := e.Packet.ReadString()
@@ -721,4 +808,19 @@ func (a *App) handleTalk(e *g.Intercept) {
 		runtime.WindowShow(a.ctx)
 		e.Block()
 	}
+}
+
+func (a *App) handleIncomingChat(e *g.Intercept) {
+	index := e.Packet.ReadInt()
+	msg := e.Packet.ReadString()
+
+	chatType := "CHAT"
+	if e.Is(in.CHAT_2) {
+		chatType = "WHISPER"
+	} else if e.Is(in.CHAT_3) {
+		chatType = "SHOUT"
+	}
+
+	log.Printf("[INCOMING %s] %d -> %s", chatType, index, msg)
+	a.AddChatLog(fmt.Sprintf("[IN %s] %d -> %s", chatType, index, msg))
 }

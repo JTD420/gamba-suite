@@ -742,16 +742,37 @@ func parseTradeItemsPacket(data []byte) []TradeItem {
 }
 
 func extractTradeItemName(field string) (string, bool) {
-	if !strings.Contains(field, "|") {
-		return "", false
+	// Legacy format example: "itkoHP|club_sofa"
+	if strings.Contains(field, "|") {
+		parts := strings.Split(field, "|")
+		if len(parts) >= 2 {
+			if name, ok := normalizeTradeItemName(parts[len(parts)-1]); ok {
+				return name, true
+			}
+		}
 	}
 
-	parts := strings.Split(field, "|")
-	if len(parts) < 2 {
-		return "", false
+	// Current format example: "irbUAXb{chair_plasty*109"
+	if strings.Contains(field, "{") {
+		parts := strings.SplitN(field, "{", 2)
+		if len(parts) == 2 {
+			raw := parts[1]
+			star := strings.Index(raw, "*")
+			if star < 0 {
+				return "", false
+			}
+			raw = raw[:star]
+			if name, ok := normalizeTradeItemName(raw); ok {
+				return name, true
+			}
+		}
 	}
 
-	name := strings.TrimSpace(parts[len(parts)-1])
+	return "", false
+}
+
+func normalizeTradeItemName(raw string) (string, bool) {
+	name := strings.TrimSpace(strings.ToLower(raw))
 	if name == "" || isCoordinatePattern(name) {
 		return "", false
 	}

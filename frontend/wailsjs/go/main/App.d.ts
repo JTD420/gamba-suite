@@ -8,7 +8,11 @@ export function AddLogMsg(arg1:string):Promise<void>;
 
 export function GetCurrentVersion():Promise<string>;
 
+export function GetLastTradePartnerName():Promise<string>;
+
 export function LoadConfig():Promise<main.PokerDisplayConfig>;
+
+export function OpenLastTrade():Promise<void>;
 
 export function SaveConfig(arg1:main.PokerDisplayConfig):Promise<void>;
 

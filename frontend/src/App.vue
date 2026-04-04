@@ -11,6 +11,10 @@
 
     <button @click="handleShowCommands" class="show-commands-button save-button">Show Commands</button>
 
+    <button @click="handleOpenLastTrade" class="save-button">
+      Open Last Trade: {{ lastTradePartnerName }}
+    </button>
+
     <!-- Update notice -->
     <div v-if="isOutdated" class="update-notice">
       A new version of this application is available. Please update to the latest version.
@@ -53,6 +57,8 @@ export default {
       chatLog: [],
       isOutdated: false, // Add this line to initialize isOutdated
       currentVersion: "", // Will be fetched from backend
+      lastTradePartnerName: 'None',
+      tradeNamePollTimer: null,
     };
   },
   methods: {
@@ -82,6 +88,24 @@ export default {
         this.addLogMsg('Configuration saved');
       } catch (error) {
         this.addLogMsg('Error saving configuration');
+        console.error(error);
+      }
+    },
+    async refreshLastTradePartnerName() {
+      try {
+        const name = await window.go.main.App.GetLastTradePartnerName();
+        this.lastTradePartnerName = name || 'None';
+      } catch (error) {
+        console.error(error);
+      }
+    },
+    async handleOpenLastTrade() {
+      try {
+        await window.go.main.App.OpenLastTrade();
+        this.addLogMsg(`Open Last Trade clicked (${this.lastTradePartnerName})`);
+        await this.refreshLastTradePartnerName();
+      } catch (error) {
+        this.addLogMsg('Error opening last trade');
         console.error(error);
       }
     },
@@ -136,6 +160,7 @@ export default {
   async mounted() {
     await this.fetchCurrentVersion();
     this.fetch();
+    await this.refreshLastTradePartnerName();
     await this.checkForUpdates();
     window.runtime.EventsOn("logUpdate", (message) => {
       this.log = message.split('\n');
@@ -145,6 +170,16 @@ export default {
       this.chatLog = message.split('\n');
       this.scrollBox('chatlogbox');
     });
+
+    this.tradeNamePollTimer = setInterval(() => {
+      this.refreshLastTradePartnerName();
+    }, 2000);
+  },
+  beforeUnmount() {
+    if (this.tradeNamePollTimer) {
+      clearInterval(this.tradeNamePollTimer);
+      this.tradeNamePollTimer = null;
+    }
   }
 };
 </script>

@@ -14,8 +14,16 @@ export function GetCurrentVersion() {
   return window['go']['main']['App']['GetCurrentVersion']();
 }
 
+export function GetLastTradePartnerName() {
+  return window['go']['main']['App']['GetLastTradePartnerName']();
+}
+
 export function LoadConfig() {
   return window['go']['main']['App']['LoadConfig']();
+}
+
+export function OpenLastTrade() {
+  return window['go']['main']['App']['OpenLastTrade']();
 }
 
 export function SaveConfig(arg1) {

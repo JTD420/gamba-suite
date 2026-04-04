@@ -9,6 +9,8 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,8 +19,10 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 	g "xabbo.b7c.io/goearth"
+	gencoding "xabbo.b7c.io/goearth/encoding"
 	"xabbo.b7c.io/goearth/shockwave/in"
 	"xabbo.b7c.io/goearth/shockwave/out"
+	room "xabbo.b7c.io/goearth/shockwave/room"
 )
 
 // Global variables for dice management, rolling state, mutex, and wait group
@@ -29,6 +33,12 @@ var (
 	currentSum       int
 	commandList      string
 	awaitingTradeOpen bool
+	tradeOpenCount    int
+	tradeCloseCount   int
+	lastTradePartnerID int
+	lastTradePartnerName string
+	lastTradeOpenData string
+	lastTradeOpen     string
 	isPokerRolling   bool
 	isTriRolling     bool
 	isBJRolling      bool
@@ -40,6 +50,14 @@ var (
 	mutex            sync.Mutex
 	resultsWaitGroup sync.WaitGroup
 	rollDelay        = 550 * time.Millisecond
+	tradeUserPattern = regexp.MustCompile(`\[(\d+)\]`)
+	roomEntities     = map[int]room.Entity{}
+	roomMu           sync.Mutex
+	users28ByToken   = map[string]string{}
+	users28Mu        sync.Mutex
+	headerSniffUntil time.Time
+	headerSniffSeen  = map[uint16]bool{}
+	headerSniffMu    sync.Mutex
 )
 
 type App struct {
@@ -140,11 +158,16 @@ func (a *App) setupExt() {
 	a.ext.Intercept(out.DICE_OFF).With(a.handleDiceOff)
 	a.ext.Intercept(in.DICE_VALUE).With(a.handleDiceResult)
 	a.ext.Intercept(in.CHAT, in.CHAT_2, in.CHAT_3).With(a.handleIncomingChat)
+	a.ext.Intercept(in.ROOM_READY).With(a.handleRoomReady)
+	a.ext.Intercept(in.USERS).With(a.handleRoomUsers)
+	a.ext.Intercept(in.SPACENODEUSERS).With(a.handleRoomUsers)
 	a.ext.Intercept(out.CHAT).With(a.handleTalk)
 	a.ext.Intercept(out.SHOUT).With(a.handleTalk)
 	a.ext.InterceptAll(func(e *g.Intercept) {
 		handleMutePacket(e)
 		handleTradePacket(a, e)
+		handleUsers28Packet(a, e)
+		handleIncomingHeaderSniff(a, e)
 	})
 }
 
@@ -201,16 +224,543 @@ func handleMutePacket(e *g.Intercept) {
 
 // Trade detection logic (called within InterceptAll)
 func handleTradePacket(a *App, e *g.Intercept) {
-	if !awaitingTradeOpen {
+	if e.Packet.Header.Value == 104 {
+		if !awaitingTradeOpen {
+			return
+		}
+
+		for _, decodeLine := range decodeTradeOpenPacket(e.Packet) {
+			a.AddLogMsg("[TRADE_OPEN_DECODE] " + decodeLine)
+			log.Printf("[TRADE_OPEN_DECODE] %s", decodeLine)
+		}
+
+		for _, candidateLine := range describeTradeRoomCandidates(a.ext) {
+			a.AddLogMsg("[TRADE_ROOM] " + candidateLine)
+			log.Printf("[TRADE_ROOM] %s", candidateLine)
+		}
+
+		if len(e.Packet.Data) >= 4 {
+			tradeToken := string(e.Packet.Data[:4])
+			if name, ok := lookupUsers28Token(tradeToken); ok {
+				a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] token %q matched user %q", tradeToken, name))
+				log.Printf("[TRADE_OPEN] token %q matched user %q", tradeToken, name)
+			} else {
+				a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] token %q not found in USERS[28] cache", tradeToken))
+				log.Printf("[TRADE_OPEN] token %q not found in USERS[28] cache", tradeToken)
+			}
+
+			if idx, name, ok := resolveTradeTokenToRoomIndex(tradeToken); ok {
+				lastTradePartnerID = idx
+				lastTradePartnerName = name
+				outPreview := string(ext.NewPacket(out.TRADE_OPEN, idx).Data)
+				a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] token %q resolved room index %d (%q) -> outgoing[%d] %q", tradeToken, idx, name, 71, outPreview))
+				log.Printf("[TRADE_OPEN] token %q resolved room index %d (%q) -> outgoing[%d] %q", tradeToken, idx, name, 71, outPreview)
+			}
+		}
+
+		tradePayload := strings.TrimSpace(string(e.Packet.Data))
+		if tradePayload == "" {
+			tradePayload = "(empty payload)"
+		}
+
+		tradeOpenCount++
+		lastTradeOpenData = string(e.Packet.Data)
+		lastTradeOpen = fmt.Sprintf("Incoming[%d] -> %s", e.Packet.Header.Value, tradePayload)
+		if lastTradePartnerID > 0 {
+			partnerID := lastTradePartnerID
+			outPreview := string(ext.NewPacket(out.TRADE_OPEN, partnerID).Data)
+			a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #%d] derived outgoing[%d] -> %s (partner id %d)", tradeOpenCount, 71, outPreview, partnerID))
+			log.Printf("[TRADE_OPEN #%d] derived outgoing[%d] -> %s (partner id %d)", tradeOpenCount, 71, outPreview, partnerID)
+		} else if partnerID, ok := extractTradePartnerID(tradePayload); ok {
+			lastTradePartnerID = partnerID
+			lastTradePartnerName = "Unknown"
+			outPreview := string(ext.NewPacket(out.TRADE_OPEN, partnerID).Data)
+			a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #%d] fallback candidate outgoing[%d] -> %s (partner id %d)", tradeOpenCount, 71, outPreview, partnerID))
+			log.Printf("[TRADE_OPEN #%d] fallback candidate outgoing[%d] -> %s (partner id %d)", tradeOpenCount, 71, outPreview, partnerID)
+		} else {
+			lastTradePartnerID = 0
+			a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #%d] unresolved reopen target: waiting for room-user mapping", tradeOpenCount))
+			log.Printf("[TRADE_OPEN #%d] unresolved reopen target: waiting for room-user mapping", tradeOpenCount)
+		}
+		awaitingTradeOpen = false
+		log.Printf("[TRADE_OPEN #%d] %s", tradeOpenCount, lastTradeOpen)
+		a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #%d] %s", tradeOpenCount, lastTradeOpen))
 		return
 	}
 
-	// TRADE_OPEN appears as incoming header 104 in your client logs.
-	if e.Packet.Header.Value == 104 {
-		awaitingTradeOpen = false
-		log.Println("TRADE_OPEN detected")
-		a.AddLogMsg("Trade opened")
+	// TRADE_CLOSE appears as incoming header 110 in your client logs.
+	if e.Packet.Header.Value == 110 {
+		tradeClosePayload := strings.TrimSpace(string(e.Packet.Data))
+		if tradeClosePayload == "" {
+			tradeClosePayload = "(empty payload)"
+		}
+
+		tradeCloseCount++
+		closeLog := fmt.Sprintf("Incoming[%d] -> %s", e.Packet.Header.Value, tradeClosePayload)
+		log.Printf("[TRADE_CLOSE #%d] %s", tradeCloseCount, closeLog)
+		a.AddLogMsg(fmt.Sprintf("[TRADE_CLOSE #%d] %s", tradeCloseCount, closeLog))
+
+		partnerID := lastTradePartnerID
+		if partnerID <= 0 {
+			requestRoomUsers(a)
+			a.AddLogMsg("[TRADE_REOPEN] not ready: no last trade target, requested room users")
+			return
+		}
+
+		a.AddLogMsg(fmt.Sprintf("[TRADE_REOPEN] ready for manual reopen -> %s (%d)", lastTradePartnerName, partnerID))
+		log.Printf("[TRADE_REOPEN] ready for manual reopen -> %s (%d)", lastTradePartnerName, partnerID)
 	}
+}
+
+func extractTradePartnerID(payload string) (int, bool) {
+	matches := tradeUserPattern.FindStringSubmatch(payload)
+	if len(matches) < 2 {
+		return 0, false
+	}
+
+	partnerID, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return 0, false
+	}
+
+	return partnerID, true
+}
+
+func decodeTradeOpenPacket(pkt *g.Packet) []string {
+	copyPacket := func() *g.Packet {
+		return &g.Packet{
+			Client: pkt.Client,
+			Header: pkt.Header,
+			Data:   append([]byte(nil), pkt.Data...),
+			Pos:    0,
+		}
+	}
+
+	lines := []string{
+		fmt.Sprintf("raw=%q", string(pkt.Data)),
+		fmt.Sprintf("hex=% X", pkt.Data),
+		fmt.Sprintf("len=%d", len(pkt.Data)),
+	}
+
+	if v, pos, ok := tryReadInt(copyPacket()); ok {
+		lines = append(lines, fmt.Sprintf("layout int -> id=%d (pos=%d)", v, pos))
+	}
+
+	if id, s, pos, ok := tryReadIntString(copyPacket()); ok {
+		lines = append(lines, fmt.Sprintf("layout int,string -> id=%d text=%q (pos=%d)", id, s, pos))
+	}
+
+	if s, pos, ok := tryReadString(copyPacket()); ok {
+		lines = append(lines, fmt.Sprintf("layout string -> text=%q (pos=%d)", s, pos))
+	}
+
+	if a, b, pos, ok := tryReadIntInt(copyPacket()); ok {
+		lines = append(lines, fmt.Sprintf("layout int,int -> a=%d b=%d (pos=%d)", a, b, pos))
+	}
+
+	lines = append(lines, scanTradeOpenFields(pkt.Data)...)
+
+	return lines
+}
+
+func scanTradeOpenFields(data []byte) []string {
+	lines := []string{}
+
+	for offset := 0; offset < len(data); offset++ {
+		remaining := len(data) - offset
+
+		if remaining >= 2 {
+			chunk := data[offset : offset+2]
+			lines = append(lines, fmt.Sprintf("scan b64_2 @%d -> %q = %d", offset, string(chunk), gencoding.B64Decode(chunk)))
+		}
+
+		if remaining >= 3 {
+			chunk := data[offset : offset+3]
+			lines = append(lines, fmt.Sprintf("scan b64_3 @%d -> %q = %d", offset, string(chunk), gencoding.B64Decode(chunk)))
+		}
+
+		vl64Len := gencoding.VL64DecodeLen(data[offset])
+		if vl64Len > 0 && vl64Len <= 6 && remaining >= vl64Len {
+			chunk := data[offset : offset+vl64Len]
+			lines = append(lines, fmt.Sprintf("scan vl64 @%d len=%d -> %q = %d", offset, vl64Len, string(chunk), gencoding.VL64Decode(chunk)))
+		}
+	}
+
+	return lines
+}
+
+func handleUsers28Packet(a *App, e *g.Intercept) {
+	if e.Packet.Header.Dir != g.In {
+		return
+	}
+
+	if e.Packet.Header.Value != 28 {
+		return
+	}
+
+	raw := string(e.Packet.Data)
+	entries := extractUsers28Entries(raw)
+	if len(entries) == 0 {
+		a.AddLogMsg(fmt.Sprintf("[USERS28] received header %d but found no parseable entries raw=%q", e.Packet.Header.Value, raw))
+		log.Printf("[USERS28] received header %d but found no parseable entries raw=%q", e.Packet.Header.Value, raw)
+		return
+	}
+
+	users28Mu.Lock()
+	for _, entry := range entries {
+		users28ByToken[entry.Token] = entry.Name
+	}
+	users28Mu.Unlock()
+
+	for _, entry := range entries {
+		a.AddLogMsg(fmt.Sprintf("[USERS28] header=%d token=%q name=%q", e.Packet.Header.Value, entry.Token, entry.Name))
+		log.Printf("[USERS28] header=%d token=%q name=%q", e.Packet.Header.Value, entry.Token, entry.Name)
+	}
+}
+
+func lookupUsers28Token(token string) (string, bool) {
+	users28Mu.Lock()
+	defer users28Mu.Unlock()
+	name, ok := users28ByToken[token]
+	return name, ok
+}
+
+func (a *App) OpenLastTrade() {
+	if lastTradePartnerID <= 0 {
+		a.AddLogMsg("Open Last Trade failed: no last trader cached yet")
+		requestRoomUsers(a)
+		return
+	}
+
+	ext.Send(out.TRADE_OPEN, lastTradePartnerID)
+	outPreview := string(ext.NewPacket(out.TRADE_OPEN, lastTradePartnerID).Data)
+	a.AddLogMsg(fmt.Sprintf("Open Last Trade sent -> %s (%d), Outgoing[71] %q", lastTradePartnerName, lastTradePartnerID, outPreview))
+}
+
+func (a *App) GetLastTradePartnerName() string {
+	if lastTradePartnerID <= 0 {
+		return "None"
+	}
+	if strings.TrimSpace(lastTradePartnerName) == "" {
+		return "Unknown"
+	}
+	return lastTradePartnerName
+}
+
+type user28Entry struct {
+	Token string
+	Name  string
+}
+
+func extractUsers28Entries(raw string) []user28Entry {
+	parts := strings.Split(raw, "\x02")
+	entries := make([]user28Entry, 0)
+
+	for _, part := range parts {
+		name, token, ok := parseUsers28Head(part)
+		if !ok {
+			continue
+		}
+		entries = append(entries, user28Entry{Token: token, Name: name})
+	}
+
+	return entries
+}
+
+func parseUsers28Head(part string) (name string, token string, ok bool) {
+	if len(part) < 7 {
+		return "", "", false
+	}
+
+	nameStart := len(part)
+	for nameStart > 0 && isLikelyNameChar(part[nameStart-1]) {
+		nameStart--
+	}
+
+	if nameStart < 5 || nameStart >= len(part) {
+		return "", "", false
+	}
+
+	name = part[nameStart:]
+	if len(name) < 2 {
+		return "", "", false
+	}
+
+	token = part[nameStart-4 : nameStart]
+	if !isLikelyToken(token) {
+		return "", "", false
+	}
+
+	return name, token, true
+}
+
+func isLikelyNameChar(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_' || b == '-'
+}
+
+func isLikelyToken(s string) bool {
+	if len(s) != 4 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < 32 || s[i] > 126 {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *App) handleRoomReady(e *g.Intercept) {
+	roomMu.Lock()
+	defer roomMu.Unlock()
+	clear(roomEntities)
+	a.AddLogMsg("[ROOM_USERS] cleared cached room users")
+	log.Printf("[ROOM_USERS] cleared cached room users")
+	go requestRoomUsers(a)
+}
+
+func (a *App) handleRoomUsers(e *g.Intercept) {
+	defer func() {
+		if recover() != nil {
+			a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] failed to parse packet %d", e.Packet.Header.Value))
+			log.Printf("[ROOM_USERS] failed to parse packet %d", e.Packet.Header.Value)
+		}
+	}()
+
+	a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] received packet %d len=%d", e.Packet.Header.Value, len(e.Packet.Data)))
+	log.Printf("[ROOM_USERS] received packet %d len=%d", e.Packet.Header.Value, len(e.Packet.Data))
+
+	count := e.Packet.ReadInt()
+
+	roomMu.Lock()
+
+	for range count {
+		var entity room.Entity
+		e.Packet.Read(&entity)
+		if entity.Type == room.User {
+			roomEntities[entity.Index] = entity
+		}
+	}
+	roomMu.Unlock()
+
+	for _, line := range summarizeRoomUsers() {
+		a.AddLogMsg("[ROOM_USERS] " + line)
+		log.Printf("[ROOM_USERS] %s", line)
+	}
+}
+
+func requestRoomUsers(a *App) {
+	defer func() {
+		if recover() != nil {
+			a.AddLogMsg("[ROOM_USERS] request failed")
+			log.Printf("[ROOM_USERS] request failed")
+		}
+	}()
+
+	// G_USRS is the packet this client uses to request the in-room USERS list (header 61).
+	a.ext.Send(out.G_USRS)
+	// Keep legacy request as a secondary path in case the server expects both in some sessions.
+	a.ext.Send(out.GETSPACENODEUSERS)
+	startIncomingHeaderSniff(8 * time.Second)
+	a.AddLogMsg("[ROOM_USERS] requested current room users via G_USRS + GETSPACENODEUSERS")
+	log.Printf("[ROOM_USERS] requested current room users via G_USRS + GETSPACENODEUSERS")
+}
+
+func startIncomingHeaderSniff(duration time.Duration) {
+	headerSniffMu.Lock()
+	defer headerSniffMu.Unlock()
+	headerSniffUntil = time.Now().Add(duration)
+	headerSniffSeen = map[uint16]bool{}
+}
+
+func handleIncomingHeaderSniff(a *App, e *g.Intercept) {
+	if e.Packet.Header.Dir != g.In {
+		return
+	}
+
+	headerSniffMu.Lock()
+	active := time.Now().Before(headerSniffUntil)
+	if !active {
+		headerSniffMu.Unlock()
+		return
+	}
+
+	header := e.Packet.Header.Value
+	if headerSniffSeen[header] {
+		headerSniffMu.Unlock()
+		return
+	}
+	headerSniffSeen[header] = true
+	headerSniffMu.Unlock()
+
+	preview := string(e.Packet.Data)
+	if len(preview) > 32 {
+		preview = preview[:32]
+	}
+	name := ext.Headers().Name(e.Packet.Header)
+	a.AddLogMsg(fmt.Sprintf("[HEADER_SNIFF] incoming[%d:%s] len=%d preview=%q", header, name, len(e.Packet.Data), preview))
+	log.Printf("[HEADER_SNIFF] incoming[%d:%s] len=%d preview=%q", header, name, len(e.Packet.Data), preview)
+}
+
+func summarizeRoomUsers() []string {
+	roomMu.Lock()
+	defer roomMu.Unlock()
+
+	if len(roomEntities) == 0 {
+		return []string{"no cached room users"}
+	}
+
+	indices := make([]int, 0, len(roomEntities))
+	for index := range roomEntities {
+		indices = append(indices, index)
+	}
+	sort.Ints(indices)
+
+	entries := make([]string, 0, len(indices))
+	for _, index := range indices {
+		entity := roomEntities[index]
+		_, cleanedName, ok := splitTokenAndName(entity.Name)
+		if ok {
+			entries = append(entries, fmt.Sprintf("%s(%d)", cleanedName, entity.Index))
+		} else {
+			entries = append(entries, fmt.Sprintf("%s(%d)", entity.Name, entity.Index))
+		}
+	}
+
+	return []string{fmt.Sprintf("cached %d room user(s): %s", len(entries), strings.Join(entries, ", "))}
+}
+
+func describeTradeRoomCandidates(ext *g.Ext) []string {
+	roomMu.Lock()
+	defer roomMu.Unlock()
+
+	if len(roomEntities) == 0 {
+		return []string{"no cached room users"}
+	}
+
+	indices := make([]int, 0, len(roomEntities))
+	for index := range roomEntities {
+		indices = append(indices, index)
+	}
+	sort.Ints(indices)
+
+	lines := make([]string, 0, len(indices))
+	for _, index := range indices {
+		entity := roomEntities[index]
+		token, cleanName, hasToken := splitTokenAndName(entity.Name)
+		displayName := entity.Name
+		if hasToken {
+			displayName = cleanName
+			users28Mu.Lock()
+			users28ByToken[token] = cleanName
+			users28Mu.Unlock()
+		}
+		libraryPayload := string(ext.NewPacket(out.TRADE_OPEN, index).Data)
+		lines = append(lines, fmt.Sprintf(
+			"name=%q index=%d candidates{library_int=%q vl64=%q b64_2=%q b64_3=%q}",
+			displayName,
+			entity.Index,
+			libraryPayload,
+			encodeVL64(entity.Index),
+			encodeB64(entity.Index, 2),
+			encodeB64(entity.Index, 3),
+		))
+	}
+
+	return lines
+}
+
+func splitTokenAndName(s string) (token string, name string, ok bool) {
+	if len(s) < 6 {
+		return "", "", false
+	}
+	token = s[:4]
+	name = s[4:]
+	if !isLikelyToken(token) || len(name) < 2 {
+		return "", "", false
+	}
+	for i := 0; i < len(name); i++ {
+		if !isLikelyNameChar(name[i]) && name[i] != ' ' {
+			return "", "", false
+		}
+	}
+	return token, name, true
+}
+
+func resolveTradeTokenToRoomIndex(token string) (index int, name string, ok bool) {
+	roomMu.Lock()
+	defer roomMu.Unlock()
+
+	for _, entity := range roomEntities {
+		entityToken, cleanName, hasToken := splitTokenAndName(entity.Name)
+		if hasToken && entityToken == token {
+			return entity.Index, cleanName, true
+		}
+	}
+
+	return 0, "", false
+}
+
+func encodeVL64(value int) string {
+	buf := make([]byte, gencoding.VL64EncodeLen(value))
+	gencoding.VL64Encode(buf, value)
+	return string(buf)
+}
+
+func encodeB64(value int, length int) string {
+	buf := make([]byte, length)
+	gencoding.B64Encode(buf, value)
+	return string(buf)
+}
+
+func tryReadInt(pkt *g.Packet) (value int, pos int, ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+
+	value = pkt.ReadInt()
+	pos = pkt.Pos
+	return value, pos, true
+}
+
+func tryReadString(pkt *g.Packet) (value string, pos int, ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+
+	value = pkt.ReadString()
+	pos = pkt.Pos
+	return value, pos, true
+}
+
+func tryReadIntString(pkt *g.Packet) (id int, text string, pos int, ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+
+	id = pkt.ReadInt()
+	text = pkt.ReadString()
+	pos = pkt.Pos
+	return id, text, pos, true
+}
+
+func tryReadIntInt(pkt *g.Packet) (a int, b int, pos int, ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+
+	a = pkt.ReadInt()
+	b = pkt.ReadInt()
+	pos = pkt.Pos
+	return a, b, pos, true
 }
 
 func (a *App) onChatMessage(e *g.Intercept) {
@@ -334,6 +884,7 @@ func (a *App) handleThrowDice(e *g.Intercept) {
 		if len(diceList) == 5 {
 			message := "Dice setup sucessful! Run :roll to confirm"
 			a.AddLogMsg(message)
+			go requestRoomUsers(a)
 			awaitingTradeOpen = true
 			if !isMuted {
 				go sendMessageWithDelay("Dealer Open, Trade Away.")

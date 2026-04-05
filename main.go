@@ -731,6 +731,16 @@ func startPokerPayout(a *App, targetID int, targetName string) {
 			}
 			pokerPayoutAttempts = attempt
 
+			if strings.TrimSpace(targetName) != "" {
+				go requestRoomUsers(a)
+				if resolvedID, ok := waitForUsers28NameIndex(targetName, 900*time.Millisecond); ok && resolvedID > 0 && resolvedID != targetID {
+					a.AddLogMsg(fmt.Sprintf("[PAYOUT] refreshed %s room index %d -> %d", targetName, targetID, resolvedID))
+					log.Printf("[PAYOUT] refreshed %s room index %d -> %d", targetName, targetID, resolvedID)
+					targetID = resolvedID
+					pokerPayoutTargetID = resolvedID
+				}
+			}
+
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT] opening trade with %s (%d), attempt %d/5", targetName, targetID, attempt))
 			log.Printf("[PAYOUT] opening trade with %s (%d), attempt %d/5", targetName, targetID, attempt)
 			pokerPayoutTradeSent = true
@@ -1171,6 +1181,33 @@ func waitForUsers28IndexName(index int, timeout time.Duration) (string, bool) {
 	return "", false
 }
 
+func lookupUsers28NameIndex(name string) (int, bool) {
+	needle := strings.ToLower(strings.TrimSpace(name))
+	if needle == "" {
+		return 0, false
+	}
+
+	users28Mu.Lock()
+	defer users28Mu.Unlock()
+	for idx, cachedName := range users28ByIndex {
+		if strings.ToLower(strings.TrimSpace(cachedName)) == needle {
+			return idx, true
+		}
+	}
+	return 0, false
+}
+
+func waitForUsers28NameIndex(name string, timeout time.Duration) (int, bool) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if idx, ok := lookupUsers28NameIndex(name); ok {
+			return idx, true
+		}
+		time.Sleep(75 * time.Millisecond)
+	}
+	return 0, false
+}
+
 // parseTradeItemsPacket extracts trade items from TRADE_ITEMS packet (header 108)
 // Items are separated by \x02 bytes and may contain item names and quantities.
 func (a *App) parseTradeItemsPacket(data []byte) []TradeItem {
@@ -1315,9 +1352,16 @@ func isCoordinatePattern(s string) bool {
 }
 
 func (a *App) OpenLastTrade() {
+	if strings.TrimSpace(lastTradePartnerName) != "" && lastTradePartnerName != "Unknown" {
+		if idx, ok := lookupUsers28NameIndex(lastTradePartnerName); ok && idx > 0 && idx != lastTradePartnerID {
+			a.AddLogMsg(fmt.Sprintf("Open Last Trade refreshed partner index by name: %s (%d -> %d)", lastTradePartnerName, lastTradePartnerID, idx))
+			lastTradePartnerID = idx
+		}
+	}
+
 	if lastTradePartnerID <= 0 {
 		a.AddLogMsg("Open Last Trade failed: no last trader cached yet")
-		requestRoomUsers(a)
+		go requestRoomUsers(a)
 		return
 	}
 
@@ -1944,11 +1988,17 @@ func (a *App) getTradeCoverageShortages() []tradeShortage {
 		haveByName[item.Name] += item.Quantity
 	}
 
+	incomingByName := map[string]int{}
+	for _, item := range partnerItems {
+		incomingByName[item.Name] += item.Quantity
+	}
+
 	shortages := make([]tradeShortage, 0)
 	for _, item := range partnerItems {
 		required := item.Quantity
 		payoutTotal := item.Quantity * 2
-		have := haveByName[item.Name]
+		// Payout happens after this trade completes, so include incoming bet items.
+		have := haveByName[item.Name] + incomingByName[item.Name]
 		if have < payoutTotal {
 			shortages = append(shortages, tradeShortage{
 				Name: item.Name,
@@ -3226,13 +3276,18 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 	log.Printf("[INCOMING %s] %d -> %s", chatType, index, msg)
 	a.AddChatLog(fmt.Sprintf("[IN %s] %d -> %s", chatType, index, msg))
 
-	if !awaitingGameChoice || index != awaitingGameChoicePartnerID {
+	if !awaitingGameChoice {
 		return
 	}
 
 	choice, ok := normalizeIncomingGameChoice(msg)
 	if !ok {
 		return
+	}
+
+	if awaitingGameChoicePartnerID > 0 && index != awaitingGameChoicePartnerID {
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] received %q from chat index %d while expecting %d; accepting due to Shockwave id mismatch", choice, index, awaitingGameChoicePartnerID))
+		log.Printf("[GAME_SELECT] received %q from chat index %d while expecting %d; accepting due to Shockwave id mismatch", choice, index, awaitingGameChoicePartnerID)
 	}
 
 	e.Block()

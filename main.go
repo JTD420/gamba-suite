@@ -1860,9 +1860,10 @@ func tryReadIntInt(pkt *g.Packet) (a int, b int, pos int, ok bool) {
 func (a *App) onChatMessage(e *g.Intercept) {
 	msg := e.Packet.ReadString()
 	a.AddChatLog("[OUT] " + msg)
+	commandMsg := extractInlineCommand(msg)
 
 	// Process commands based on the message prefix and suffix
-	if strings.HasPrefix(msg, ":") {
+	if strings.HasPrefix(commandMsg, ":") {
 		// Check if already rolling or closing
 		if isPokerRolling || isTriRolling || isBJRolling || is13Rolling || isHitting || is13Hitting || isClosing {
 			log.Println("Already rolling or closing...")
@@ -1870,7 +1871,7 @@ func (a *App) onChatMessage(e *g.Intercept) {
 			return
 		}
 
-		command := strings.TrimPrefix(msg, ":")
+		command := strings.TrimPrefix(commandMsg, ":")
 		switch {
 		case strings.HasSuffix(command, "reset"):
 			e.Block()
@@ -1917,6 +1918,20 @@ func (a *App) onChatMessage(e *g.Intercept) {
 			ChatIsDisabled = true
 		}
 	}
+}
+
+func extractInlineCommand(msg string) string {
+	trimmed := strings.TrimSpace(msg)
+	if strings.HasPrefix(trimmed, ":") {
+		return trimmed
+	}
+
+	idx := strings.Index(trimmed, ":")
+	if idx < 0 {
+		return trimmed
+	}
+
+	return strings.TrimSpace(trimmed[idx:])
 }
 
 func (a *App) evalAt(msg string) {
@@ -2649,8 +2664,8 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 
 	switch choice {
 	case "poker":
-		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected Poker; starting internal roll", index))
-		log.Printf("[GAME_SELECT] %d selected Poker; starting internal roll", index)
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected Poker; starting internal :roll flow", index))
+		log.Printf("[GAME_SELECT] %d selected Poker; starting internal :roll flow", index)
 		a.startPokerRoll()
 	case "21":
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected 21; starting internal roll", index))

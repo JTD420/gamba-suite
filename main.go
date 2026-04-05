@@ -1493,7 +1493,7 @@ func formatTradeShortages(shortages []tradeShortage) string {
 	return strings.Join(parts, ", ")
 }
 
-// sendTradeCompletionMessage builds and sends a chat message with the items from the completed trade
+// sendTradeCompletionMessage sends the post-trade game prompt sequence.
 func (a *App) sendTradeCompletionMessage() {
 	items := a.GetCurrentTradeItems()
 	
@@ -1502,25 +1502,25 @@ func (a *App) sendTradeCompletionMessage() {
 		log.Printf("[TRADE_MESSAGE] no items in trade, skipping message")
 		return
 	}
-	
-	// Build the message
-	var msgParts []string
-	for i, item := range items {
-		displayName := formatTradeItemName(item.Name)
-		msgParts = append(msgParts, fmt.Sprintf("%d x %s", item.Quantity, displayName))
-		
-		// Log each item
-		a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE] item[%d] %s (qty: %d)", i, item.Name, item.Quantity))
-		log.Printf("[TRADE_MESSAGE] item[%d] %s (qty: %d)", i, item.Name, item.Quantity)
+
+	partnerName := strings.TrimSpace(lastTradePartnerName)
+	if partnerName == "" {
+		partnerName = "Player"
 	}
-	
-	message := fmt.Sprintf("Traded: %s", strings.Join(msgParts, ", "))
-	
-	a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE] sending: %q", message))
-	log.Printf("[TRADE_MESSAGE] sending: %q", message)
-	
-	// Send the message via shout
-	ext.Send(out.SHOUT, message)
+
+	first := fmt.Sprintf("%s what game do you want to play?", partnerName)
+	second := "Say Poker, 21, 13"
+
+	a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE] shouting: %q", first))
+	log.Printf("[TRADE_MESSAGE] shouting: %q", first)
+	ext.Send(out.SHOUT, first)
+
+	go func(msg string) {
+		time.Sleep(700 * time.Millisecond)
+		a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE] shouting: %q", msg))
+		log.Printf("[TRADE_MESSAGE] shouting: %q", msg)
+		ext.Send(out.SHOUT, msg)
+	}(second)
 }
 
 func formatTradeItemName(name string) string {

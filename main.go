@@ -51,6 +51,8 @@ var (
 	lastTradeBlockNotice string
 	awaitingGameChoice bool
 	awaitingGameChoicePartnerID int
+	pokerSequenceStage int
+	pokerSequencePlayerName string
 	underfundedTradeMonitorID int
 	underfundedTradeMonitorNotice string
 	lastTradeOpenData string
@@ -401,6 +403,8 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		stopUnderfundedTradeMonitor()
 		awaitingGameChoice = false
 		awaitingGameChoicePartnerID = 0
+		pokerSequenceStage = 0
+		pokerSequencePlayerName = ""
 		lastTradeCoverageNotice = ""
 		lastTradeBlockNotice = ""
 		if !awaitingTradeOpen {
@@ -542,6 +546,11 @@ func resetTradeAutoFlow() {
 	tradeAutoConfirmPending = false
 	tradeCompleted = false
 	tradeCloseAnnounced = false
+}
+
+func resetPokerSequence() {
+	pokerSequenceStage = 0
+	pokerSequencePlayerName = ""
 }
 
 func stopUnderfundedTradeMonitor() {
@@ -1949,6 +1958,34 @@ func (a *App) startPokerRoll() {
 	go a.rollPokerDice()
 }
 
+func (a *App) beginPokerSequence() {
+	playerName := strings.TrimSpace(lastTradePartnerName)
+	if playerName == "" {
+		playerName = "Player"
+	}
+
+	resetPokerSequence()
+	pokerSequenceStage = 1
+	pokerSequencePlayerName = playerName
+
+	first := "Lets Play!"
+	second := fmt.Sprintf("%s Roll", playerName)
+
+	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", first))
+	log.Printf("[GAME_SELECT] shouting: %q", first)
+	ext.Send(out.SHOUT, first)
+
+	go func(msg string) {
+		time.Sleep(700 * time.Millisecond)
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", msg))
+		log.Printf("[GAME_SELECT] shouting: %q", msg)
+		ext.Send(out.SHOUT, msg)
+
+		time.Sleep(700 * time.Millisecond)
+		a.startPokerRoll()
+	}(second)
+}
+
 // Reset all saved dice states
 func resetDiceState() {
 	mutex.Lock()
@@ -1956,6 +1993,7 @@ func resetDiceState() {
 	resultsWaitGroup.Wait() // Ensure all dice roll results are processed
 	diceList = []*Dice{}
 	awaitingTradeOpen = false
+	resetPokerSequence()
 	fakeDiceTestingMode = false
 	isPokerRolling, isTriRolling, isBJRolling, is13Rolling, isHitting, is13Hitting, isClosing = false, false, false, false, false, false, false
 }
@@ -2664,16 +2702,18 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 
 	switch choice {
 	case "poker":
-		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected Poker; starting internal :roll flow", index))
-		log.Printf("[GAME_SELECT] %d selected Poker; starting internal :roll flow", index)
-		a.startPokerRoll()
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected Poker; starting player/dealer poker sequence", index))
+		log.Printf("[GAME_SELECT] %d selected Poker; starting player/dealer poker sequence", index)
+		a.beginPokerSequence()
 	case "21":
+		resetPokerSequence()
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected 21; starting internal roll", index))
 		log.Printf("[GAME_SELECT] %d selected 21; starting internal roll", index)
 		isBJRolling = true
 		a.AddLogMsg("21 Roll:\n")
 		go a.rollBjDice()
 	case "13":
+		resetPokerSequence()
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected 13; starting internal roll", index))
 		log.Printf("[GAME_SELECT] %d selected 13; starting internal roll", index)
 		is13Rolling = true

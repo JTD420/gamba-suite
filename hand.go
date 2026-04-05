@@ -43,6 +43,23 @@ func (a *App) evaluatePokerHand() {
 		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
 		a.AddLogMsg(logRollResult)
 	}
+
+	if pokerSequenceStage == 1 {
+		pokerSequenceStage = 2
+		go func() {
+			time.Sleep(700 * time.Millisecond)
+			message := "Dealer Roll"
+			a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", message))
+			log.Printf("[GAME_SELECT] shouting: %q", message)
+			ext.Send(out.SHOUT, message)
+
+			time.Sleep(700 * time.Millisecond)
+			a.startPokerRoll()
+		}()
+	} else if pokerSequenceStage == 2 {
+		resetPokerSequence()
+	}
+
 	isPokerRolling = false
 }
 

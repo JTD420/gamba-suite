@@ -57,6 +57,7 @@ var (
 	pokerSequencePlayerResult PokerHandResult
 	pokerSequencePlayerHand string
 	pokerPayoutMode        bool
+	pokerPayoutTradeActive bool
 	pokerPayoutTargetID    int
 	pokerPayoutTargetName  string
 	pokerPayoutAttempts    int
@@ -443,11 +444,15 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		if pokerPayoutMode {
 			if pokerPayoutTradeSent {
 				// Our outgoing TRADE_OPEN was accepted — this is the payout trade opening successfully
-				pokerPayoutTradeSent = false
-				pokerPayoutMode = false
+				savedPayoutTargetID := pokerPayoutTargetID
+				savedPayoutTargetName := pokerPayoutTargetName
+				stopPokerPayout() // kills retry goroutine
+				pokerPayoutTradeActive = true
+				pokerPayoutTargetID = savedPayoutTargetID
+				pokerPayoutTargetName = savedPayoutTargetName
 				isPayoutTradeOpen = true
-				a.AddLogMsg(fmt.Sprintf("[PAYOUT] trade opened successfully with %s, proceeding", pokerPayoutTargetName))
-				log.Printf("[PAYOUT] trade opened successfully with %s, proceeding", pokerPayoutTargetName)
+				a.AddLogMsg(fmt.Sprintf("[PAYOUT] trade opened successfully with %s, proceeding", savedPayoutTargetName))
+				log.Printf("[PAYOUT] trade opened successfully with %s, proceeding", savedPayoutTargetName)
 				// Fall through to normal trade-open handling below
 			} else {
 				// Someone else opened a trade with us during payout — block it
@@ -598,17 +603,32 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		a.ClearTradeItems()
 
 		if !wasCompleted {
-			awaitingTradeOpen = true
-			a.AddLogMsg("[TRADE_REOPEN] trade closed before completion, restarting dealer cycle")
-			log.Printf("[TRADE_REOPEN] trade closed before completion, restarting dealer cycle")
-			if canAnnounceDealerOpen() {
-				dealerTradeWindowOpen = true
-				go sendMessageWithDelay(a.dealerOpenMessage())
+			if pokerPayoutTradeActive {
+				// Payout trade was cancelled by player — retry the payout
+				retryTargetID := pokerPayoutTargetID
+				retryTargetName := pokerPayoutTargetName
+				pokerPayoutTradeActive = false
+				a.AddLogMsg(fmt.Sprintf("[PAYOUT] payout trade cancelled by %s, retrying", retryTargetName))
+				log.Printf("[PAYOUT] payout trade cancelled by %s, retrying", retryTargetName)
+				startPokerPayout(a, retryTargetID, retryTargetName)
 			} else {
-				dealerTradeWindowOpen = false
-				log.Printf("User is muted. Dealer open announcement skipped; incoming trades will be blocked.")
+				awaitingTradeOpen = true
+				a.AddLogMsg("[TRADE_REOPEN] trade closed before completion, restarting dealer cycle")
+				log.Printf("[TRADE_REOPEN] trade closed before completion, restarting dealer cycle")
+				if canAnnounceDealerOpen() {
+					dealerTradeWindowOpen = true
+					go sendMessageWithDelay(a.dealerOpenMessage())
+				} else {
+					dealerTradeWindowOpen = false
+					log.Printf("User is muted. Dealer open announcement skipped; incoming trades will be blocked.")
+				}
+				startDealerOpenHeartbeat(a)
 			}
-			startDealerOpenHeartbeat(a)
+		} else if pokerPayoutTradeActive {
+			// Payout trade completed normally — clear active flag
+			pokerPayoutTradeActive = false
+			a.AddLogMsg("[PAYOUT] payout trade completed successfully")
+			log.Printf("[PAYOUT] payout trade completed successfully")
 		}
 
 		partnerID := lastTradePartnerID
@@ -642,6 +662,7 @@ func resetPokerSequence() {
 
 func stopPokerPayout() {
 	pokerPayoutMode = false
+	pokerPayoutTradeActive = false
 	pokerPayoutTargetID = 0
 	pokerPayoutTargetName = ""
 	pokerPayoutAttempts = 0

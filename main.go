@@ -54,6 +54,8 @@ var (
 	awaitingGameChoicePartnerID int
 	pokerSequenceStage int
 	pokerSequencePlayerName string
+	pokerSequencePlayerResult PokerHandResult
+	pokerSequencePlayerHand string
 	underfundedTradeMonitorID int
 	underfundedTradeMonitorNotice string
 	lastTradeOpenData string
@@ -606,6 +608,8 @@ func resetTradeAutoFlow() {
 func resetPokerSequence() {
 	pokerSequenceStage = 0
 	pokerSequencePlayerName = ""
+	pokerSequencePlayerResult = PokerHandResult{}
+	pokerSequencePlayerHand = ""
 }
 
 func stopUnderfundedTradeMonitor() {
@@ -1652,11 +1656,10 @@ func formatTradeShortages(shortages []tradeShortage) string {
 // sendTradeCompletionMessage sends the post-trade game prompt sequence.
 func (a *App) sendTradeCompletionMessage() {
 	items := a.GetCurrentTradeItems()
-	
+
 	if len(items) == 0 {
-		a.AddLogMsg("[TRADE_MESSAGE] no items in trade, skipping message")
-		log.Printf("[TRADE_MESSAGE] no items in trade, skipping message")
-		return
+		a.AddLogMsg("[TRADE_MESSAGE] no items detected in trade (tracking may have missed packets), continuing anyway")
+		log.Printf("[TRADE_MESSAGE] no items detected in trade, continuing anyway")
 	}
 
 	partnerName := strings.TrimSpace(lastTradePartnerName)

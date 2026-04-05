@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -22,12 +21,13 @@ func sendMessageWithDelay(message string) {
 
 // Wait for all dice results and evaluate the poker hand
 func (a *App) evaluatePokerHand() {
-	if !ChatIsDisabled {
-		hand := a.toPokerString(diceList)
-		logRollResult := fmt.Sprintf("Poker Result: %s\n", hand)
-		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
-		a.AddLogMsg(logRollResult)
+	result := evaluatePokerRules(diceList)
+	hand := a.toPokerString(diceList)
+	logRollResult := fmt.Sprintf("Poker Result: %s\n", hand)
+	time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
+	a.AddLogMsg(logRollResult)
 
+	if !ChatIsDisabled {
 		if !isMuted {
 			// If the user is not muted, send the message
 			sendMessageWithDelay(hand)
@@ -37,14 +37,11 @@ func (a *App) evaluatePokerHand() {
 			// ToDo:
 			// messageQueue = append(messageQueue, hand)
 		}
-	} else {
-		hand := a.toPokerString(diceList)
-		logRollResult := fmt.Sprintf("Poker Result: %s\n", hand)
-		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
-		a.AddLogMsg(logRollResult)
 	}
 
 	if pokerSequenceStage == 1 {
+		pokerSequencePlayerResult = result
+		pokerSequencePlayerHand = hand
 		pokerSequenceStage = 2
 		go func() {
 			time.Sleep(700 * time.Millisecond)
@@ -57,6 +54,25 @@ func (a *App) evaluatePokerHand() {
 			a.startPokerRoll()
 		}()
 	} else if pokerSequenceStage == 2 {
+		winner := comparePokerHands(pokerSequencePlayerResult, result)
+		playerName := strings.TrimSpace(pokerSequencePlayerName)
+		if playerName == "" {
+			playerName = "Player"
+		}
+		winnerName := "Dealer"
+		if winner == PokerWinnerPlayer {
+			winnerName = playerName
+		}
+		winnerMsg := fmt.Sprintf("%s Wins - %s: %s | Dealer: %s", winnerName, playerName, pokerSequencePlayerHand, hand)
+
+		a.AddLogMsg(fmt.Sprintf("[POKER_RULES] player=%d dealer=%d winner=%s", pokerSequencePlayerResult.Category, result.Category, winnerMsg))
+		log.Printf("[POKER_RULES] player=%d dealer=%d winner=%s", pokerSequencePlayerResult.Category, result.Category, winnerMsg)
+
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", winnerMsg))
+		log.Printf("[GAME_SELECT] shouting: %q", winnerMsg)
+		time.Sleep(800 * time.Millisecond)
+		sendMessageWithDelay(winnerMsg)
+
 		resetPokerSequence()
 	}
 
@@ -219,96 +235,11 @@ func sumHandInt(values []int) int {
 // Evaluate the hand of dice and return a string representation
 // thank you b7 <3 (and me, eduard, selfplug lol)
 func (a *App) toPokerString(dices []*Dice) string {
-	// Load user configuration
 	config := a.LoadConfig()
-
-	if config != nil {
-		// Use the loaded config
-		// fmt.Println("Config loaded:", config)
-	} else {
-		// Use default values if no config is found
+	if config == nil {
 		fmt.Println("Using default configuration")
-		config = &PokerDisplayConfig{
-			FiveOfAKind:  "Five of a kind: %s",
-			FourOfAKind:  "Four of a kind: %s",
-			FullHouse:    "Full House: %s",
-			HighStraight: "High Str8",
-			LowStraight:  "Low Str8",
-			ThreeOfAKind: "Three of a kind: %s",
-			TwoPair:      "Two Pair: %ss",
-			OnePair:      "One Pair: %ss",
-			Nothing:      "Nothing",
-		}
+		config = defaultPokerDisplayConfig()
 	}
 
-	s := ""
-	for _, dice := range dices {
-		s += strconv.Itoa(dice.Value)
-	}
-	runes := []rune(s)
-	sort.Slice(runes, func(i, j int) bool {
-		return runes[i] < runes[j]
-	})
-	s = string(runes)
-
-	if s == "12345" {
-		return fmt.Sprintf(config.LowStraight)
-	}
-	if s == "23456" {
-		return fmt.Sprintf(config.HighStraight)
-	}
-
-	mapCount := make(map[int]int)
-	for _, c := range s {
-		mapCount[int(c-'0')]++
-	}
-
-	keys := []int{}
-	values := []int{}
-	for k, v := range mapCount {
-		if v > 1 {
-			keys = append(keys, k)
-			values = append(values, v)
-		}
-	}
-
-	if len(keys) == 0 {
-		return fmt.Sprintf(config.Nothing)
-	}
-
-	sort.Slice(keys, func(i, j int) bool { return keys[i] > keys[j] })
-	sort.Slice(values, func(i, j int) bool { return values[i] > values[j] })
-
-	n := strings.Trim(strings.Replace(fmt.Sprint(keys), " ", "", -1), "[]")
-	c := strings.Trim(strings.Replace(fmt.Sprint(values), " ", "", -1), "[]")
-
-	switch c {
-	case "5":
-		return fmt.Sprintf(config.FiveOfAKind, n)
-	case "4":
-		return fmt.Sprintf(config.FourOfAKind, n)
-	case "3":
-		return fmt.Sprintf(config.ThreeOfAKind, n)
-	case "32":
-		var threeOfAKind, pair int
-
-		// Loop through the map to find the three-of-a-kind and the pair
-		for num, count := range mapCount {
-			if count == 3 {
-				threeOfAKind = num
-			} else if count == 2 {
-				pair = num
-			}
-		}
-
-		// Construct the string with the three-of-a-kind first
-		n = strconv.Itoa(threeOfAKind) + strconv.Itoa(pair)
-		return fmt.Sprintf(config.FullHouse, n)
-	case "22":
-		return fmt.Sprintf(config.TwoPair, n)
-	case "2":
-		return fmt.Sprintf(config.OnePair, n)
-	default:
-		return n + ""
-	}
+	return formatPokerHandResult(config, evaluatePokerRules(dices))
 }

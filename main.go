@@ -49,6 +49,7 @@ var (
 	tradeCloseAnnounced                bool
 	suppressNextTradeCloseAnnouncement bool
 	ignoreNextGuardCloseRecovery       bool
+	hiddenBlockedTradeCleanupPending   bool
 	lastTradeCoverageNotice            string
 	lastTradeBlockNotice               string
 	awaitingGameChoice                 bool
@@ -700,6 +701,16 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		return
 	}
 
+	if e.Packet.Header.Dir == g.In && hiddenBlockedTradeCleanupPending {
+		switch e.Packet.Header.Value {
+		case 105, 108, 109, 111, 112:
+			a.AddLogMsg(fmt.Sprintf("[TRADE_GUARD] suppressing incoming trade packet %d during blocked-trade cleanup", e.Packet.Header.Value))
+			log.Printf("[TRADE_GUARD] suppressing incoming trade packet %d during blocked-trade cleanup", e.Packet.Header.Value)
+			e.Block()
+			return
+		}
+	}
+
 	// TRADE_ACCEPT incoming 109 - wait 2 seconds then send TRADE_ACCEPT (69)
 	if e.Packet.Header.Value == 109 {
 		scheduleAutoTradeAccept(a, string(e.Packet.Data))
@@ -821,9 +832,11 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				if !allowed {
 					a.AddLogMsg("[TRADE_BLOCK] incoming trade blocked during active round")
 					log.Printf("[TRADE_BLOCK] incoming trade blocked during active round")
+					hiddenBlockedTradeCleanupPending = true
 					ignoreNextGuardCloseRecovery = true
 					suppressNextTradeCloseAnnouncement = true
 					e.Block()
+					ext.Send(out.TRADE_CLOSE)
 					return
 				}
 			}
@@ -865,6 +878,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				// Someone else opened a trade with us during payout — block it
 				a.AddLogMsg(fmt.Sprintf("[PAYOUT] incoming trade blocked during payout to %s, closing", pokerPayoutTargetName))
 				log.Printf("[PAYOUT] incoming trade blocked during payout to %s, closing", pokerPayoutTargetName)
+				hiddenBlockedTradeCleanupPending = true
 				ignoreNextGuardCloseRecovery = true
 				suppressNextTradeCloseAnnouncement = true
 				e.Block()
@@ -887,6 +901,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 			a.AddLogMsg(fmt.Sprintf("[TRADE_GUARD] blocking incoming trade open: %s", reason))
 			log.Printf("[TRADE_GUARD] blocking incoming trade open: %s", reason)
+			hiddenBlockedTradeCleanupPending = true
 			ignoreNextGuardCloseRecovery = true
 			suppressNextTradeCloseAnnouncement = true
 			e.Block()
@@ -1015,10 +1030,14 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 	// TRADE_CLOSE appears as incoming header 110 in your client logs.
 	if e.Packet.Header.Value == 110 {
+		if hiddenBlockedTradeCleanupPending {
+			hiddenBlockedTradeCleanupPending = false
+		}
 		if ignoreNextGuardCloseRecovery {
 			ignoreNextGuardCloseRecovery = false
 			a.AddLogMsg("[TRADE_GUARD] ignoring trade-close recovery for blocked foreign trade during active round")
 			log.Printf("[TRADE_GUARD] ignoring trade-close recovery for blocked foreign trade during active round")
+			e.Block()
 			return
 		}
 
@@ -1128,6 +1147,17 @@ func stopPokerPayout() {
 	payoutActualAddCount = 0
 }
 
+func waitForHiddenBlockedTradeCleanup(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !hiddenBlockedTradeCleanupPending {
+			return true
+		}
+		time.Sleep(75 * time.Millisecond)
+	}
+	return !hiddenBlockedTradeCleanupPending
+}
+
 func startPokerPayout(a *App, targetID int, targetName string) {
 	stopPokerPayout()
 	pokerPayoutMode = true
@@ -1146,6 +1176,13 @@ func startPokerPayout(a *App, targetID int, targetName string) {
 				return
 			}
 			pokerPayoutAttempts = attempt
+
+			if hiddenBlockedTradeCleanupPending {
+				a.AddLogMsg("[PAYOUT_DEBUG] waiting for blocked-trade cleanup before opening payout trade")
+				log.Printf("[PAYOUT_DEBUG] waiting for blocked-trade cleanup before opening payout trade")
+				ext.Send(out.TRADE_CLOSE)
+				waitForHiddenBlockedTradeCleanup(2 * time.Second)
+			}
 
 			if strings.TrimSpace(targetName) != "" {
 				expectedToken, _ := lookupTokenByName(targetName)

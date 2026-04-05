@@ -87,6 +87,7 @@ var (
 	roomEntities     = map[int]room.Entity{}
 	roomMu           sync.Mutex
 	users28ByToken   = map[string]string{}
+	users28ByIndex   = map[int]string{}     // roomIndex -> name
 	users28Mu        sync.Mutex
 	headerSniffUntil time.Time
 	headerSniffSeen  = map[uint16]bool{}
@@ -97,13 +98,16 @@ var (
 	lastAddItemWasOurs   bool
 	addItemMu            sync.Mutex
 	currentHandItems  []TradeItem
+	currentHandItemIDs map[string][]int
 	handItemsMu       sync.Mutex
+	pokerGameBetItems []TradeItem
 	stripScanMu       sync.Mutex
 	stripScanActive   bool
 	stripScanSessionID = 0
 	stripScanPageCount = 0
 	stripScanSeenItemIDs = map[int]struct{}{}
 	stripScanCounts      = map[string]int{}
+	stripScanItemIDs     = map[string][]int{}
 	knownDiceIDs     = map[int]struct{}{}
 	fakeDiceTestingMode bool
 	dealerOpenHeartbeatID int
@@ -340,6 +344,13 @@ func handleMutePacket(e *g.Intercept) {
 
 // Trade detection logic (called within InterceptAll)
 func handleTradePacket(a *App, e *g.Intercept) {
+	defer func() {
+		if r := recover(); r != nil {
+			a.AddLogMsg(fmt.Sprintf("[TRADE] recovered while handling header %d: %v", e.Packet.Header.Value, r))
+			log.Printf("[TRADE] recovered while handling header %d: %v", e.Packet.Header.Value, r)
+		}
+	}()
+
 	if e.Packet.Header.Dir == g.Out && (e.Packet.Header.Value == 69 || e.Packet.Header.Value == 402) {
 		shortages := a.getTradeCoverageShortages()
 		if len(shortages) > 0 {
@@ -382,7 +393,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 	// Ownership: if we just sent TRADE_ADDITEM[72], the new item is ours; otherwise partner triggered.
 	// Compute each side by diffing total items against the other side's last known list.
 	if e.Packet.Header.Value == 108 {
-		allItems := parseTradeItemsPacket(e.Packet.Data)
+		allItems := a.parseTradeItemsPacket(e.Packet.Data)
 
 		addItemMu.Lock()
 		wasOurs := lastAddItemWasOurs
@@ -454,6 +465,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				a.AddLogMsg(fmt.Sprintf("[PAYOUT] trade opened successfully with %s, proceeding", savedPayoutTargetName))
 				log.Printf("[PAYOUT] trade opened successfully with %s, proceeding", savedPayoutTargetName)
 				// Fall through to normal trade-open handling below
+						go a.autoAddPayoutItems()
 			} else {
 				// Someone else opened a trade with us during payout — block it
 				a.AddLogMsg(fmt.Sprintf("[PAYOUT] incoming trade blocked during payout to %s, closing", pokerPayoutTargetName))
@@ -501,23 +513,54 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			log.Printf("[TRADE_ROOM] %s", candidateLine)
 		}
 
-		if len(e.Packet.Data) >= 4 {
-			tradeToken := string(e.Packet.Data[:4])
-			lastTradePartnerToken = tradeToken
-			if name, ok := lookupUsers28Token(tradeToken); ok {
-				a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] token %q matched user %q", tradeToken, name))
-				log.Printf("[TRADE_OPEN] token %q matched user %q", tradeToken, name)
-			} else {
-				a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] token %q not found in USERS[28] cache", tradeToken))
-				log.Printf("[TRADE_OPEN] token %q not found in USERS[28] cache", tradeToken)
+		if len(e.Packet.Data) >= 1 {
+			// Decode the trader's room index from the VL64 at the start of the trade packet.
+			vlen := gencoding.VL64DecodeLen(e.Packet.Data[0])
+			if vlen > 0 && vlen <= len(e.Packet.Data) {
+				traderRoomIndex := gencoding.VL64Decode(e.Packet.Data[:vlen])
+				if traderRoomIndex > 0 {
+					lastTradePartnerID = traderRoomIndex
+					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] decoded trader room index %d from VL64", traderRoomIndex))
+					log.Printf("[TRADE_OPEN] decoded trader room index %d from VL64", traderRoomIndex)
+
+					// Refresh users every trade-open so we can map room index -> username reliably.
+					go requestRoomUsers(a)
+
+					// Look up name by room index from USERS28 cache.
+					indexName, indexOk := lookupUsers28Index(traderRoomIndex)
+					if !indexOk {
+						indexName, indexOk = waitForUsers28IndexName(traderRoomIndex, 900*time.Millisecond)
+					}
+					if indexOk {
+						lastTradePartnerName = indexName
+						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] resolved name %q from room index %d", indexName, traderRoomIndex))
+						log.Printf("[TRADE_OPEN] resolved name %q from room index %d", indexName, traderRoomIndex)
+					} else {
+						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] room index %d not in USERS28 index cache, name unknown", traderRoomIndex))
+						log.Printf("[TRADE_OPEN] room index %d not in USERS28 index cache, name unknown", traderRoomIndex)
+					}
+				}
 			}
 
-			if idx, name, ok := resolveTradeTokenToRoomIndex(tradeToken); ok {
-				lastTradePartnerID = idx
-				lastTradePartnerName = name
-				outPreview := string(ext.NewPacket(out.TRADE_OPEN, idx).Data)
-				a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] token %q resolved room index %d (%q) -> outgoing[%d] %q", tradeToken, idx, name, 71, outPreview))
-				log.Printf("[TRADE_OPEN] token %q resolved room index %d (%q) -> outgoing[%d] %q", tradeToken, idx, name, 71, outPreview)
+			// Keep token-based fallback for when index decode fails.
+			if len(e.Packet.Data) >= 4 {
+				tradeToken := string(e.Packet.Data[:4])
+				lastTradePartnerToken = tradeToken
+				if lastTradePartnerName == "" || lastTradePartnerName == "Unknown" {
+					if name, ok := lookupUsers28Token(tradeToken); ok {
+						lastTradePartnerName = name
+						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] fallback token %q matched name %q", tradeToken, name))
+						log.Printf("[TRADE_OPEN] fallback token %q matched name %q", tradeToken, name)
+					}
+				}
+				if lastTradePartnerID <= 0 {
+					if idx, name, ok := resolveTradeTokenToRoomIndex(tradeToken); ok {
+						lastTradePartnerID = idx
+						if lastTradePartnerName == "" || lastTradePartnerName == "Unknown" {
+							lastTradePartnerName = name
+						}
+					}
+				}
 			}
 		}
 
@@ -730,6 +773,47 @@ func startPokerPayout(a *App, targetID int, targetName string) {
 			startDealerOpenHeartbeat(a)
 		}
 	}()
+}
+
+func (a *App) autoAddPayoutItems() {
+	time.Sleep(600 * time.Millisecond) // settle time after trade opens
+
+	handItemsMu.Lock()
+	handItemIDs := currentHandItemIDs
+	handItemsMu.Unlock()
+
+	betItems := pokerGameBetItems
+	if len(betItems) == 0 {
+		a.AddLogMsg("[PAYOUT] no bet items recorded, skipping auto-add")
+		log.Printf("[PAYOUT] no bet items recorded, skipping auto-add")
+		return
+	}
+
+	total := 0
+	for _, betItem := range betItems {
+		needed := betItem.Quantity * 2
+		toAdd := handItemIDs[betItem.Name]
+		if len(toAdd) > needed {
+			toAdd = toAdd[:needed]
+		}
+		if len(toAdd) < needed {
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT] warning: need %d of %s but only have %d", needed, betItem.Name, len(toAdd)))
+			log.Printf("[PAYOUT] warning: need %d of %s but only have %d", needed, betItem.Name, len(toAdd))
+		}
+		for _, itemID := range toAdd {
+			if !pokerPayoutTradeActive {
+				a.AddLogMsg("[PAYOUT] trade closed mid-add, stopping")
+				return
+			}
+			time.Sleep(550 * time.Millisecond)
+			ext.Send(out.TRADE_ADDITEM, -itemID)
+			total++
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT] added item %d (%s) %d/%d", itemID, betItem.Name, total, needed))
+			log.Printf("[PAYOUT] added item %d (%s) %d/%d", itemID, betItem.Name, total, needed)
+		}
+	}
+	a.AddLogMsg(fmt.Sprintf("[PAYOUT] auto-add complete: %d item(s) offered", total))
+	log.Printf("[PAYOUT] auto-add complete: %d item(s) offered", total)
 }
 
 func stopUnderfundedTradeMonitor() {
@@ -1043,12 +1127,15 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 	users28Mu.Lock()
 	for _, entry := range entries {
 		users28ByToken[entry.Token] = entry.Name
+		if entry.RoomIndex > 0 {
+			users28ByIndex[entry.RoomIndex] = entry.Name
+		}
 	}
 	users28Mu.Unlock()
 
 	for _, entry := range entries {
-		a.AddLogMsg(fmt.Sprintf("[USERS28] header=%d token=%q name=%q", e.Packet.Header.Value, entry.Token, entry.Name))
-		log.Printf("[USERS28] header=%d token=%q name=%q", e.Packet.Header.Value, entry.Token, entry.Name)
+		a.AddLogMsg(fmt.Sprintf("[USERS28] header=%d token=%q name=%q roomIndex=%d", e.Packet.Header.Value, entry.Token, entry.Name, entry.RoomIndex))
+		log.Printf("[USERS28] header=%d token=%q name=%q roomIndex=%d", e.Packet.Header.Value, entry.Token, entry.Name, entry.RoomIndex)
 	}
 }
 
@@ -1059,9 +1146,34 @@ func lookupUsers28Token(token string) (string, bool) {
 	return name, ok
 }
 
+func lookupUsers28Index(index int) (string, bool) {
+	users28Mu.Lock()
+	defer users28Mu.Unlock()
+	name, ok := users28ByIndex[index]
+	if !ok {
+		return "", false
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", false
+	}
+	return name, true
+}
+
+func waitForUsers28IndexName(index int, timeout time.Duration) (string, bool) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if name, ok := lookupUsers28Index(index); ok {
+			return name, true
+		}
+		time.Sleep(75 * time.Millisecond)
+	}
+	return "", false
+}
+
 // parseTradeItemsPacket extracts trade items from TRADE_ITEMS packet (header 108)
-// Items are separated by \x02 bytes and may contain item names and quantities
-func parseTradeItemsPacket(data []byte) []TradeItem {
+// Items are separated by \x02 bytes and may contain item names and quantities.
+func (a *App) parseTradeItemsPacket(data []byte) []TradeItem {
 	counts := map[string]int{}
 	rawByName := map[string]string{}
 
@@ -1073,7 +1185,7 @@ func parseTradeItemsPacket(data []byte) []TradeItem {
 		}
 
 		fieldStr := strings.TrimSpace(string(field))
-		itemName, ok := extractTradeItemName(fieldStr)
+		itemName, ok := a.extractTradeItemName(fieldStr)
 		if !ok {
 			continue
 		}
@@ -1106,12 +1218,12 @@ func parseTradeItemsPacket(data []byte) []TradeItem {
 	return items
 }
 
-func extractTradeItemName(field string) (string, bool) {
+func (a *App) extractTradeItemName(field string) (string, bool) {
 	// Legacy format example: "itkoHP|club_sofa"
 	if strings.Contains(field, "|") {
 		parts := strings.Split(field, "|")
 		if len(parts) >= 2 {
-			if name, ok := normalizeTradeItemName(parts[len(parts)-1]); ok {
+			if name, ok := a.normalizeTradeFieldClass(parts[len(parts)-1]); ok {
 				return name, true
 			}
 		}
@@ -1121,19 +1233,53 @@ func extractTradeItemName(field string) (string, bool) {
 	if strings.Contains(field, "{") {
 		parts := strings.SplitN(field, "{", 2)
 		if len(parts) == 2 {
-			raw := parts[1]
-			star := strings.Index(raw, "*")
-			if star < 0 {
-				return "", false
-			}
-			raw = raw[:star]
-			if name, ok := normalizeTradeItemName(raw); ok {
+			if name, ok := a.normalizeTradeFieldClass(parts[1]); ok {
 				return name, true
 			}
 		}
 	}
 
 	return "", false
+}
+
+func (a *App) normalizeTradeFieldClass(raw string) (string, bool) {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	if raw == "" {
+		return "", false
+	}
+
+	if star := strings.Index(raw, "*"); star >= 0 {
+		raw = raw[:star]
+	}
+
+	name, ok := normalizeTradeItemName(raw)
+	if !ok {
+		return "", false
+	}
+
+	if isKnownTradeClassName(a, name) {
+		return name, true
+	}
+	return "", false
+}
+
+func isKnownTradeClassName(a *App, name string) bool {
+	// Accept names that match the strict furni class-name regex (e.g. chair_plasty, cf_10_coin_gold).
+	if stripItemNameRe.MatchString(name) && stripItemNameRe.FindString(name) == name {
+		return true
+	}
+
+	// Also accept single-word items that appear in the dealer's scanned hand (e.g. edice).
+	handItemsMu.Lock()
+	for _, item := range currentHandItems {
+		if item.Name == name {
+			handItemsMu.Unlock()
+			return true
+		}
+	}
+	handItemsMu.Unlock()
+
+	return false
 }
 
 func normalizeTradeItemName(raw string) (string, bool) {
@@ -1264,6 +1410,7 @@ func (a *App) requestPlayerStrip() {
 	stripScanPageCount = 0
 	stripScanSeenItemIDs = map[int]struct{}{}
 	stripScanCounts = map[string]int{}
+	stripScanItemIDs = map[string][]int{}
 	stripScanMu.Unlock()
 	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] start scan session=%d", sessionID))
 	log.Printf("[STRIP_DEBUG] start scan session=%d", sessionID)
@@ -1290,6 +1437,7 @@ func handleStripPacket(a *App, e *g.Intercept) {
 		stripScanPageCount = 0
 		stripScanSeenItemIDs = map[int]struct{}{}
 		stripScanCounts = map[string]int{}
+		stripScanItemIDs = map[string][]int{}
 		active = true
 		a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] packet-triggered scan init session=%d", stripScanSessionID))
 		log.Printf("[STRIP_DEBUG] packet-triggered scan init session=%d", stripScanSessionID)
@@ -1298,7 +1446,7 @@ func handleStripPacket(a *App, e *g.Intercept) {
 	stripScanPageCount++
 	currentPage := stripScanPageCount
 
-	firstMainID, pageRecords, classQtys := parseStripInfoPageRaw(rawData)
+	firstMainID, pageRecords, classQtys, classItemIDs := parseStripInfoPageRaw(rawData)
 
 	pageRepeated := false
 	if firstMainID != 0 {
@@ -1312,6 +1460,9 @@ func handleStripPacket(a *App, e *g.Intercept) {
 	if !pageRepeated {
 		for className, qty := range classQtys {
 			stripScanCounts[className] += qty
+				for className, ids := range classItemIDs {
+					stripScanItemIDs[className] = append(stripScanItemIDs[className], ids...)
+				}
 		}
 	}
 
@@ -1352,6 +1503,7 @@ func (a *App) finalizeStripScan(sessionID int, reason string) {
 	}
 
 	items := buildStripScanItems()
+	itemIDs := stripScanItemIDs
 	pagesScanned := stripScanPageCount
 	stripScanActive = false
 	stripScanMu.Unlock()
@@ -1360,6 +1512,7 @@ func (a *App) finalizeStripScan(sessionID int, reason string) {
 
 	handItemsMu.Lock()
 	currentHandItems = items
+	currentHandItemIDs = itemIDs
 	handItemsMu.Unlock()
 
 	a.AddLogMsg(fmt.Sprintf("[STRIP] scan complete after %d page(s), reason=%s; hand item types=%d", pagesScanned, reason, len(items)))
@@ -1420,8 +1573,9 @@ func buildStripScanItems() []TradeItem {
 //                          for "I": [Props string]
 // Quantity per record = 1 + extraCount.
 // Returns: firstMainID (for wrap detection), record count, className→quantity map.
-func parseStripInfoPageRaw(data []byte) (firstMainID int, pageRecords int, classQtys map[string]int) {
+func parseStripInfoPageRaw(data []byte) (firstMainID int, pageRecords int, classQtys map[string]int, classItemIDs map[string][]int) {
 	classQtys = map[string]int{}
+	classItemIDs = map[string][]int{}
 	pos := 0
 
 	readVL64 := func() (int, bool) {
@@ -1471,8 +1625,11 @@ func parseStripInfoPageRaw(data []byte) (firstMainID int, pageRecords int, class
 		if !ok {
 			break
 		}
+		extraIDs := make([]int, 0, extraCount)
 		for j := 0; j < extraCount; j++ {
-			if _, ok := readVL64(); !ok {
+			if extraID, ok := readVL64(); ok {
+				extraIDs = append(extraIDs, extraID)
+			} else {
 				break
 			}
 		}
@@ -1540,6 +1697,8 @@ func parseStripInfoPageRaw(data []byte) (firstMainID int, pageRecords int, class
 		}
 
 		classQtys[classRaw] += 1 + extraCount
+			classItemIDs[classRaw] = append(classItemIDs[classRaw], mainID)
+			classItemIDs[classRaw] = append(classItemIDs[classRaw], extraIDs...)
 	}
 	return
 }
@@ -1624,6 +1783,43 @@ func inferStackCountFromMetaField(meta string) (int, bool) {
 	return 0, false
 }
 
+func extractTradeFieldNameRaw(field string) (string, bool) {
+	// Legacy format example: "itkoHP|club_sofa"
+	if strings.Contains(field, "|") {
+		parts := strings.Split(field, "|")
+		if len(parts) >= 2 {
+			if name, ok := normalizeTradeFieldClassRaw(parts[len(parts)-1]); ok {
+				return name, true
+			}
+		}
+	}
+
+	// Current format example: "irbUAXb{chair_plasty*109"
+	if strings.Contains(field, "{") {
+		parts := strings.SplitN(field, "{", 2)
+		if len(parts) == 2 {
+			if name, ok := normalizeTradeFieldClassRaw(parts[1]); ok {
+				return name, true
+			}
+		}
+	}
+
+	return "", false
+}
+
+func normalizeTradeFieldClassRaw(raw string) (string, bool) {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	if raw == "" {
+		return "", false
+	}
+
+	if star := strings.Index(raw, "*"); star >= 0 {
+		raw = raw[:star]
+	}
+
+	return normalizeTradeItemName(raw)
+}
+
 func normalizeCatalogClassWithQuantity(raw string) (name string, qty int, ok bool) {
 	raw = strings.TrimSpace(strings.ToLower(raw))
 	if raw == "" {
@@ -1658,7 +1854,7 @@ func extractStripItemName(field string) (string, bool) {
 
 func extractStripItemAndQuantity(field string) (string, int, bool) {
 	// Try existing trade formats first (handles | and { delimiters).
-	if name, ok := extractTradeItemName(field); ok {
+	if name, ok := extractTradeFieldNameRaw(field); ok {
 		return name, 1, true
 	}
 
@@ -1718,7 +1914,7 @@ func (a *App) notifyTradeQuantityCoverage() {
 	lastTradeCoverageNotice = notice
 
 	primary := shortages[0]
-	msg := fmt.Sprintf("Total \"%s\" available \"%d\": please offer less.", formatTradeItemName(primary.Name), primary.Have)
+	msg := fmt.Sprintf("Total \"%s\" available \"%d\" but payout needs \"%d\": please offer less.", formatTradeItemName(primary.Name), primary.Have, primary.PayoutTotal)
 	a.AddLogMsg("[TRADE_COVERAGE] " + msg)
 	log.Printf("[TRADE_COVERAGE] %s", msg)
 	ext.Send(out.SHOUT, msg)
@@ -1753,7 +1949,7 @@ func (a *App) getTradeCoverageShortages() []tradeShortage {
 		required := item.Quantity
 		payoutTotal := item.Quantity * 2
 		have := haveByName[item.Name]
-		if have < required {
+		if have < payoutTotal {
 			shortages = append(shortages, tradeShortage{
 				Name: item.Name,
 				Required: required,
@@ -1775,11 +1971,16 @@ func formatTradeShortages(shortages []tradeShortage) string {
 
 // sendTradeCompletionMessage sends the post-trade game prompt sequence.
 func (a *App) sendTradeCompletionMessage() {
-	items := a.GetCurrentTradeItems()
+	tradeItemsMu.Lock()
+	pokerGameBetItems = make([]TradeItem, len(currentTradeItems))
+	copy(pokerGameBetItems, currentTradeItems)
+	tradeItemsMu.Unlock()
 
-	if len(items) == 0 {
-		a.AddLogMsg("[TRADE_MESSAGE] no items detected in trade (tracking may have missed packets), continuing anyway")
+	if len(pokerGameBetItems) == 0 {
+		a.AddLogMsg("[TRADE_MESSAGE] no items detected in trade, continuing anyway")
 		log.Printf("[TRADE_MESSAGE] no items detected in trade, continuing anyway")
+	} else {
+		a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE] recorded %d bet item type(s) for payout", len(pokerGameBetItems)))
 	}
 
 	partnerName := strings.TrimSpace(lastTradePartnerName)
@@ -1816,28 +2017,70 @@ func formatTradeItemName(name string) string {
 }
 
 type user28Entry struct {
-	Token string
-	Name  string
+	Token     string
+	Name      string
+	RoomIndex int
 }
 
 func extractUsers28Entries(raw string) []user28Entry {
-	parts := strings.Split(raw, "\x02")
+	b := []byte(raw)
 	entries := make([]user28Entry, 0)
+	seen := map[string]struct{}{}
 
-	for _, part := range parts {
-		name, token, ok := parseUsers28Head(part)
-		if !ok {
+	for i := 0; i < len(b); i++ {
+		vlen := gencoding.VL64DecodeLen(b[i])
+		if vlen <= 0 || vlen > 6 || i+vlen >= len(b) {
 			continue
 		}
-		entries = append(entries, user28Entry{Token: token, Name: name})
+
+		roomIdx := gencoding.VL64Decode(b[i : i+vlen])
+		if roomIdx <= 0 {
+			continue
+		}
+
+		nameStart := i + vlen
+		nameEnd := nameStart
+		for nameEnd < len(b) && isLikelyNameChar(b[nameEnd]) {
+			nameEnd++
+		}
+
+		nameLen := nameEnd - nameStart
+		if nameLen < 2 || nameLen > 32 {
+			continue
+		}
+
+		if nameEnd >= len(b) || b[nameEnd] != 0x02 {
+			continue
+		}
+
+		name := strings.TrimSpace(string(b[nameStart:nameEnd]))
+		if name == "" {
+			continue
+		}
+
+		token := ""
+		if i >= 4 {
+			candidate := string(b[i-4 : i])
+			if isLikelyToken(candidate) {
+				token = candidate
+			}
+		}
+
+		key := fmt.Sprintf("%d|%s", roomIdx, strings.ToLower(name))
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+
+		entries = append(entries, user28Entry{Token: token, Name: name, RoomIndex: roomIdx})
 	}
 
 	return entries
 }
 
-func parseUsers28Head(part string) (name string, token string, ok bool) {
+func parseUsers28Head(part string) (name string, token string, roomIndex int, ok bool) {
 	if len(part) < 7 {
-		return "", "", false
+		return "", "", 0, false
 	}
 
 	nameStart := len(part)
@@ -1846,20 +2089,48 @@ func parseUsers28Head(part string) (name string, token string, ok bool) {
 	}
 
 	if nameStart < 5 || nameStart >= len(part) {
-		return "", "", false
+		return "", "", 0, false
 	}
 
 	name = part[nameStart:]
 	if len(name) < 2 {
-		return "", "", false
+		return "", "", 0, false
 	}
 
 	token = part[nameStart-4 : nameStart]
 	if !isLikelyToken(token) {
-		return "", "", false
+		return "", "", 0, false
 	}
 
-	return name, token, true
+	// Try to decode a VL64 room index from the bytes immediately before the token.
+	// In Shockwave USERS packets the entry layout is: [roomIndex VL64][name string] ...
+	// The 4-byte legacy token appears just before the name; the VL64 may start before it.
+	tokenOffset := nameStart - 4
+	for startOff := tokenOffset - 1; startOff >= 0 && startOff >= tokenOffset-6; startOff-- {
+		b := part[startOff]
+		vlen := gencoding.VL64DecodeLen(b)
+		if vlen > 0 && startOff+vlen == tokenOffset {
+			v := gencoding.VL64Decode([]byte(part[startOff : startOff+vlen]))
+			if v > 0 {
+				roomIndex = v
+			}
+			break
+		}
+	}
+
+	// Also try decoding the token itself as a VL64 room index (older format).
+	if roomIndex == 0 {
+		tb := []byte(token)
+		vlen := gencoding.VL64DecodeLen(tb[0])
+		if vlen > 0 && vlen <= 4 {
+			v := gencoding.VL64Decode(tb[:vlen])
+			if v > 0 {
+				roomIndex = v
+			}
+		}
+	}
+
+	return name, token, roomIndex, true
 }
 
 func isLikelyNameChar(b byte) bool {
@@ -1889,9 +2160,9 @@ func (a *App) handleRoomReady(e *g.Intercept) {
 
 func (a *App) handleRoomUsers(e *g.Intercept) {
 	defer func() {
-		if recover() != nil {
-			a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] failed to parse packet %d", e.Packet.Header.Value))
-			log.Printf("[ROOM_USERS] failed to parse packet %d", e.Packet.Header.Value)
+		if r := recover(); r != nil {
+			a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] failed to parse packet %d: %v", e.Packet.Header.Value, r))
+			log.Printf("[ROOM_USERS] failed to parse packet %d: %v", e.Packet.Header.Value, r)
 		}
 	}()
 
@@ -1899,15 +2170,19 @@ func (a *App) handleRoomUsers(e *g.Intercept) {
 	log.Printf("[ROOM_USERS] received packet %d len=%d", e.Packet.Header.Value, len(e.Packet.Data))
 
 	count := e.Packet.ReadInt()
-
-	roomMu.Lock()
+	parsedUsers := map[int]room.Entity{}
 
 	for range count {
 		var entity room.Entity
 		e.Packet.Read(&entity)
 		if entity.Type == room.User {
-			roomEntities[entity.Index] = entity
+			parsedUsers[entity.Index] = entity
 		}
+	}
+
+	roomMu.Lock()
+	for index, entity := range parsedUsers {
+		roomEntities[index] = entity
 	}
 	roomMu.Unlock()
 

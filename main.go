@@ -759,9 +759,14 @@ func startPokerPayout(a *App, targetID int, targetName string) {
 
 			if strings.TrimSpace(targetName) != "" {
 				go requestRoomUsers(a)
-				if resolvedID, ok := waitForUsers28NameIndex(targetName, 900*time.Millisecond); ok && resolvedID > 0 && resolvedID != targetID {
-					a.AddLogMsg(fmt.Sprintf("[PAYOUT] refreshed %s room index %d -> %d", targetName, targetID, resolvedID))
-					log.Printf("[PAYOUT] refreshed %s room index %d -> %d", targetName, targetID, resolvedID)
+				if resolvedID, ok := waitForRoomEntityIndexByName(targetName, 900*time.Millisecond); ok && resolvedID > 0 && resolvedID != targetID {
+					a.AddLogMsg(fmt.Sprintf("[PAYOUT] refreshed %s target from ROOM_USERS index %d -> %d", targetName, targetID, resolvedID))
+					log.Printf("[PAYOUT] refreshed %s target from ROOM_USERS index %d -> %d", targetName, targetID, resolvedID)
+					targetID = resolvedID
+					pokerPayoutTargetID = resolvedID
+				} else if resolvedID, ok := waitForUsers28NameIndex(targetName, 700*time.Millisecond); ok && resolvedID > 0 && resolvedID != targetID {
+					a.AddLogMsg(fmt.Sprintf("[PAYOUT] refreshed %s target from USERS28 index %d -> %d", targetName, targetID, resolvedID))
+					log.Printf("[PAYOUT] refreshed %s target from USERS28 index %d -> %d", targetName, targetID, resolvedID)
 					targetID = resolvedID
 					pokerPayoutTargetID = resolvedID
 				}
@@ -1244,6 +1249,38 @@ func waitForUsers28NameIndex(name string, timeout time.Duration) (int, bool) {
 	return 0, false
 }
 
+func lookupRoomEntityIndexByName(name string) (int, bool) {
+	needle := strings.ToLower(strings.TrimSpace(name))
+	if needle == "" {
+		return 0, false
+	}
+
+	roomMu.Lock()
+	defer roomMu.Unlock()
+	for _, entity := range roomEntities {
+		entityName := strings.TrimSpace(entity.Name)
+		if _, clean, ok := splitTokenAndName(entityName); ok {
+			entityName = clean
+		}
+		if strings.ToLower(entityName) == needle {
+			return entity.Index, true
+		}
+	}
+
+	return 0, false
+}
+
+func waitForRoomEntityIndexByName(name string, timeout time.Duration) (int, bool) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if idx, ok := lookupRoomEntityIndexByName(name); ok {
+			return idx, true
+		}
+		time.Sleep(75 * time.Millisecond)
+	}
+	return 0, false
+}
+
 // parseTradeItemsPacket extracts trade items from TRADE_ITEMS packet (header 108)
 // Items are separated by \x02 bytes and may contain item names and quantities.
 func (a *App) parseTradeItemsPacket(data []byte) []TradeItem {
@@ -1389,8 +1426,11 @@ func isCoordinatePattern(s string) bool {
 
 func (a *App) OpenLastTrade() {
 	if strings.TrimSpace(lastTradePartnerName) != "" && lastTradePartnerName != "Unknown" {
-		if idx, ok := lookupUsers28NameIndex(lastTradePartnerName); ok && idx > 0 && idx != lastTradePartnerID {
-			a.AddLogMsg(fmt.Sprintf("Open Last Trade refreshed partner index by name: %s (%d -> %d)", lastTradePartnerName, lastTradePartnerID, idx))
+		if idx, ok := lookupRoomEntityIndexByName(lastTradePartnerName); ok && idx > 0 && idx != lastTradePartnerID {
+			a.AddLogMsg(fmt.Sprintf("Open Last Trade refreshed partner index from ROOM_USERS: %s (%d -> %d)", lastTradePartnerName, lastTradePartnerID, idx))
+			lastTradePartnerID = idx
+		} else if idx, ok := lookupUsers28NameIndex(lastTradePartnerName); ok && idx > 0 && idx != lastTradePartnerID {
+			a.AddLogMsg(fmt.Sprintf("Open Last Trade refreshed partner index from USERS28: %s (%d -> %d)", lastTradePartnerName, lastTradePartnerID, idx))
 			lastTradePartnerID = idx
 		}
 	}

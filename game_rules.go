@@ -33,6 +33,10 @@ type PokerHandResult struct {
 	Tiebreaks []int
 }
 
+// Temporary testing override: force poker winner to player.
+// Set to false when normal win/loss logic is needed again.
+var forcePokerPlayerWinForTesting = true
+
 func defaultPokerDisplayConfig() *PokerDisplayConfig {
 	return &PokerDisplayConfig{
 		FiveOfAKind:  "Five of a kind: %s",
@@ -87,6 +91,10 @@ func evaluatePokerRules(dices []*Dice) PokerHandResult {
 }
 
 func comparePokerHands(player PokerHandResult, dealer PokerHandResult) PokerWinner {
+	if forcePokerPlayerWinForTesting {
+		return PokerWinnerPlayer
+	}
+
 	if player.Category > dealer.Category {
 		return PokerWinnerPlayer
 	}

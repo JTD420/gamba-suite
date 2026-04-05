@@ -154,6 +154,7 @@ type App struct {
 	ext       *g.Ext
 	assets    embed.FS
 	log       []string
+	debugLog  []string
 	logMu     sync.Mutex
 	chatLog   []string
 	chatLogMu sync.Mutex
@@ -1711,6 +1712,7 @@ func (a *App) resetDealerSessionState(reason string) {
 	currentHandItemIDs = map[string][]int{}
 	handItemsMu.Unlock()
 	a.emitHandItemsUpdate()
+	a.emitActiveGameBetItemsUpdate()
 
 	clearRoomUserCaches(a)
 	a.AddLogMsg(fmt.Sprintf("[DEALER_RESET] session reset (%s)", reason))
@@ -2198,6 +2200,17 @@ func (a *App) emitTradeItemsUpdate(side string) {
 			runtime.EventsEmit(a.ctx, "ownTradeItemsUpdate", string(jsonData))
 		}
 	}
+}
+
+func (a *App) emitActiveGameBetItemsUpdate() {
+	items := make([]TradeItem, len(pokerGameBetItems))
+	copy(items, pokerGameBetItems)
+
+	jsonData, err := json.Marshal(items)
+	if err != nil {
+		return
+	}
+	runtime.EventsEmit(a.ctx, "activeGameBetItemsUpdate", string(jsonData))
 }
 
 // requestPlayerStrip sends GETSTRIP[65] to refresh the player's hand inventory.
@@ -2830,6 +2843,7 @@ func (a *App) sendTradeCompletionMessage() {
 	pokerGameBetItems = make([]TradeItem, len(currentTradeItems))
 	copy(pokerGameBetItems, currentTradeItems)
 	tradeItemsMu.Unlock()
+	a.emitActiveGameBetItemsUpdate()
 
 	if len(pokerGameBetItems) == 0 {
 		a.AddLogMsg("[TRADE_MESSAGE] no items detected in trade, continuing anyway")
@@ -4282,16 +4296,74 @@ func (a *App) ShowCommands() {
 func (a *App) AddLogMsg(msg string) {
 	a.logMu.Lock()
 	defer a.logMu.Unlock()
-	// Get the current time and format it as a timestamp
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	// Prepend the timestamp to the message
 	timestampedMsg := fmt.Sprintf("[%s] %s", timestamp, msg)
 
-	a.log = append(a.log, timestampedMsg)
-	if len(a.log) > 100 {
-		a.log = a.log[1:]
+	a.debugLog = appendCappedLog(a.debugLog, timestampedMsg, 300)
+	if shouldShowInUserLog(msg) {
+		a.log = appendCappedLog(a.log, timestampedMsg, 150)
 	}
+
 	runtime.EventsEmit(a.ctx, "logUpdate", strings.Join(a.log, "\n"))
+	runtime.EventsEmit(a.ctx, "debugLogUpdate", strings.Join(a.debugLog, "\n"))
+}
+
+func appendCappedLog(lines []string, msg string, limit int) []string {
+	lines = append(lines, msg)
+	if len(lines) > limit {
+		lines = lines[len(lines)-limit:]
+	}
+	return lines
+}
+
+func shouldShowInUserLog(msg string) bool {
+	trimmed := strings.TrimSpace(msg)
+	if trimmed == "" {
+		return false
+	}
+
+	blockedPrefixes := []string{
+		"[PAYOUT_DEBUG]",
+		"[STRIP_DEBUG]",
+		"[TRADE_OPEN_DECODE]",
+		"[TRADE_ROOM]",
+		"[USERS28]",
+		"[ROOM_USERS]",
+		"[HEADER_SNIFF]",
+		"[TRADE_HEADERS]",
+		"[TRADE_ADDITEM #72]",
+		"[TRADE_ACCEPT #109]",
+		"[TRADE_CONFIRM #111]",
+	}
+	for _, prefix := range blockedPrefixes {
+		if strings.HasPrefix(trimmed, prefix) {
+			return false
+		}
+	}
+
+	blockedContains := []string{
+		"raw[",
+		"outgoing payload",
+		"derived outgoing[",
+		"fallback candidate outgoing[",
+		"unresolved reopen target",
+		"accepted by partner-name match",
+		"accepted by index fallback",
+		"accepted \"",
+		"ignoring \"",
+		"backfilled trade partner name",
+	}
+	for _, fragment := range blockedContains {
+		if strings.Contains(trimmed, fragment) {
+			return false
+		}
+	}
+
+	if strings.HasPrefix(trimmed, "[TRADE_ITEMS #108]") || strings.HasPrefix(trimmed, "[TRADE_OPEN #") || strings.HasPrefix(trimmed, "[TRADE_CLOSE #") {
+		return false
+	}
+
+	return true
 }
 
 func (a *App) AddChatLog(msg string) {

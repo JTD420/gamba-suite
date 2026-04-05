@@ -39,8 +39,11 @@
     <div v-if="activeTab === 'Trade'">
 
       <h2 class="section-title">Double Payout Check</h2>
-      <div class="trade-empty" v-if="tradeItems.length === 0">
-        No active bet in trade yet.
+      <p class="trade-hint" v-if="activeBetSourceLabel">
+        Showing {{ activeBetSourceLabel }} data until the round is fully complete.
+      </p>
+      <div class="trade-empty" v-if="activeBetItems.length === 0">
+        No live or saved round bet data yet.
       </div>
       <table v-else class="catalog-table">
         <thead><tr><th>Item</th><th>Bet</th><th>Need Stock</th><th>Payout</th><th>Have</th><th>Status</th></tr></thead>
@@ -55,10 +58,10 @@
           </tr>
         </tbody>
       </table>
-      <p class="trade-hint" v-if="tradeItems.length > 0 && !canCoverPayout">
+      <p class="trade-hint" v-if="activeBetItems.length > 0 && !canCoverPayout">
         You do not have enough stock to return double payout (bet + match).
       </p>
-      <p class="trade-hint" v-if="tradeItems.length > 0 && canCoverPayout">
+      <p class="trade-hint" v-if="activeBetItems.length > 0 && canCoverPayout">
         Your hand can return double payout (bet + match).
       </p>
 
@@ -79,6 +82,74 @@
           </tr>
         </tbody>
       </table>
+      <hr class="trade-divider" />
+
+      <!-- Player's Offer -->
+      <h2 class="section-title">Player Offer</h2>
+      <div v-if="tradeItems.length === 0" class="trade-empty">
+        No active trade items detected.<br />
+        <span style="font-size:12px;color:#666">Items appear here when the partner places furniture in the trade.</span>
+      </div>
+      <table v-else class="catalog-table">
+        <thead><tr><th>Item</th><th>Qty</th></tr></thead>
+        <tbody>
+          <tr v-for="(item, index) in tradeItems" :key="`trade-${index}`">
+            <td><span class="catalog-label">{{ item.displayName }}</span></td>
+            <td><span class="catalog-label">{{ item.Quantity }}</span></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <hr class="trade-divider" />
+
+      <!-- Your Offer -->
+      <h2 class="section-title">Your Offer To Them</h2>
+      <div v-if="ownTradeItems.length === 0" class="trade-empty">
+        Nothing added by you yet.
+      </div>
+      <table v-else class="catalog-table">
+        <thead><tr><th>Item</th><th>Qty</th></tr></thead>
+        <tbody>
+          <tr v-for="(item, index) in ownTradeItems" :key="`own-trade-${index}`">
+            <td><span class="catalog-label">{{ item.displayName }}</span></td>
+            <td><span class="catalog-label">{{ item.Quantity }}</span></td>
+          </tr>
+        </tbody>
+      </table>
+
+    </div>
+
+    <!-- Logs tab -->
+    <div v-if="activeTab === 'Logs'">
+      <div class="log-grid">
+        <div>
+          <div class="log-title-row">
+            <h2 class="section-title">Activity Log</h2>
+            <button class="copy-btn" @click="copyActivityLogs">Copy</button>
+          </div>
+          <div id="log" ref="logbox" class="log-section">
+            <div v-for="(msg, index) in log" :key="`roll-${index}`">{{ msg }}</div>
+          </div>
+        </div>
+        <div>
+          <div class="log-title-row">
+            <h2 class="section-title">Chat Logs</h2>
+            <button class="copy-btn" @click="copyChatLogs">Copy</button>
+          </div>
+          <div ref="chatlogbox" class="log-section chat-log-section">
+            <div v-for="(msg, index) in chatLog" :key="`chat-${index}`">{{ msg }}</div>
+          </div>
+        </div>
+        <div>
+          <div class="log-title-row">
+            <h2 class="section-title">Debugging</h2>
+            <button class="copy-btn" @click="copyDebugLogs">Copy</button>
+          </div>
+          <div ref="debuglogbox" class="log-section debug-log-section">
+            <div v-for="(msg, index) in debugLog" :key="`debug-${index}`">{{ msg }}</div>
+          </div>
+        </div>
+      </div>
 
       <hr class="trade-divider" />
 
@@ -99,66 +170,6 @@
           </tr>
         </tbody>
       </table>
-
-      <hr class="trade-divider" />
-
-      <!-- Partner's Offer -->
-      <h2 class="section-title">Partner's Offer</h2>
-      <div v-if="tradeItems.length === 0" class="trade-empty">
-        No active trade items detected.<br />
-        <span style="font-size:12px;color:#666">Items appear here when the partner places furniture in the trade.</span>
-      </div>
-      <table v-else class="catalog-table">
-        <thead><tr><th>Item</th><th>Qty</th></tr></thead>
-        <tbody>
-          <tr v-for="(item, index) in tradeItems" :key="`trade-${index}`">
-            <td><span class="catalog-label">{{ item.displayName }}</span></td>
-            <td><span class="catalog-label">{{ item.Quantity }}</span></td>
-          </tr>
-        </tbody>
-      </table>
-
-      <hr class="trade-divider" />
-
-      <!-- Your Offer -->
-      <h2 class="section-title">Your Offer</h2>
-      <div v-if="ownTradeItems.length === 0" class="trade-empty">
-        You are not offering any items.
-      </div>
-      <table v-else class="catalog-table">
-        <thead><tr><th>Item</th><th>Qty</th></tr></thead>
-        <tbody>
-          <tr v-for="(item, index) in ownTradeItems" :key="`own-trade-${index}`">
-            <td><span class="catalog-label">{{ item.displayName }}</span></td>
-            <td><span class="catalog-label">{{ item.Quantity }}</span></td>
-          </tr>
-        </tbody>
-      </table>
-
-    </div>
-
-    <!-- Logs tab -->
-    <div v-if="activeTab === 'Logs'">
-      <div class="log-grid">
-        <div>
-          <div class="log-title-row">
-            <h2 class="section-title">Roll Logs</h2>
-            <button class="copy-btn" @click="copyRollLogs">Copy</button>
-          </div>
-          <div id="log" ref="logbox" class="log-section">
-            <div v-for="(msg, index) in log" :key="`roll-${index}`">{{ msg }}</div>
-          </div>
-        </div>
-        <div>
-          <div class="log-title-row">
-            <h2 class="section-title">Chat Logs</h2>
-            <button class="copy-btn" @click="copyChatLogs">Copy</button>
-          </div>
-          <div ref="chatlogbox" class="log-section chat-log-section">
-            <div v-for="(msg, index) in chatLog" :key="`chat-${index}`">{{ msg }}</div>
-          </div>
-        </div>
-      </div>
     </div>
 
   </div>
@@ -181,10 +192,12 @@ export default {
         nothing: '',
       },
       tradeItems: [],
+      activeGameBetItems: [],
       ownTradeItems: [],
       handItems: [],
       roomIdentity: [],
       log: [],
+      debugLog: [],
       chatLog: [],
       isOutdated: false,
       currentVersion: '',
@@ -214,10 +227,16 @@ export default {
         return acc;
       }, {});
 
-      return this.tradeItemsWithDisplay.map(item => {
+      const liveIncomingByName = this.tradeItems.reduce((acc, item) => {
+        acc[item.Name] = (acc[item.Name] || 0) + item.Quantity;
+        return acc;
+      }, {});
+
+      return this.activeBetItemsWithDisplay.map(item => {
         const required = item.Quantity;
         const payoutTotal = item.Quantity * 2;
-        const have = handByName[item.Name] || 0;
+        const includeLiveIncoming = this.tradeItems.length > 0 ? (liveIncomingByName[item.Name] || 0) : 0;
+        const have = (handByName[item.Name] || 0) + includeLiveIncoming;
         const short = Math.max(required - have, 0);
         return {
           name: item.Name,
@@ -232,6 +251,23 @@ export default {
     },
     canCoverPayout() {
       return this.payoutRows.every((row) => row.short === 0);
+    },
+    activeBetItems() {
+      return this.tradeItems.length > 0 ? this.tradeItems : this.activeGameBetItems;
+    },
+    activeBetItemsWithDisplay() {
+      return this.activeBetItems.map(item => {
+        return { ...item, displayName: this.formatItemName(item.Name) };
+      });
+    },
+    activeBetSourceLabel() {
+      if (this.tradeItems.length > 0) {
+        return 'live trade';
+      }
+      if (this.activeGameBetItems.length > 0) {
+        return 'current round';
+      }
+      return '';
     },
   },
   methods: {
@@ -319,13 +355,17 @@ export default {
         console.error(error);
       }
     },
-    async copyRollLogs() {
+    async copyActivityLogs() {
       const text = this.log.join('\n');
-      await this.copyTextToClipboard(text, 'roll logs');
+      await this.copyTextToClipboard(text, 'activity logs');
     },
     async copyChatLogs() {
       const text = this.chatLog.join('\n');
       await this.copyTextToClipboard(text, 'chat logs');
+    },
+    async copyDebugLogs() {
+      const text = this.debugLog.join('\n');
+      await this.copyTextToClipboard(text, 'debug logs');
     },
     formatLabel(key) {
       return key.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
@@ -383,6 +423,10 @@ export default {
       this.log = message.split('\n');
       this.scrollBox('logbox');
     });
+    window.runtime.EventsOn("debugLogUpdate", (message) => {
+      this.debugLog = message.split('\n');
+      this.scrollBox('debuglogbox');
+    });
     window.runtime.EventsOn("chatLogUpdate", (message) => {
       this.chatLog = message.split('\n');
       this.scrollBox('chatlogbox');
@@ -396,6 +440,17 @@ export default {
         }));
       } catch (_) {
         this.tradeItems = [];
+      }
+    });
+
+    window.runtime.EventsOn("activeGameBetItemsUpdate", (jsonStr) => {
+      try {
+        this.activeGameBetItems = (JSON.parse(jsonStr) || []).map(item => ({
+          ...item,
+          displayName: this.formatItemName(item.Name),
+        }));
+      } catch (_) {
+        this.activeGameBetItems = [];
       }
     });
 
@@ -558,6 +613,11 @@ input[type="text"]::placeholder {
 .chat-log-section {
   color: #7dd3fc;
   border-color: #7dd3fc;
+}
+
+.debug-log-section {
+  color: #fda4af;
+  border-color: #fda4af;
 }
 
 /* Update notice style */

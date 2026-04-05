@@ -70,6 +70,7 @@ var (
 	headerSniffSeen  = map[uint16]bool{}
 	headerSniffMu    sync.Mutex
 	currentTradeItems []TradeItem
+	currentOwnTradeItems []TradeItem
 	tradeItemsMu     sync.Mutex
 	currentHandItems  []TradeItem
 	handItemsMu       sync.Mutex
@@ -287,29 +288,32 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 	// TRADE_ITEMS header 108 - parse individual items being traded
 	if e.Packet.Header.Value == 108 {
-		payload := string(e.Packet.Data)
-		if !isTradeItemsFromPartner(payload) {
-			a.AddLogMsg("[TRADE_ITEMS #108] ignored: packet is not partner-side items")
-			log.Printf("[TRADE_ITEMS #108] ignored: packet is not partner-side items")
-			return
-		}
-
 		items := parseTradeItemsPacket(e.Packet.Data)
-		
+
 		tradeItemsMu.Lock()
-		currentTradeItems = items
+		if e.Packet.Header.Dir == g.In {
+			currentTradeItems = items
+		} else if e.Packet.Header.Dir == g.Out {
+			currentOwnTradeItems = items
+		}
 		tradeItemsMu.Unlock()
-		
+
 		// Log the parsed items
-		a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] received %d items", len(items)))
-		log.Printf("[TRADE_ITEMS #108] received %d items", len(items))
-		
+		side := "unknown"
+		if e.Packet.Header.Dir == g.In {
+			side = "partner"
+		} else if e.Packet.Header.Dir == g.Out {
+			side = "yours"
+		}
+		a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] side=%s received %d item(s)", side, len(items)))
+		log.Printf("[TRADE_ITEMS #108] side=%s received %d item(s)", side, len(items))
+
 		for i, item := range items {
-			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] item[%d] name=%q quantity=%d raw=%q", i, item.Name, item.Quantity, item.RawData))
-			log.Printf("[TRADE_ITEMS #108] item[%d] name=%q quantity=%d raw=%q", i, item.Name, item.Quantity, item.RawData)
+			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] side=%s item[%d] name=%q quantity=%d raw=%q", side, i, item.Name, item.Quantity, item.RawData))
+			log.Printf("[TRADE_ITEMS #108] side=%s item[%d] name=%q quantity=%d raw=%q", side, i, item.Name, item.Quantity, item.RawData)
 		}
 
-		a.emitTradeItemsUpdate()
+		a.emitTradeItemsUpdate(side)
 		return
 	}
 	
@@ -871,24 +875,35 @@ func (a *App) GetTradeItemsJSON() string {
 func (a *App) ClearTradeItems() {
 	tradeItemsMu.Lock()
 	currentTradeItems = []TradeItem{}
+	currentOwnTradeItems = []TradeItem{}
 	tradeItemsMu.Unlock()
-	a.AddLogMsg("[TRADE_ITEMS] cleared current trade items")
-	log.Printf("[TRADE_ITEMS] cleared current trade items")
-	a.emitTradeItemsUpdate()
+	a.AddLogMsg("[TRADE_ITEMS] cleared partner and own trade items")
+	log.Printf("[TRADE_ITEMS] cleared partner and own trade items")
+	a.emitTradeItemsUpdate("both")
 }
 
 // emitTradeItemsUpdate pushes the current trade items to the frontend via an event
-func (a *App) emitTradeItemsUpdate() {
+func (a *App) emitTradeItemsUpdate(side string) {
 	tradeItemsMu.Lock()
-	items := make([]TradeItem, len(currentTradeItems))
-	copy(items, currentTradeItems)
+	partnerItems := make([]TradeItem, len(currentTradeItems))
+	copy(partnerItems, currentTradeItems)
+	ownItems := make([]TradeItem, len(currentOwnTradeItems))
+	copy(ownItems, currentOwnTradeItems)
 	tradeItemsMu.Unlock()
 
-	jsonData, err := json.Marshal(items)
-	if err != nil {
-		return
+	if side == "partner" || side == "both" {
+		jsonData, err := json.Marshal(partnerItems)
+		if err == nil {
+			runtime.EventsEmit(a.ctx, "tradeItemsUpdate", string(jsonData))
+		}
 	}
-	runtime.EventsEmit(a.ctx, "tradeItemsUpdate", string(jsonData))
+
+	if side == "yours" || side == "both" {
+		jsonData, err := json.Marshal(ownItems)
+		if err == nil {
+			runtime.EventsEmit(a.ctx, "ownTradeItemsUpdate", string(jsonData))
+		}
+	}
 }
 
 // requestPlayerStrip sends GETSTRIP[65] to refresh the player's hand inventory.

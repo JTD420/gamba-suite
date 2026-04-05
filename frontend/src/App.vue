@@ -118,6 +118,34 @@
         Items marked <span class="unlisted-value">?</span> are not in the catalog &mdash; set their value there first.
       </p>
 
+      <hr class="trade-divider" />
+
+      <!-- Your Offer -->
+      <h2 class="section-title">Your Offer</h2>
+      <div v-if="ownTradeItems.length === 0" class="trade-empty">
+        You are not offering any items.
+      </div>
+      <table v-else class="catalog-table">
+        <thead><tr><th>Item</th><th>Qty</th><th>Unit Value</th><th>Line Total</th></tr></thead>
+        <tbody>
+          <tr v-for="(item, index) in ownTradeItemsWithValues" :key="`own-trade-${index}`">
+            <td><span class="catalog-label">{{ item.displayName }}</span></td>
+            <td><span class="catalog-label">{{ item.Quantity }}</span></td>
+            <td><span class="catalog-label" :class="{ 'unlisted-value': item.unitValue === null }">{{ item.unitValue !== null ? item.unitValue : '?' }}</span></td>
+            <td><span class="catalog-label" :class="{ 'unlisted-value': item.lineTotal === null }">{{ item.lineTotal !== null ? item.lineTotal : '?' }}</span></td>
+          </tr>
+        </tbody>
+        <tfoot>
+          <tr>
+            <td colspan="3" class="trade-total-label">Your Offer Total</td>
+            <td class="trade-total-value">{{ ownTradeTotal }}</td>
+          </tr>
+        </tfoot>
+      </table>
+      <p class="trade-hint" v-if="ownTradeItems.some(i => !catalog.find(c => c.name === i.Name))">
+        Items marked <span class="unlisted-value">?</span> are not in the catalog &mdash; set their value there first.
+      </p>
+
     </div>
 
     <!-- Logs tab -->
@@ -159,6 +187,7 @@ export default {
       },
       catalog: [],
       tradeItems: [],
+      ownTradeItems: [],
       handItems: [],
       log: [],
       chatLog: [],
@@ -180,6 +209,20 @@ export default {
     },
     tradeTotal() {
       return this.tradeItemsWithValues
+        .filter(i => i.lineTotal !== null)
+        .reduce((sum, i) => sum + i.lineTotal, 0);
+    },
+    ownTradeItemsWithValues() {
+      return this.ownTradeItems.map(item => {
+        const entry = this.catalog.find(c => c.name === item.Name);
+        const unitValue = entry ? entry.value : null;
+        const lineTotal = unitValue !== null ? unitValue * item.Quantity : null;
+        const displayName = entry ? entry.display_name : item.Name;
+        return { ...item, displayName, unitValue, lineTotal };
+      });
+    },
+    ownTradeTotal() {
+      return this.ownTradeItemsWithValues
         .filter(i => i.lineTotal !== null)
         .reduce((sum, i) => sum + i.lineTotal, 0);
     },
@@ -338,6 +381,14 @@ export default {
         this.tradeItems = JSON.parse(jsonStr) || [];
       } catch (_) {
         this.tradeItems = [];
+      }
+    });
+
+    window.runtime.EventsOn("ownTradeItemsUpdate", (jsonStr) => {
+      try {
+        this.ownTradeItems = JSON.parse(jsonStr) || [];
+      } catch (_) {
+        this.ownTradeItems = [];
       }
     });
 

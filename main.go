@@ -48,6 +48,7 @@ var (
 	tradeCompleted                     bool
 	tradeCloseAnnounced                bool
 	suppressNextTradeCloseAnnouncement bool
+	ignoreNextGuardCloseRecovery       bool
 	lastTradeCoverageNotice            string
 	lastTradeBlockNotice               string
 	awaitingGameChoice                 bool
@@ -127,6 +128,7 @@ var (
 	tradeWindowOpenedAt                time.Time
 	tradeWindowDeadline                time.Time
 	tradeWindowTimeoutActive           bool
+	blockAllTrades                     = true
 )
 
 type TradeItem struct {
@@ -796,6 +798,37 @@ func handleTradePacket(a *App, e *g.Intercept) {
 	}
 
 	if e.Packet.Header.Value == 104 {
+		// Manual block-all-trades toggle
+		if blockAllTrades && !matchesRecentOutgoingFunc(e.Packet.Data) {
+			activeRound := awaitingGameChoice || dealerGameActive() || pokerPayoutMode || pokerPayoutTradeActive
+			allowed := false
+
+			if activeRound {
+				partnerName := strings.TrimSpace(lastTradePartnerName)
+				if partnerName != "" && !strings.EqualFold(partnerName, "Unknown") {
+					incomingToken := extractTradeTokenFromPacket(e.Packet.Data)
+					if partnerToken, ok := lookupTokenByName(partnerName); ok {
+						a.AddLogMsg(fmt.Sprintf("[TRADE_BLOCK_DEBUG] active partner=%q expectedToken=%q incomingToken=%q", partnerName, partnerToken, incomingToken))
+						log.Printf("[TRADE_BLOCK_DEBUG] active partner=%q expectedToken=%q incomingToken=%q", partnerName, partnerToken, incomingToken)
+						if incomingToken != "" && incomingToken == partnerToken {
+							a.AddLogMsg(fmt.Sprintf("[TRADE_BLOCK] allowing trade from active partner %q by token match", partnerName))
+							log.Printf("[TRADE_BLOCK] allowing trade from active partner %q by token match", partnerName)
+							allowed = true
+						}
+					}
+				}
+
+				if !allowed {
+					a.AddLogMsg("[TRADE_BLOCK] incoming trade blocked during active round")
+					log.Printf("[TRADE_BLOCK] incoming trade blocked during active round")
+					ignoreNextGuardCloseRecovery = true
+					suppressNextTradeCloseAnnouncement = true
+					e.Block()
+					return
+				}
+			}
+		}
+
 		a.ShowWindow()
 		stopUnderfundedTradeMonitor()
 		lastTradeCoverageNotice = ""
@@ -811,6 +844,10 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		// During payout mode, someone else opened a trade with us — close it and let the payout loop retry
 		isPayoutTradeOpen := false
 		if pokerPayoutMode {
+			incomingToken := extractTradeTokenFromPacket(e.Packet.Data)
+			expectedToken, _ := lookupTokenByName(pokerPayoutTargetName)
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] incoming trade-open while payout active: sent=%t target=%q targetID=%d expectedToken=%q incomingToken=%q matchedRecentOutgoing=%t", pokerPayoutTradeSent, pokerPayoutTargetName, pokerPayoutTargetID, expectedToken, incomingToken, matchedRecentOutgoing))
+			log.Printf("[PAYOUT_DEBUG] incoming trade-open while payout active: sent=%t target=%q targetID=%d expectedToken=%q incomingToken=%q matchedRecentOutgoing=%t", pokerPayoutTradeSent, pokerPayoutTargetName, pokerPayoutTargetID, expectedToken, incomingToken, matchedRecentOutgoing)
 			if pokerPayoutTradeSent {
 				// Our outgoing TRADE_OPEN was accepted — this is the payout trade opening successfully
 				savedPayoutTargetID := pokerPayoutTargetID
@@ -828,6 +865,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				// Someone else opened a trade with us during payout — block it
 				a.AddLogMsg(fmt.Sprintf("[PAYOUT] incoming trade blocked during payout to %s, closing", pokerPayoutTargetName))
 				log.Printf("[PAYOUT] incoming trade blocked during payout to %s, closing", pokerPayoutTargetName)
+				ignoreNextGuardCloseRecovery = true
 				suppressNextTradeCloseAnnouncement = true
 				e.Block()
 				ext.Send(out.TRADE_CLOSE)
@@ -849,6 +887,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 			a.AddLogMsg(fmt.Sprintf("[TRADE_GUARD] blocking incoming trade open: %s", reason))
 			log.Printf("[TRADE_GUARD] blocking incoming trade open: %s", reason)
+			ignoreNextGuardCloseRecovery = true
 			suppressNextTradeCloseAnnouncement = true
 			e.Block()
 			ext.Send(out.TRADE_CLOSE)
@@ -976,6 +1015,13 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 	// TRADE_CLOSE appears as incoming header 110 in your client logs.
 	if e.Packet.Header.Value == 110 {
+		if ignoreNextGuardCloseRecovery {
+			ignoreNextGuardCloseRecovery = false
+			a.AddLogMsg("[TRADE_GUARD] ignoring trade-close recovery for blocked foreign trade during active round")
+			log.Printf("[TRADE_GUARD] ignoring trade-close recovery for blocked foreign trade during active round")
+			return
+		}
+
 		stopUnderfundedTradeMonitor()
 		stopTradeWindowTimeoutMonitor()
 		wasCompleted := tradeCompleted
@@ -1102,17 +1148,23 @@ func startPokerPayout(a *App, targetID int, targetName string) {
 			pokerPayoutAttempts = attempt
 
 			if strings.TrimSpace(targetName) != "" {
+				expectedToken, _ := lookupTokenByName(targetName)
+				a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] attempt %d target=%q currentTargetID=%d expectedToken=%q", attempt, targetName, targetID, expectedToken))
+				log.Printf("[PAYOUT_DEBUG] attempt %d target=%q currentTargetID=%d expectedToken=%q", attempt, targetName, targetID, expectedToken)
 				go requestRoomUsers(a)
 				if resolvedID, ok := waitForRoomEntityIndexByName(targetName, 900*time.Millisecond); ok && resolvedID > 0 && resolvedID != targetID {
 					a.AddLogMsg(fmt.Sprintf("[PAYOUT] refreshed %s target from ROOM_USERS index %d -> %d", targetName, targetID, resolvedID))
 					log.Printf("[PAYOUT] refreshed %s target from ROOM_USERS index %d -> %d", targetName, targetID, resolvedID)
 					targetID = resolvedID
 					pokerPayoutTargetID = resolvedID
-				} else if resolvedID, ok := waitForUsers28NameIndex(targetName, 700*time.Millisecond); ok && resolvedID > 0 && resolvedID != targetID {
-					a.AddLogMsg(fmt.Sprintf("[PAYOUT] refreshed %s target from USERS28 index %d -> %d", targetName, targetID, resolvedID))
-					log.Printf("[PAYOUT] refreshed %s target from USERS28 index %d -> %d", targetName, targetID, resolvedID)
+				} else if resolvedID, ok := waitForUsers28RoomIndexByName(targetName, 700*time.Millisecond); ok && resolvedID > 0 && resolvedID != targetID {
+					a.AddLogMsg(fmt.Sprintf("[PAYOUT] refreshed %s target from USERS28 room index %d -> %d", targetName, targetID, resolvedID))
+					log.Printf("[PAYOUT] refreshed %s target from USERS28 room index %d -> %d", targetName, targetID, resolvedID)
 					targetID = resolvedID
 					pokerPayoutTargetID = resolvedID
+				} else if resolvedID, ok := waitForUsers28NameIndex(targetName, 700*time.Millisecond); ok {
+					a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] generic USERS28 name->index fallback produced %d for %s (current target %d)", resolvedID, targetName, targetID))
+					log.Printf("[PAYOUT_DEBUG] generic USERS28 name->index fallback produced %d for %s (current target %d)", resolvedID, targetName, targetID)
 				}
 			}
 
@@ -1948,6 +2000,10 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 	for _, entry := range entries {
 		a.AddLogMsg(fmt.Sprintf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, entry.Token, entry.ShortToken, entry.Name, entry.RoomIndex))
 		log.Printf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, entry.Token, entry.ShortToken, entry.Name, entry.RoomIndex)
+		if chatIdx, ok := chatIndexFromShortToken(entry.ShortToken); ok && chatIdx > 0 {
+			a.AddLogMsg(fmt.Sprintf("[USERS28_DEBUG] name=%q roomIndex=%d chatIndex=%d short=%q token=%q", entry.Name, entry.RoomIndex, chatIdx, entry.ShortToken, entry.Token))
+			log.Printf("[USERS28_DEBUG] name=%q roomIndex=%d chatIndex=%d short=%q token=%q", entry.Name, entry.RoomIndex, chatIdx, entry.ShortToken, entry.Token)
+		}
 	}
 }
 
@@ -2053,6 +2109,33 @@ func lookupUsers28NameIndex(name string) (int, bool) {
 		if strings.ToLower(strings.TrimSpace(cachedName)) == needle {
 			return idx, true
 		}
+	}
+	return 0, false
+}
+
+func lookupUsers28RoomIndexByName(name string) (int, bool) {
+	needle := strings.ToLower(strings.TrimSpace(name))
+	if needle == "" {
+		return 0, false
+	}
+
+	users28Mu.Lock()
+	defer users28Mu.Unlock()
+	for _, entry := range roomIdentityByShortToken {
+		if entry.RoomIndex > 0 && strings.ToLower(strings.TrimSpace(entry.Name)) == needle {
+			return entry.RoomIndex, true
+		}
+	}
+	return 0, false
+}
+
+func waitForUsers28RoomIndexByName(name string, timeout time.Duration) (int, bool) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if idx, ok := lookupUsers28RoomIndexByName(name); ok {
+			return idx, true
+		}
+		time.Sleep(75 * time.Millisecond)
 	}
 	return 0, false
 }
@@ -3740,6 +3823,19 @@ func rememberOutgoingTradeOpenTarget(targetID int) {
 	tradeOpenStateMu.Unlock()
 }
 
+// matchesRecentOutgoingFunc is a convenience wrapper used by the block-all guard.
+// Returns true if the packet looks like a response to our own recent TRADE_OPEN.
+func matchesRecentOutgoingFunc(data []byte) bool {
+	id := 0
+	if len(data) > 0 {
+		if v, ok := decodeLeadingVL64(data); ok {
+			id = v
+		}
+	}
+	_, matched := matchesRecentOutgoingTradeOpen(data, id)
+	return matched
+}
+
 func matchesRecentOutgoingTradeOpen(data []byte, leadingIncomingID int) (int, bool) {
 	tradeOpenStateMu.Lock()
 	targetID := lastOutgoingTradeOpenID
@@ -3874,6 +3970,16 @@ func (a *App) onChatMessage(e *g.Intercept) {
 		case strings.HasSuffix(command, "chatoff"):
 			e.Block()
 			ChatIsDisabled = true
+		case strings.HasSuffix(command, "tradesoff"):
+			e.Block()
+			blockAllTrades = true
+			a.AddLogMsg("[TRADE_BLOCK] all incoming trades are now blocked")
+			log.Printf("[TRADE_BLOCK] all incoming trades are now blocked")
+		case strings.HasSuffix(command, "tradeson"):
+			e.Block()
+			blockAllTrades = false
+			a.AddLogMsg("[TRADE_BLOCK] incoming trades re-enabled")
+			log.Printf("[TRADE_BLOCK] incoming trades re-enabled")
 		}
 	}
 }
@@ -4193,9 +4299,11 @@ func (a *App) rollTriDice() {
 			isTriRolling = false
 			return
 		}
+		currentSum = 0
 		for _, index := range []int{0, 2, 4} {
 			diceList[index].Value = rand.Intn(6) + 1
 			diceList[index].IsClosed = false
+			currentSum += diceList[index].Value
 			logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceList[index].ID, diceList[index].Value)
 			a.AddLogMsg(logRollResult)
 		}
@@ -4849,4 +4957,33 @@ func gameChoiceDisplay(choice string) string {
 	default:
 		return choice
 	}
+}
+
+// extractTradeTokenFromPacket returns the 4-byte user token in a TRADE_OPEN
+// (header 104) packet. It sits immediately after the leading VL64 room index.
+func extractTradeTokenFromPacket(data []byte) string {
+	if len(data) < 1 {
+		return ""
+	}
+	vlen := gencoding.VL64DecodeLen(data[0])
+	if vlen <= 0 || vlen+4 > len(data) {
+		return ""
+	}
+	return string(data[vlen : vlen+4])
+}
+
+// lookupTokenByName reverses users28ByToken to find the 4-byte token for a name.
+func lookupTokenByName(name string) (string, bool) {
+	needle := strings.ToLower(strings.TrimSpace(name))
+	if needle == "" {
+		return "", false
+	}
+	users28Mu.Lock()
+	defer users28Mu.Unlock()
+	for token, n := range users28ByToken {
+		if strings.ToLower(strings.TrimSpace(n)) == needle {
+			return token, true
+		}
+	}
+	return "", false
 }

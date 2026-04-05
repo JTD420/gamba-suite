@@ -52,6 +52,7 @@ var (
 	lastTradeBlockNotice string
 	awaitingGameChoice bool
 	awaitingGameChoicePartnerID int
+	awaitingGameChoicePartnerName string
 	pokerSequenceStage int
 	pokerSequencePlayerName string
 	pokerSequencePlayerResult PokerHandResult
@@ -114,6 +115,7 @@ var (
 	fakeDiceTestingMode bool
 	dealerOpenHeartbeatID int
 	dealerOpenHeartbeatActive bool
+	dealerResyncInProgress bool
 	lastOutgoingTradeOpenID int
 	lastOutgoingTradeOpenAt time.Time
 	tradeOpenStateMu sync.Mutex
@@ -236,7 +238,7 @@ func dealerGameActive() bool {
 }
 
 func dealerReadyForNewTrade() bool {
-	return awaitingTradeOpen && dealerTradeWindowOpen && !dealerGameActive()
+	return awaitingTradeOpen && dealerTradeWindowOpen && !dealerGameActive() && !dealerResyncInProgress
 }
 
 func dealerDiceReadyLocked() bool {
@@ -532,6 +534,8 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			reason := "dealer not open"
 			if dealerGameActive() {
 				reason = "dealer busy in active game"
+			} else if dealerResyncInProgress {
+				reason = "dealer syncing hand"
 			} else if !awaitingTradeOpen {
 				reason = "dealer not accepting trades"
 			} else if !dealerTradeWindowOpen {
@@ -553,6 +557,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 		awaitingGameChoice = false
 		awaitingGameChoicePartnerID = 0
+		awaitingGameChoicePartnerName = ""
 		pokerSequenceStage = 0
 		pokerSequencePlayerName = ""
 		stopDealerOpenHeartbeat()
@@ -729,19 +734,8 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			a.AddLogMsg("[PAYOUT] payout trade completed successfully")
 			log.Printf("[PAYOUT] payout trade completed successfully")
 
-			// Resume dealer-open cycle after payout is fully closed.
-			awaitingTradeOpen = true
-			if canAnnounceDealerOpen() {
-				dealerTradeWindowOpen = true
-				openMsg := a.dealerOpenMessage()
-				a.AddLogMsg(fmt.Sprintf("[TRADE_REOPEN] shouting: %q", openMsg))
-				log.Printf("[TRADE_REOPEN] shouting: %q", openMsg)
-				go sendMessageWithDelay(openMsg)
-			} else {
-				dealerTradeWindowOpen = false
-				log.Printf("User is muted. Dealer open announcement skipped; incoming trades will be blocked.")
-			}
-			startDealerOpenHeartbeat(a)
+			// Resync hand before reopening dealer trades.
+			go a.resyncHandThenOpenDealer()
 		}
 
 		partnerID := lastTradePartnerID
@@ -1871,7 +1865,7 @@ func (a *App) emitTradeItemsUpdate(side string) {
 }
 
 // requestPlayerStrip sends GETSTRIP[65] to refresh the player's hand inventory.
-func (a *App) requestPlayerStrip() {
+func (a *App) requestPlayerStrip() int {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[STRIP] GETSTRIP request panicked: %v", r)
@@ -1893,7 +1887,60 @@ func (a *App) requestPlayerStrip() {
 	sendGetStripRaw(a, stripGetNewPayload)
 	a.AddLogMsg("[STRIP] requested player hand scan (GETSTRIP new)")
 	log.Printf("[STRIP] requested player hand scan (GETSTRIP new)")
-	_ = sessionID
+	return sessionID
+}
+
+func waitForStripScanCompletion(sessionID int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		stripScanMu.Lock()
+		active := stripScanActive
+		current := stripScanSessionID
+		stripScanMu.Unlock()
+
+		if current > sessionID {
+			return true
+		}
+		if current == sessionID && !active {
+			return true
+		}
+
+		time.Sleep(150 * time.Millisecond)
+	}
+	return false
+}
+
+func (a *App) resyncHandThenOpenDealer() {
+	awaitingTradeOpen = false
+	dealerTradeWindowOpen = false
+	dealerResyncInProgress = true
+	stopDealerOpenHeartbeat()
+
+	a.AddLogMsg("[TRADE_REOPEN] payout complete; syncing hand before reopening trades")
+	log.Printf("[TRADE_REOPEN] payout complete; syncing hand before reopening trades")
+
+	scanID := a.requestPlayerStrip()
+	if ok := waitForStripScanCompletion(scanID, 20*time.Second); ok {
+		a.AddLogMsg(fmt.Sprintf("[TRADE_REOPEN] hand sync complete (session=%d)", scanID))
+		log.Printf("[TRADE_REOPEN] hand sync complete (session=%d)", scanID)
+	} else {
+		a.AddLogMsg(fmt.Sprintf("[TRADE_REOPEN] hand sync timeout (session=%d), reopening anyway", scanID))
+		log.Printf("[TRADE_REOPEN] hand sync timeout (session=%d), reopening anyway", scanID)
+	}
+
+	dealerResyncInProgress = false
+	awaitingTradeOpen = true
+	if canAnnounceDealerOpen() {
+		dealerTradeWindowOpen = true
+		openMsg := a.dealerOpenMessage()
+		a.AddLogMsg(fmt.Sprintf("[TRADE_REOPEN] shouting: %q", openMsg))
+		log.Printf("[TRADE_REOPEN] shouting: %q", openMsg)
+		go sendMessageWithDelay(openMsg)
+	} else {
+		dealerTradeWindowOpen = false
+		log.Printf("User is muted. Dealer open announcement skipped; incoming trades will be blocked.")
+	}
+	startDealerOpenHeartbeat(a)
 }
 
 // handleStripPacket parses STRIPINFO_2 [140] to track items in the player's hand.
@@ -2458,7 +2505,14 @@ func (a *App) sendTradeCompletionMessage() {
 	first := fmt.Sprintf("%s what game do you want to play?", partnerName)
 	second := "Say Poker, 21, 13"
 	awaitingGameChoice = true
-	awaitingGameChoicePartnerID = lastTradePartnerID
+	awaitingGameChoicePartnerName = strings.TrimSpace(lastTradePartnerName)
+	// Prefer the real room chat index over the USERS28 virtual id.
+	// Chat messages use small room indices (e.g. 32), not the large USERS28 ids (e.g. 227177).
+	if chatIdx, ok := lookupUsers28NameIndex(awaitingGameChoicePartnerName); ok && chatIdx > 0 {
+		awaitingGameChoicePartnerID = chatIdx
+	} else {
+		awaitingGameChoicePartnerID = lastTradePartnerID
+	}
 
 	a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE] shouting: %q", first))
 	log.Printf("[TRADE_MESSAGE] shouting: %q", first)
@@ -3801,9 +3855,42 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 		return
 	}
 
-	if awaitingGameChoicePartnerID > 0 && index != awaitingGameChoicePartnerID {
-		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] received %q from chat index %d while expecting %d; accepting due to Shockwave id mismatch", choice, index, awaitingGameChoicePartnerID))
-		log.Printf("[GAME_SELECT] received %q from chat index %d while expecting %d; accepting due to Shockwave id mismatch", choice, index, awaitingGameChoicePartnerID)
+	// Resolve the chat sender's name: try roomEntities first, fall back to users28ByIndex.
+	senderName := ""
+	roomMu.Lock()
+	if entity, ok := roomEntities[index]; ok {
+		senderName = strings.TrimSpace(entity.Name)
+		if _, clean, ok2 := splitTokenAndName(senderName); ok2 {
+			senderName = clean
+		}
+	}
+	roomMu.Unlock()
+	if senderName == "" {
+		if n, ok := lookupUsers28Index(index); ok {
+			senderName = n
+		}
+	}
+
+	// Accept only if sender matches by room index OR by name.
+	indexMatch := awaitingGameChoicePartnerID > 0 && index == awaitingGameChoicePartnerID
+	nameMatch := awaitingGameChoicePartnerName != "" && strings.EqualFold(senderName, awaitingGameChoicePartnerName)
+	// Fallback 1: stored ID may be a USERS28/virtual id instead of chat index;
+	// look up the partner's chat index via roomEntities by name.
+	if !indexMatch && !nameMatch && awaitingGameChoicePartnerName != "" {
+		if expectedIdx, ok := lookupRoomEntityIndexByName(awaitingGameChoicePartnerName); ok && expectedIdx > 0 && expectedIdx == index {
+			indexMatch = true
+		}
+	}
+	// Fallback 2: look up the partner's chat index via the users28ByIndex cache.
+	if !indexMatch && !nameMatch && awaitingGameChoicePartnerName != "" {
+		if expectedIdx, ok := lookupUsers28NameIndex(awaitingGameChoicePartnerName); ok && expectedIdx > 0 && expectedIdx == index {
+			indexMatch = true
+		}
+	}
+	if !indexMatch && !nameMatch {
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] ignoring %q from %q (index %d); waiting for %q (index %d)", choice, senderName, index, awaitingGameChoicePartnerName, awaitingGameChoicePartnerID))
+		log.Printf("[GAME_SELECT] ignoring %q from %q (index %d); waiting for %q (index %d)", choice, senderName, index, awaitingGameChoicePartnerName, awaitingGameChoicePartnerID)
+		return
 	}
 
 	e.Block()
@@ -3815,6 +3902,7 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 
 	awaitingGameChoice = false
 	awaitingGameChoicePartnerID = 0
+	awaitingGameChoicePartnerName = ""
 
 	ack := fmt.Sprintf("%s! Lets Play!", gameChoiceDisplay(choice))
 	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", ack))

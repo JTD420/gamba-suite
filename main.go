@@ -123,6 +123,10 @@ var (
 	lastOutgoingTradeOpenID            int
 	lastOutgoingTradeOpenAt            time.Time
 	tradeOpenStateMu                   sync.Mutex
+	tradeWindowTimeoutMonitorID        int
+	tradeWindowOpenedAt                time.Time
+	tradeWindowDeadline                time.Time
+	tradeWindowTimeoutActive           bool
 )
 
 type TradeItem struct {
@@ -472,6 +476,9 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		}
 
 		a.emitTradeItemsUpdate(side)
+		if side == "partner" && len(allItems) > 0 {
+			extendTradeWindowTimeoutForPartnerActivity(a)
+		}
 		if pokerPayoutTradeActive {
 			a.AddLogMsg("[TRADE_COVERAGE] skipped shortage enforcement during payout trade")
 			log.Printf("[TRADE_COVERAGE] skipped shortage enforcement during payout trade")
@@ -518,6 +525,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		stopUnderfundedTradeMonitor()
 		lastTradeCoverageNotice = ""
 		lastTradeBlockNotice = ""
+		openedDuringDealerWindow := awaitingTradeOpen && dealerTradeWindowOpen
 
 		incomingTraderID := 0
 		if id, ok := decodeLeadingVL64(e.Packet.Data); ok {
@@ -583,6 +591,9 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		pokerSequenceStage = 0
 		pokerSequencePlayerName = ""
 		stopDealerOpenHeartbeat()
+		if !isPayoutTradeOpen && openedDuringDealerWindow {
+			startTradeWindowTimeoutMonitor(a)
+		}
 
 		resetTradeAutoFlow()
 
@@ -691,6 +702,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 	// TRADE_CLOSE appears as incoming header 110 in your client logs.
 	if e.Packet.Header.Value == 110 {
 		stopUnderfundedTradeMonitor()
+		stopTradeWindowTimeoutMonitor()
 		wasCompleted := tradeCompleted
 		tradeAutoConfirmed = true
 		tradeAutoConfirmPending = false
@@ -738,17 +750,9 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				log.Printf("[PAYOUT] payout trade cancelled by %s, retrying", retryTargetName)
 				startPokerPayout(a, retryTargetID, retryTargetName)
 			} else {
-				awaitingTradeOpen = true
-				a.AddLogMsg("[TRADE_REOPEN] trade closed before completion, restarting dealer cycle")
-				log.Printf("[TRADE_REOPEN] trade closed before completion, restarting dealer cycle")
-				if canAnnounceDealerOpen() {
-					dealerTradeWindowOpen = true
-					go sendMessageWithDelay(a.dealerOpenMessage())
-				} else {
-					dealerTradeWindowOpen = false
-					log.Printf("User is muted. Dealer open announcement skipped; incoming trades will be blocked.")
-				}
-				startDealerOpenHeartbeat(a)
+				a.AddLogMsg("[TRADE_REOPEN] trade closed before completion, performing full dealer reset")
+				log.Printf("[TRADE_REOPEN] trade closed before completion, performing full dealer reset")
+				go a.resyncHandThenOpenDealer()
 			}
 		} else if pokerPayoutTradeActive {
 			// Payout trade completed normally — clear active flag
@@ -1209,6 +1213,73 @@ func stopUnderfundedTradeMonitor() {
 	underfundedTradeMonitorNotice = ""
 }
 
+func startTradeWindowTimeoutMonitor(a *App) {
+	tradeWindowTimeoutMonitorID++
+	monitorID := tradeWindowTimeoutMonitorID
+	tradeWindowOpenedAt = time.Now()
+	tradeWindowDeadline = tradeWindowOpenedAt.Add(45 * time.Second)
+	tradeWindowTimeoutActive = true
+
+	go func(id int) {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			if id != tradeWindowTimeoutMonitorID {
+				return
+			}
+
+			if !tradeWindowTimeoutActive {
+				return
+			}
+
+			if time.Now().Before(tradeWindowDeadline) {
+				continue
+			}
+
+			tradeWindowTimeoutActive = false
+			msg := "closing trade window opened for too long"
+			a.AddLogMsg("[TRADE_TIMEOUT] " + msg)
+			log.Printf("[TRADE_TIMEOUT] %s", msg)
+			ext.Send(out.SHOUT, msg)
+			ext.Send(out.TRADE_CLOSE)
+			return
+		}
+	}(monitorID)
+}
+
+func extendTradeWindowTimeoutForPartnerActivity(a *App) {
+	if !tradeWindowTimeoutActive {
+		return
+	}
+
+	now := time.Now()
+	maxDeadline := tradeWindowOpenedAt.Add(90 * time.Second)
+	if now.After(maxDeadline) {
+		return
+	}
+
+	extendedDeadline := now.Add(20 * time.Second)
+	if extendedDeadline.After(maxDeadline) {
+		extendedDeadline = maxDeadline
+	}
+
+	if extendedDeadline.After(tradeWindowDeadline) {
+		tradeWindowDeadline = extendedDeadline
+		seconds := int(tradeWindowDeadline.Sub(tradeWindowOpenedAt).Seconds())
+		a.AddLogMsg(fmt.Sprintf("[TRADE_TIMEOUT] partner adding items, extending window to %ds max", seconds))
+		log.Printf("[TRADE_TIMEOUT] partner adding items, extending window to %ds max", seconds)
+	}
+}
+
+func stopTradeWindowTimeoutMonitor() {
+	if !tradeWindowTimeoutActive {
+		return
+	}
+	tradeWindowTimeoutMonitorID++
+	tradeWindowTimeoutActive = false
+}
+
 func startUnderfundedTradeMonitor(a *App, notice string) {
 	underfundedTradeMonitorID++
 	monitorID := underfundedTradeMonitorID
@@ -1596,6 +1667,54 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 		a.AddLogMsg(fmt.Sprintf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, entry.Token, entry.ShortToken, entry.Name, entry.RoomIndex))
 		log.Printf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, entry.Token, entry.ShortToken, entry.Name, entry.RoomIndex)
 	}
+}
+
+func clearRoomUserCaches(a *App) {
+	roomMu.Lock()
+	clear(roomEntities)
+	roomMu.Unlock()
+
+	users28Mu.Lock()
+	clear(users28ByToken)
+	clear(users28ByIndex)
+	clear(users28ByShortToken)
+	clear(roomIdentityByShortToken)
+	users28Mu.Unlock()
+
+	a.emitRoomIdentityUpdate()
+}
+
+func (a *App) resetDealerSessionState(reason string) {
+	awaitingTradeOpen = false
+	dealerTradeWindowOpen = false
+	awaitingGameChoice = false
+	awaitingGameChoicePartnerID = 0
+	awaitingGameChoicePartnerName = ""
+	lastTradePartnerID = 0
+	lastTradePartnerName = ""
+	lastTradePartnerToken = ""
+	pokerGameBetItems = nil
+	lastAddItemWasOurs = false
+	lastTradeCoverageNotice = ""
+	lastTradeBlockNotice = ""
+
+	stopTradeWindowTimeoutMonitor()
+	stopUnderfundedTradeMonitor()
+	stopDealerOpenHeartbeat()
+	resetTradeAutoFlow()
+	resetPokerSequence()
+	stopPokerPayout()
+	a.ClearTradeItems()
+
+	handItemsMu.Lock()
+	currentHandItems = nil
+	currentHandItemIDs = map[string][]int{}
+	handItemsMu.Unlock()
+	a.emitHandItemsUpdate()
+
+	clearRoomUserCaches(a)
+	a.AddLogMsg(fmt.Sprintf("[DEALER_RESET] session reset (%s)", reason))
+	log.Printf("[DEALER_RESET] session reset (%s)", reason)
 }
 
 func lookupUsers28Token(token string) (string, bool) {
@@ -2128,13 +2247,12 @@ func waitForStripScanCompletion(sessionID int, timeout time.Duration) bool {
 }
 
 func (a *App) resyncHandThenOpenDealer() {
-	awaitingTradeOpen = false
-	dealerTradeWindowOpen = false
+	a.resetDealerSessionState("reopen")
 	dealerResyncInProgress = true
-	stopDealerOpenHeartbeat()
 
-	a.AddLogMsg("[TRADE_REOPEN] payout complete; syncing hand before reopening trades")
-	log.Printf("[TRADE_REOPEN] payout complete; syncing hand before reopening trades")
+	a.AddLogMsg("[TRADE_REOPEN] full reset complete; syncing room users and hand before reopening trades")
+	log.Printf("[TRADE_REOPEN] full reset complete; syncing room users and hand before reopening trades")
+	requestRoomUsers(a)
 
 	scanID := a.requestPlayerStrip()
 	if ok := waitForStripScanCompletion(scanID, 20*time.Second); ok {
@@ -2146,6 +2264,9 @@ func (a *App) resyncHandThenOpenDealer() {
 	}
 
 	dealerResyncInProgress = false
+	if shouldRefreshRoomUsers() {
+		requestRoomUsers(a)
+	}
 	awaitingTradeOpen = true
 	if canAnnounceDealerOpen() {
 		dealerTradeWindowOpen = true
@@ -2947,16 +3068,7 @@ func isLikelyToken(s string) bool {
 }
 
 func (a *App) handleRoomReady(e *g.Intercept) {
-	roomMu.Lock()
-	defer roomMu.Unlock()
-	clear(roomEntities)
-	users28Mu.Lock()
-	clear(users28ByToken)
-	clear(users28ByIndex)
-	clear(users28ByShortToken)
-	clear(roomIdentityByShortToken)
-	users28Mu.Unlock()
-	a.emitRoomIdentityUpdate()
+	clearRoomUserCaches(a)
 	a.AddLogMsg("[ROOM_USERS] cleared cached room users")
 	log.Printf("[ROOM_USERS] cleared cached room users")
 	go requestRoomUsers(a)
@@ -3526,6 +3638,7 @@ func resetDiceState() {
 	diceList = []*Dice{}
 	awaitingTradeOpen = false
 	dealerTradeWindowOpen = false
+	stopTradeWindowTimeoutMonitor()
 	resetPokerSequence()
 	fakeDiceTestingMode = false
 	isPokerRolling, isTriRolling, isBJRolling, is13Rolling, isHitting, is13Hitting, isClosing = false, false, false, false, false, false, false

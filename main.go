@@ -69,9 +69,11 @@ var (
 	headerSniffUntil time.Time
 	headerSniffSeen  = map[uint16]bool{}
 	headerSniffMu    sync.Mutex
-	currentTradeItems []TradeItem
+	currentTradeItems    []TradeItem
 	currentOwnTradeItems []TradeItem
-	tradeItemsMu     sync.Mutex
+	tradeItemsMu         sync.Mutex
+	lastAddItemWasOurs   bool
+	addItemMu            sync.Mutex
 	currentHandItems  []TradeItem
 	handItemsMu       sync.Mutex
 	stripScanMu       sync.Mutex
@@ -274,6 +276,16 @@ func handleMutePacket(e *g.Intercept) {
 
 // Trade detection logic (called within InterceptAll)
 func handleTradePacket(a *App, e *g.Intercept) {
+	// TRADE_ADDITEM outgoing 72 - we are adding an item; flag next TRADE_ITEMS as ours
+	if e.Packet.Header.Dir == g.Out && e.Packet.Header.Value == 72 {
+		addItemMu.Lock()
+		lastAddItemWasOurs = true
+		addItemMu.Unlock()
+		a.AddLogMsg("[TRADE_ADDITEM #72] outgoing: next TRADE_ITEMS belongs to us")
+		log.Printf("[TRADE_ADDITEM #72] outgoing: next TRADE_ITEMS belongs to us")
+		return
+	}
+
 	// TRADE_ACCEPT incoming 109 - wait 2 seconds then send TRADE_ACCEPT (69)
 	if e.Packet.Header.Value == 109 {
 		scheduleAutoTradeAccept(a, string(e.Packet.Data))
@@ -286,31 +298,40 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		return
 	}
 
-	// TRADE_ITEMS header 108 - parse individual items being traded
+	// TRADE_ITEMS header 108 - incoming server echo of full trade state (always incoming)
+	// Ownership: if we just sent TRADE_ADDITEM[72], the new item is ours; otherwise partner triggered.
+	// Compute each side by diffing total items against the other side's last known list.
 	if e.Packet.Header.Value == 108 {
-		items := parseTradeItemsPacket(e.Packet.Data)
+		allItems := parseTradeItemsPacket(e.Packet.Data)
 
-		tradeItemsMu.Lock()
-		if e.Packet.Header.Dir == g.In {
-			currentTradeItems = items
-		} else if e.Packet.Header.Dir == g.Out {
-			currentOwnTradeItems = items
-		}
-		tradeItemsMu.Unlock()
+		addItemMu.Lock()
+		wasOurs := lastAddItemWasOurs
+		lastAddItemWasOurs = false
+		addItemMu.Unlock()
 
-		// Log the parsed items
-		side := "unknown"
-		if e.Packet.Header.Dir == g.In {
-			side = "partner"
-		} else if e.Packet.Header.Dir == g.Out {
+		side := "partner"
+		if wasOurs {
 			side = "yours"
 		}
-		a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] side=%s received %d item(s)", side, len(items)))
-		log.Printf("[TRADE_ITEMS #108] side=%s received %d item(s)", side, len(items))
 
-		for i, item := range items {
-			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] side=%s item[%d] name=%q quantity=%d raw=%q", side, i, item.Name, item.Quantity, item.RawData))
-			log.Printf("[TRADE_ITEMS #108] side=%s item[%d] name=%q quantity=%d raw=%q", side, i, item.Name, item.Quantity, item.RawData)
+		tradeItemsMu.Lock()
+		if wasOurs {
+			// We added an item: our offer = total minus known partner items
+			currentOwnTradeItems = diffItems(allItems, currentTradeItems)
+		} else {
+			// Partner added an item: their offer = total minus our known items
+			currentTradeItems = diffItems(allItems, currentOwnTradeItems)
+		}
+		computedPartner := len(currentTradeItems)
+		computedOwn := len(currentOwnTradeItems)
+		tradeItemsMu.Unlock()
+
+		a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] side=%s total=%d partner=%d own=%d", side, len(allItems), computedPartner, computedOwn))
+		log.Printf("[TRADE_ITEMS #108] side=%s total=%d partner=%d own=%d", side, len(allItems), computedPartner, computedOwn)
+
+		for i, item := range allItems {
+			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] raw[%d] name=%q quantity=%d", i, item.Name, item.Quantity))
+			log.Printf("[TRADE_ITEMS #108] raw[%d] name=%q quantity=%d", i, item.Name, item.Quantity)
 		}
 
 		a.emitTradeItemsUpdate(side)
@@ -1098,6 +1119,42 @@ func parseStripItemsPacketRaw(data []byte, catalogNames map[string]struct{}) []T
 	}
 
 	return items
+}
+
+// diffItems returns the items in `all` that exceed the quantities in `subtract`.
+// Used to compute one trader's items from the combined TRADE_ITEMS packet.
+func diffItems(all []TradeItem, subtract []TradeItem) []TradeItem {
+	subtractQty := make(map[string]int, len(subtract))
+	for _, item := range subtract {
+		subtractQty[item.Name] += item.Quantity
+	}
+
+	allQty := make(map[string]int, len(all))
+	rawByName := make(map[string]string, len(all))
+	names := make([]string, 0, len(all))
+	for _, item := range all {
+		if allQty[item.Name] == 0 {
+			names = append(names, item.Name)
+		}
+		allQty[item.Name] += item.Quantity
+		if rawByName[item.Name] == "" {
+			rawByName[item.Name] = item.RawData
+		}
+	}
+	sort.Strings(names)
+
+	result := make([]TradeItem, 0)
+	for _, name := range names {
+		remaining := allQty[name] - subtractQty[name]
+		if remaining > 0 {
+			result = append(result, TradeItem{
+				Name:     name,
+				Quantity: remaining,
+				RawData:  rawByName[name],
+			})
+		}
+	}
+	return result
 }
 
 func mergePreferHigherQuantity(base []TradeItem, candidate []TradeItem) []TradeItem {

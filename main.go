@@ -68,15 +68,11 @@ var (
 	mutex            sync.Mutex
 	resultsWaitGroup sync.WaitGroup
 	rollDelay        = 550 * time.Millisecond
+	stripNextDelay   = 2250 * time.Millisecond
+	stripGetNewPayload  = "new"
+	stripGetNextPayload = "next"
 	tradeUserPattern = regexp.MustCompile(`\[(\d+)\]`)
 	stripItemNameRe  = regexp.MustCompile(`(?:CF_\d+_[a-z][a-z_]*|[a-z][a-z0-9_]*_[a-z0-9_]+)(?:\*\d+)?`)
-	allowedTradeItemAliases = map[string]string{
-		"club_sofa":     "club_sofa",
-		"hc_sofa":       "club_sofa",
-		"chair_plasty": "chair_plasty",
-		"plastic_chair": "chair_plasty",
-		"plstic_chair":  "chair_plasty",
-	}
 	gameChoiceCleanupRe = regexp.MustCompile(`[^a-z0-9]+`)
 	roomEntities     = map[int]room.Entity{}
 	roomMu           sync.Mutex
@@ -94,9 +90,16 @@ var (
 	handItemsMu       sync.Mutex
 	stripScanMu       sync.Mutex
 	stripScanActive   bool
+	stripScanSessionID = 0
+	stripScanPageCount = 0
+	stripScanLoopStreak = 0
+	stripScanSeenPageFingerprints = map[string]struct{}{}
 	stripScanSeenItemIDs = map[int]struct{}{}
 	stripScanCounts      = map[string]int{}
 	stripScanRawByName   = map[string]string{}
+	stripScanFallbackCounts = map[string]int{}
+	stripScanFallbackRawByName = map[string]string{}
+	stripScanRepeatRetryLimit = 8
 	knownDiceIDs     = map[int]struct{}{}
 	fakeDiceTestingMode bool
 	dealerOpenHeartbeatID int
@@ -226,6 +229,7 @@ func (a *App) setupExt() {
 	registerCustomTradeHeaders(a)
 
 	a.ext.Intercept(out.CHAT, out.SHOUT, out.WHISPER).With(a.onChatMessage)
+	a.ext.Intercept(out.GETSTRIP).With(a.handleOutgoingGetStrip)
 	a.ext.Intercept(out.THROW_DICE).With(a.handleThrowDice)
 	a.ext.Intercept(out.DICE_OFF).With(a.handleDiceOff)
 	a.ext.Intercept(in.DICE_VALUE).With(a.handleDiceResult)
@@ -400,6 +404,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 	}
 	
 	if e.Packet.Header.Value == 104 {
+		a.ShowWindow()
 		stopUnderfundedTradeMonitor()
 		awaitingGameChoice = false
 		awaitingGameChoicePartnerID = 0
@@ -890,10 +895,6 @@ func parseTradeItemsPacket(data []byte) []TradeItem {
 		if !ok {
 			continue
 		}
-		itemName, ok = canonicalAllowedTradeItem(itemName)
-		if !ok {
-			continue
-		}
 
 		counts[itemName]++
 		if _, exists := rawByName[itemName]; !exists {
@@ -967,23 +968,6 @@ func normalizeTradeItemName(raw string) (string, bool) {
 	}
 
 	return name, true
-}
-
-func canonicalAllowedTradeItem(name string) (string, bool) {
-	name = strings.TrimSpace(strings.ToLower(name))
-	if name == "" {
-		return "", false
-	}
-
-	if canonical, ok := allowedTradeItemAliases[name]; ok {
-		return canonical, true
-	}
-
-	if strings.HasPrefix(name, "chair_plasty") || strings.HasPrefix(name, "plastic_chair") || strings.HasPrefix(name, "plstic_chair") {
-		return "chair_plasty", true
-	}
-
-	return "", false
 }
 
 // isCoordinatePattern checks if a string looks like coordinates (e.g., "0,0,0")
@@ -1092,15 +1076,24 @@ func (a *App) requestPlayerStrip() {
 	}()
 
 	stripScanMu.Lock()
+	stripScanSessionID++
+	sessionID := stripScanSessionID
 	stripScanActive = true
+	stripScanPageCount = 0
+	stripScanSeenPageFingerprints = map[string]struct{}{}
 	stripScanSeenItemIDs = map[int]struct{}{}
 	stripScanCounts = map[string]int{}
 	stripScanRawByName = map[string]string{}
+	stripScanFallbackCounts = map[string]int{}
+	stripScanFallbackRawByName = map[string]string{}
 	stripScanMu.Unlock()
+	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] start scan session=%d", sessionID))
+	log.Printf("[STRIP_DEBUG] start scan session=%d", sessionID)
 
-	a.ext.Send(out.GETSTRIP, "new")
+	sendGetStripRaw(a, stripGetNewPayload)
 	a.AddLogMsg("[STRIP] requested player hand scan (GETSTRIP new)")
 	log.Printf("[STRIP] requested player hand scan (GETSTRIP new)")
+	_ = sessionID
 }
 
 // handleStripPacket parses STRIPINFO_2 [140] to track items in the player's hand.
@@ -1118,60 +1111,145 @@ func handleStripPacket(a *App, e *g.Intercept) {
 	active := stripScanActive
 	if !active {
 		stripScanActive = true
+		stripScanSessionID++
+		stripScanPageCount = 0
+		stripScanSeenPageFingerprints = map[string]struct{}{}
 		stripScanSeenItemIDs = map[int]struct{}{}
 		stripScanCounts = map[string]int{}
 		stripScanRawByName = map[string]string{}
+		stripScanFallbackCounts = map[string]int{}
+		stripScanFallbackRawByName = map[string]string{}
 		active = true
+		a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] packet-triggered scan init session=%d", stripScanSessionID))
+		log.Printf("[STRIP_DEBUG] packet-triggered scan init session=%d", stripScanSessionID)
+	}
+	scanID := stripScanSessionID
+	stripScanPageCount++
+	currentPage := stripScanPageCount
+	pageFingerprint := fingerprintStripPage(inv.Items)
+	pageRepeated := false
+	if _, seen := stripScanSeenPageFingerprints[pageFingerprint]; seen {
+		pageRepeated = true
+	} else {
+		stripScanSeenPageFingerprints[pageFingerprint] = struct{}{}
 	}
 	wrapped := accumulateStripScan(inv.Items)
-	pageCount := len(inv.Items)
-	lastPage := pageCount < 9
-
-	if wrapped || lastPage {
-		items := buildStripScanItems()
-		stripScanActive = false
-		stripScanMu.Unlock()
-
-		rawItems := parseStripItemsPacketRaw(rawData)
-		if len(items) == 0 && len(rawItems) > 0 {
-			items = rawItems
-			a.AddLogMsg("[STRIP] scan decode had no matches; raw fallback parser recovered hand items")
-			log.Printf("[STRIP] scan decode had no matches; raw fallback parser recovered hand items")
-		} else if len(items) > 0 && len(rawItems) > 0 {
-			items = mergePreferHigherQuantity(items, rawItems)
-		}
-
-		handItemsMu.Lock()
-		currentHandItems = items
-		handItemsMu.Unlock()
-
-		a.AddLogMsg(fmt.Sprintf("[STRIP] scan complete (%d page item(s)); hand item types=%d", pageCount, len(items)))
-		log.Printf("[STRIP] scan complete (%d page item(s)); hand item types=%d", pageCount, len(items))
-		for i, item := range items {
-			a.AddLogMsg(fmt.Sprintf("[STRIP] hand[%d] name=%q qty=%d", i, item.Name, item.Quantity))
-			log.Printf("[STRIP] hand[%d] name=%q qty=%d", i, item.Name, item.Quantity)
-		}
-		a.emitHandItemsUpdate()
-		return
+	if !pageRepeated {
+		accumulateRawStripItems(parseStripItemsPacketRaw(rawData))
 	}
+	pageCount := len(inv.Items)
+	pageLimitReached := stripScanPageCount >= 25
+	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] session=%d page=%d items=%d wrapped=%t repeated=%t pageLimit=%t", scanID, currentPage, pageCount, wrapped, pageRepeated, pageLimitReached))
+	log.Printf("[STRIP_DEBUG] session=%d page=%d items=%d wrapped=%t repeated=%t pageLimit=%t", scanID, currentPage, pageCount, wrapped, pageRepeated, pageLimitReached)
 
 	stripScanMu.Unlock()
 
+	if pageRepeated || pageLimitReached {
+		reason := "wrapped"
+		if pageRepeated {
+			reason = "repeated page"
+		} else if pageLimitReached {
+			reason = "page limit"
+		}
+		a.finalizeStripScan(scanID, reason)
+		return
+	}
+
 	go func() {
-		time.Sleep(550 * time.Millisecond)
-		a.ext.Send(out.GETSTRIP, "next")
+		time.Sleep(stripNextDelay)
+		sendGetStripRaw(a, stripGetNextPayload)
 	}()
 
-	a.AddLogMsg(fmt.Sprintf("[STRIP] continuing scan: page had %d item(s), requesting next", pageCount))
-	log.Printf("[STRIP] continuing scan: page had %d item(s), requesting next", pageCount)
+	a.AddLogMsg(fmt.Sprintf("[STRIP] continuing scan: page %d had %d item(s), requesting next after %s", currentPage, pageCount, stripNextDelay))
+	log.Printf("[STRIP] continuing scan: page %d had %d item(s), requesting next after %s", currentPage, pageCount, stripNextDelay)
 	return
 }
 
-func accumulateStripScan(invItems []inventory.Item) (wrapped bool) {
+func (a *App) finalizeStripScan(sessionID int, reason string) {
+	stripScanMu.Lock()
+	if !stripScanActive || stripScanSessionID != sessionID {
+		a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] finalize skipped session=%d active=%t currentSession=%d", sessionID, stripScanActive, stripScanSessionID))
+		log.Printf("[STRIP_DEBUG] finalize skipped session=%d active=%t currentSession=%d", sessionID, stripScanActive, stripScanSessionID)
+		stripScanMu.Unlock()
+		return
+	}
+
+	items := buildStripScanItems()
+	fallbackItems := buildStripFallbackItems()
+	pagesScanned := stripScanPageCount
+	stripScanActive = false
+	stripScanMu.Unlock()
+	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] finalize session=%d reason=%s pages=%d", sessionID, reason, pagesScanned))
+	log.Printf("[STRIP_DEBUG] finalize session=%d reason=%s pages=%d", sessionID, reason, pagesScanned)
+
+	if len(items) == 0 && len(fallbackItems) > 0 {
+		items = fallbackItems
+		a.AddLogMsg("[STRIP] scan decode had no matches; accumulated raw fallback recovered hand items")
+		log.Printf("[STRIP] scan decode had no matches; accumulated raw fallback recovered hand items")
+	} else if len(items) > 0 && len(fallbackItems) > 0 && hasSuspiciousStripItems(items) {
+		items = fallbackItems
+		a.AddLogMsg("[STRIP] structured decode looked noisy; switched to accumulated raw fallback items")
+	}
+
+	handItemsMu.Lock()
+	currentHandItems = items
+	handItemsMu.Unlock()
+
+	a.AddLogMsg(fmt.Sprintf("[STRIP] scan complete after %d page(s), reason=%s; hand item types=%d", pagesScanned, reason, len(items)))
+	log.Printf("[STRIP] scan complete after %d page(s), reason=%s; hand item types=%d", pagesScanned, reason, len(items))
+	for i, item := range items {
+		a.AddLogMsg(fmt.Sprintf("[STRIP] hand[%d] name=%q qty=%d", i, item.Name, item.Quantity))
+		log.Printf("[STRIP] hand[%d] name=%q qty=%d", i, item.Name, item.Quantity)
+	}
+	a.emitHandItemsUpdate()
+}
+
+func (a *App) handleOutgoingGetStrip(e *g.Intercept) {
+	if e.Packet.Header.Dir != g.Out {
+		return
+	}
+	payload := strings.TrimSpace(string(e.Packet.Data))
+	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] outgoing GETSTRIP[65] payload=%q", payload))
+	log.Printf("[STRIP_DEBUG] outgoing GETSTRIP[65] payload=%q", payload)
+}
+
+func sendGetStripRaw(a *App, payload string) {
+	trimmed := strings.TrimSpace(payload)
+	ext.Send(g.Out.Id("GETSTRIP"), []byte(trimmed))
+	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] raw GETSTRIP send payload=%q", trimmed))
+	log.Printf("[STRIP_DEBUG] raw GETSTRIP send payload=%q", trimmed)
+}
+
+func fingerprintStripPage(invItems []inventory.Item) string {
+	if len(invItems) == 0 {
+		return "empty"
+	}
+
+	parts := make([]string, 0, len(invItems))
 	for _, invItem := range invItems {
-		if _, exists := stripScanSeenItemIDs[invItem.ItemId]; exists {
-			return true
+		parts = append(parts, fmt.Sprintf("%d:%s", invItem.ItemId, strings.TrimSpace(strings.ToLower(invItem.Class))))
+	}
+	return strings.Join(parts, "|")
+}
+
+func accumulateStripScan(invItems []inventory.Item) (wrapped bool) {
+	if len(invItems) == 0 {
+		return false
+	}
+
+	// A real wrap means the next page starts at an item id we've already scanned.
+	firstID := invItems[0].ItemId
+	if _, exists := stripScanSeenItemIDs[firstID]; exists {
+		wrapped = true
+	}
+
+	pageSeenIDs := map[int]struct{}{}
+	for _, invItem := range invItems {
+		// Ignore duplicate ids inside the same page; they should not end the scan.
+		if _, exists := pageSeenIDs[invItem.ItemId]; exists {
+			continue
 		}
+		pageSeenIDs[invItem.ItemId] = struct{}{}
 		stripScanSeenItemIDs[invItem.ItemId] = struct{}{}
 
 		if strings.TrimSpace(invItem.Class) == "" {
@@ -1189,7 +1267,19 @@ func accumulateStripScan(invItems []inventory.Item) (wrapped bool) {
 		}
 	}
 
-	return false
+	return wrapped
+}
+
+func accumulateRawStripItems(items []TradeItem) {
+	for _, item := range items {
+		if item.Quantity <= 0 || strings.TrimSpace(item.Name) == "" {
+			continue
+		}
+		stripScanFallbackCounts[item.Name] += item.Quantity
+		if _, exists := stripScanFallbackRawByName[item.Name]; !exists {
+			stripScanFallbackRawByName[item.Name] = item.RawData
+		}
+	}
 }
 
 func buildStripScanItems() []TradeItem {
@@ -1209,6 +1299,29 @@ func buildStripScanItems() []TradeItem {
 			Name:     name,
 			Quantity: stripScanCounts[name],
 			RawData:  stripScanRawByName[name],
+		})
+	}
+
+	return items
+}
+
+func buildStripFallbackItems() []TradeItem {
+	if len(stripScanFallbackCounts) == 0 {
+		return []TradeItem{}
+	}
+
+	names := make([]string, 0, len(stripScanFallbackCounts))
+	for name := range stripScanFallbackCounts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	items := make([]TradeItem, 0, len(names))
+	for _, name := range names {
+		items = append(items, TradeItem{
+			Name:     name,
+			Quantity: stripScanFallbackCounts[name],
+			RawData:  stripScanFallbackRawByName[name],
 		})
 	}
 
@@ -1372,11 +1485,6 @@ func normalizeCatalogClassWithQuantity(raw string) (name string, qty int, ok boo
 		return "", 0, false
 	}
 
-	name, ok = canonicalAllowedTradeItem(name)
-	if !ok {
-		return "", 0, false
-	}
-
 	return name, qty, true
 }
 
@@ -1389,10 +1497,6 @@ func extractStripItemName(field string) (string, bool) {
 func extractStripItemAndQuantity(field string) (string, int, bool) {
 	// Try existing trade formats first (handles | and { delimiters).
 	if name, ok := extractTradeItemName(field); ok {
-		name, ok = canonicalAllowedTradeItem(name)
-		if !ok {
-			return "", 0, false
-		}
 		return name, 1, true
 	}
 
@@ -1532,7 +1636,7 @@ func (a *App) sendTradeCompletionMessage() {
 	ext.Send(out.SHOUT, first)
 
 	go func(msg string) {
-		time.Sleep(700 * time.Millisecond)
+		time.Sleep(1750 * time.Millisecond)
 		a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE] shouting: %q", msg))
 		log.Printf("[TRADE_MESSAGE] shouting: %q", msg)
 		ext.Send(out.SHOUT, msg)
@@ -1548,6 +1652,22 @@ func formatTradeItemName(name string) string {
 		parts[i] = strings.ToUpper(part[:1]) + part[1:]
 	}
 	return strings.Join(parts, " ")
+}
+
+func hasSuspiciousStripItems(items []TradeItem) bool {
+	if len(items) == 0 {
+		return false
+	}
+
+	suspicious := 0
+	for _, item := range items {
+		name := strings.TrimSpace(strings.ToLower(item.Name))
+		if name == "" || name == "inull" || strings.HasPrefix(name, "hh") || strings.HasPrefix(name, "hi") {
+			suspicious++
+		}
+	}
+
+	return suspicious*2 >= len(items)
 }
 
 type user28Entry struct {

@@ -21,33 +21,42 @@ var defaultCatalog = []CatalogItem{
 }
 
 func normalizeCatalogItems(items []CatalogItem) []CatalogItem {
-	canonical := map[string]CatalogItem{
-		"club_sofa":    {Name: "club_sofa", DisplayName: "Club Sofa", Value: 0},
-		"chair_plasty": {Name: "chair_plasty", DisplayName: "Chair Plasty", Value: 0},
-	}
-
+	cleaned := make([]CatalogItem, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
 	for _, item := range items {
 		name := strings.TrimSpace(strings.ToLower(item.Name))
-		switch name {
-		case "hc_sofa":
-			name = "club_sofa"
-		case "chair_plasty", "club_sofa":
-			// supported names
-		default:
+		if name == "" {
 			continue
 		}
-
-		entry := canonical[name]
-		if item.Value >= 0 {
-			entry.Value = item.Value
+		if _, exists := seen[name]; exists {
+			continue
 		}
-		canonical[name] = entry
+		seen[name] = struct{}{}
+
+		displayName := strings.TrimSpace(item.DisplayName)
+		if displayName == "" {
+			displayName = formatTradeItemName(name)
+		}
+
+		value := item.Value
+		if value < 0 {
+			value = 0
+		}
+
+		cleaned = append(cleaned, CatalogItem{
+			Name:        name,
+			DisplayName: displayName,
+			Value:       value,
+		})
 	}
 
-	return []CatalogItem{
-		canonical["club_sofa"],
-		canonical["chair_plasty"],
+	if len(cleaned) == 0 {
+		defaults := make([]CatalogItem, len(defaultCatalog))
+		copy(defaults, defaultCatalog)
+		return defaults
 	}
+
+	return cleaned
 }
 
 func getCatalogFilePath() string {

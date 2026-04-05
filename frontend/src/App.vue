@@ -4,7 +4,7 @@
     <!-- Tab bar -->
     <div class="tab-bar">
       <button
-        v-for="tab in ['Config', 'Catalog', 'Trade/Bet', 'Logs']"
+        v-for="tab in ['Config', 'Trade', 'Logs']"
         :key="tab"
         :class="['tab-btn', { active: activeTab === tab }]"
         @click="activeTab = tab"
@@ -35,46 +35,32 @@
       </div>
     </div>
 
-    <!-- Catalog tab -->
-    <div v-if="activeTab === 'Catalog'">
-      <h2 class="section-title">Item Catalog</h2>
+    <!-- Trade tab -->
+    <div v-if="activeTab === 'Trade'">
 
-      <table class="catalog-table">
-        <thead>
-          <tr>
-            <th>Item Name</th>
-            <th>Display Name</th>
-            <th>Value (credits)</th>
-          </tr>
-        </thead>
+      <h2 class="section-title">Double Payout Check</h2>
+      <div class="trade-empty" v-if="tradeItems.length === 0">
+        No active bet in trade yet.
+      </div>
+      <table v-else class="catalog-table">
+        <thead><tr><th>Item</th><th>Bet</th><th>Need Stock</th><th>Payout</th><th>Have</th><th>Status</th></tr></thead>
         <tbody>
-          <tr v-for="(item, index) in catalog" :key="index">
-            <td><span class="catalog-label">{{ item.name }}</span></td>
-            <td><span class="catalog-label">{{ item.display_name }}</span></td>
-            <td><input v-model.number="item.value" type="number" class="catalog-input catalog-value" min="0" /></td>
+          <tr v-for="(row, index) in payoutRows" :key="`payout-${index}`">
+            <td><span class="catalog-label">{{ row.displayName }}</span></td>
+            <td><span class="catalog-label">{{ row.betQty }}</span></td>
+            <td><span class="catalog-label">{{ row.required }}</span></td>
+            <td><span class="catalog-label">{{ row.payoutTotal }}</span></td>
+            <td><span class="catalog-label">{{ row.have }}</span></td>
+            <td><span class="catalog-label" :class="{ 'unlisted-value': row.short > 0 }">{{ row.short > 0 ? `Short ${row.short}` : 'OK' }}</span></td>
           </tr>
         </tbody>
       </table>
-
-      <button @click="saveCatalog" class="save-button">Save Catalog</button>
-    </div>
-
-    <!-- Trade/Bet tab -->
-    <div v-if="activeTab === 'Trade/Bet'">
-
-      <!-- Game Settings -->
-      <h2 class="section-title">Game Settings</h2>
-      <div class="game-settings-box">
-        <div class="game-settings-row">
-          <label class="game-settings-label">Home Money (from hand)</label>
-          <span class="game-settings-value">{{ handTotal }}</span>
-        </div>
-        <div class="game-settings-row">
-          <label class="game-settings-label" for="max-bet-coins">Max Bet Coins</label>
-          <input id="max-bet-coins" v-model.trim="config.max_bet_coins" type="text" class="game-settings-input" />
-        </div>
-        <button @click="saveGameSettings" class="save-button game-settings-save">Save Game Settings</button>
-      </div>
+      <p class="trade-hint" v-if="tradeItems.length > 0 && !canCoverPayout">
+        You do not have enough stock to return double payout (bet + match).
+      </p>
+      <p class="trade-hint" v-if="tradeItems.length > 0 && canCoverPayout">
+        Your hand can return double payout (bet + match).
+      </p>
 
       <hr class="trade-divider" />
 
@@ -85,25 +71,14 @@
         <span style="font-size:12px;color:#666;">Refreshes every 30s and when a trade opens.</span>
       </div>
       <table v-else class="catalog-table">
-        <thead><tr><th>Item</th><th>Qty</th><th>Unit Value</th><th>Line Total</th></tr></thead>
+        <thead><tr><th>Item</th><th>Qty</th></tr></thead>
         <tbody>
-          <tr v-for="(item, index) in handItemsWithValues" :key="`hand-${index}`">
+          <tr v-for="(item, index) in handItems" :key="`hand-${index}`">
             <td><span class="catalog-label">{{ item.displayName }}</span></td>
             <td><span class="catalog-label">{{ item.Quantity }}</span></td>
-            <td><span class="catalog-label" :class="{ 'unlisted-value': item.unitValue === null }">{{ item.unitValue !== null ? item.unitValue : '?' }}</span></td>
-            <td><span class="catalog-label" :class="{ 'unlisted-value': item.lineTotal === null }">{{ item.lineTotal !== null ? item.lineTotal : '?' }}</span></td>
           </tr>
         </tbody>
-        <tfoot>
-          <tr>
-            <td colspan="3" class="trade-total-label">Hand Total</td>
-            <td class="trade-total-value">{{ handTotal }}</td>
-          </tr>
-        </tfoot>
       </table>
-      <p class="trade-hint" v-if="handItems.some(i => !catalog.find(c => c.name === i.Name))">
-        Items marked <span class="unlisted-value">?</span> are not in the catalog.
-      </p>
 
       <hr class="trade-divider" />
 
@@ -114,25 +89,14 @@
         <span style="font-size:12px;color:#666">Items appear here when the partner places furniture in the trade.</span>
       </div>
       <table v-else class="catalog-table">
-        <thead><tr><th>Item</th><th>Qty</th><th>Unit Value</th><th>Line Total</th></tr></thead>
+        <thead><tr><th>Item</th><th>Qty</th></tr></thead>
         <tbody>
-          <tr v-for="(item, index) in tradeItemsWithValues" :key="`trade-${index}`">
+          <tr v-for="(item, index) in tradeItems" :key="`trade-${index}`">
             <td><span class="catalog-label">{{ item.displayName }}</span></td>
             <td><span class="catalog-label">{{ item.Quantity }}</span></td>
-            <td><span class="catalog-label" :class="{ 'unlisted-value': item.unitValue === null }">{{ item.unitValue !== null ? item.unitValue : '?' }}</span></td>
-            <td><span class="catalog-label" :class="{ 'unlisted-value': item.lineTotal === null }">{{ item.lineTotal !== null ? item.lineTotal : '?' }}</span></td>
           </tr>
         </tbody>
-        <tfoot>
-          <tr>
-            <td colspan="3" class="trade-total-label">Offer Total</td>
-            <td class="trade-total-value">{{ tradeTotal }}</td>
-          </tr>
-        </tfoot>
       </table>
-      <p class="trade-hint" v-if="tradeItems.some(i => !catalog.find(c => c.name === i.Name))">
-        Items marked <span class="unlisted-value">?</span> are not in the catalog &mdash; set their value there first.
-      </p>
 
       <hr class="trade-divider" />
 
@@ -142,25 +106,14 @@
         You are not offering any items.
       </div>
       <table v-else class="catalog-table">
-        <thead><tr><th>Item</th><th>Qty</th><th>Unit Value</th><th>Line Total</th></tr></thead>
+        <thead><tr><th>Item</th><th>Qty</th></tr></thead>
         <tbody>
-          <tr v-for="(item, index) in ownTradeItemsWithValues" :key="`own-trade-${index}`">
+          <tr v-for="(item, index) in ownTradeItems" :key="`own-trade-${index}`">
             <td><span class="catalog-label">{{ item.displayName }}</span></td>
             <td><span class="catalog-label">{{ item.Quantity }}</span></td>
-            <td><span class="catalog-label" :class="{ 'unlisted-value': item.unitValue === null }">{{ item.unitValue !== null ? item.unitValue : '?' }}</span></td>
-            <td><span class="catalog-label" :class="{ 'unlisted-value': item.lineTotal === null }">{{ item.lineTotal !== null ? item.lineTotal : '?' }}</span></td>
           </tr>
         </tbody>
-        <tfoot>
-          <tr>
-            <td colspan="3" class="trade-total-label">Your Offer Total</td>
-            <td class="trade-total-value">{{ ownTradeTotal }}</td>
-          </tr>
-        </tfoot>
       </table>
-      <p class="trade-hint" v-if="ownTradeItems.some(i => !catalog.find(c => c.name === i.Name))">
-        Items marked <span class="unlisted-value">?</span> are not in the catalog &mdash; set their value there first.
-      </p>
 
     </div>
 
@@ -200,9 +153,7 @@ export default {
         two_pair: '',
         one_pair: '',
         nothing: '',
-        max_bet_coins: '0',
       },
-      catalog: [],
       tradeItems: [],
       ownTradeItems: [],
       handItems: [],
@@ -215,47 +166,45 @@ export default {
     };
   },
   computed: {
-    tradeItemsWithValues() {
+    tradeItemsWithDisplay() {
       return this.tradeItems.map(item => {
-        const entry = this.catalog.find(c => c.name === item.Name);
-        const unitValue = entry ? entry.value : null;
-        const lineTotal = unitValue !== null ? unitValue * item.Quantity : null;
-        const displayName = entry ? entry.display_name : item.Name;
-        return { ...item, displayName, unitValue, lineTotal };
+        return { ...item, displayName: this.formatItemName(item.Name) };
       });
     },
-    tradeTotal() {
-      return this.tradeItemsWithValues
-        .filter(i => i.lineTotal !== null)
-        .reduce((sum, i) => sum + i.lineTotal, 0);
-    },
-    ownTradeItemsWithValues() {
+    ownTradeItemsWithDisplay() {
       return this.ownTradeItems.map(item => {
-        const entry = this.catalog.find(c => c.name === item.Name);
-        const unitValue = entry ? entry.value : null;
-        const lineTotal = unitValue !== null ? unitValue * item.Quantity : null;
-        const displayName = entry ? entry.display_name : item.Name;
-        return { ...item, displayName, unitValue, lineTotal };
+        return { ...item, displayName: this.formatItemName(item.Name) };
       });
     },
-    ownTradeTotal() {
-      return this.ownTradeItemsWithValues
-        .filter(i => i.lineTotal !== null)
-        .reduce((sum, i) => sum + i.lineTotal, 0);
-    },
-    handItemsWithValues() {
+    handItemsWithDisplay() {
       return this.handItems.map(item => {
-        const entry = this.catalog.find(c => c.name === item.Name);
-        const unitValue = entry ? entry.value : null;
-        const lineTotal = unitValue !== null ? unitValue * item.Quantity : null;
-        const displayName = entry ? entry.display_name : item.Name;
-        return { ...item, displayName, unitValue, lineTotal };
+        return { ...item, displayName: this.formatItemName(item.Name) };
       });
     },
-    handTotal() {
-      return this.handItemsWithValues
-        .filter(i => i.lineTotal !== null)
-        .reduce((sum, i) => sum + i.lineTotal, 0);
+    payoutRows() {
+      const handByName = this.handItems.reduce((acc, item) => {
+        acc[item.Name] = (acc[item.Name] || 0) + item.Quantity;
+        return acc;
+      }, {});
+
+      return this.tradeItemsWithDisplay.map(item => {
+        const required = item.Quantity;
+        const payoutTotal = item.Quantity * 2;
+        const have = handByName[item.Name] || 0;
+        const short = Math.max(required - have, 0);
+        return {
+          name: item.Name,
+          displayName: item.displayName,
+          betQty: item.Quantity,
+          required,
+          payoutTotal,
+          have,
+          short,
+        };
+      });
+    },
+    canCoverPayout() {
+      return this.payoutRows.every((row) => row.short === 0);
     },
   },
   methods: {
@@ -285,15 +234,6 @@ export default {
         this.addLogMsg('Configuration saved');
       } catch (error) {
         this.addLogMsg('Error saving configuration');
-        console.error(error);
-      }
-    },
-    async saveGameSettings() {
-      try {
-        await window.go.main.App.SaveConfig(this.config);
-        this.addLogMsg('Game settings saved');
-      } catch (error) {
-        this.addLogMsg('Error saving game settings');
         console.error(error);
       }
     },
@@ -334,6 +274,13 @@ export default {
     formatLabel(key) {
       return key.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
     },
+    formatItemName(name) {
+      return String(name || '')
+        .split('_')
+        .filter(Boolean)
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(' ');
+    },
     scrollBox(refName) {
       this.$nextTick(() => {
         const box = this.$refs[refName];
@@ -367,25 +314,8 @@ export default {
         console.error(error);
       }
     },
-    async loadCatalog() {
-      try {
-        const items = await window.go.main.App.LoadCatalog();
-        this.catalog = items || [];
-      } catch (error) {
-        console.error('Error loading catalog', error);
-      }
-    },
-    async saveCatalog() {
-      try {
-        await window.go.main.App.SaveCatalog(this.catalog);
-        await this.loadCatalog();
-      } catch (error) {
-        console.error('Error saving catalog', error);
-      }
-    },
     fetch() {
       this.loadConfig();
-      this.loadCatalog();
     },
   },
   async mounted() {
@@ -404,7 +334,10 @@ export default {
 
     window.runtime.EventsOn("tradeItemsUpdate", (jsonStr) => {
       try {
-        this.tradeItems = JSON.parse(jsonStr) || [];
+        this.tradeItems = (JSON.parse(jsonStr) || []).map(item => ({
+          ...item,
+          displayName: this.formatItemName(item.Name),
+        }));
       } catch (_) {
         this.tradeItems = [];
       }
@@ -412,7 +345,10 @@ export default {
 
     window.runtime.EventsOn("ownTradeItemsUpdate", (jsonStr) => {
       try {
-        this.ownTradeItems = JSON.parse(jsonStr) || [];
+        this.ownTradeItems = (JSON.parse(jsonStr) || []).map(item => ({
+          ...item,
+          displayName: this.formatItemName(item.Name),
+        }));
       } catch (_) {
         this.ownTradeItems = [];
       }
@@ -420,7 +356,10 @@ export default {
 
     window.runtime.EventsOn("handItemsUpdate", (jsonStr) => {
       try {
-        this.handItems = JSON.parse(jsonStr) || [];
+        this.handItems = (JSON.parse(jsonStr) || []).map(item => ({
+          ...item,
+          displayName: this.formatItemName(item.Name),
+        }));
       } catch (_) {
         this.handItems = [];
       }

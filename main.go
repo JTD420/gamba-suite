@@ -47,6 +47,10 @@ var (
 	tradeAutoConfirmPending bool
 	tradeCompleted bool
 	tradeCloseAnnounced bool
+	lastTradeCoverageNotice string
+	lastTradeBlockNotice string
+	underfundedTradeMonitorID int
+	underfundedTradeMonitorNotice string
 	lastTradeOpenData string
 	lastTradeOpen     string
 	isPokerRolling   bool
@@ -62,6 +66,13 @@ var (
 	rollDelay        = 550 * time.Millisecond
 	tradeUserPattern = regexp.MustCompile(`\[(\d+)\]`)
 	stripItemNameRe  = regexp.MustCompile(`(?:CF_\d+_[a-z][a-z_]*|[a-z][a-z0-9_]*_[a-z0-9_]+)(?:\*\d+)?`)
+	allowedTradeItemAliases = map[string]string{
+		"club_sofa":     "club_sofa",
+		"hc_sofa":       "club_sofa",
+		"chair_plasty": "chair_plasty",
+		"plastic_chair": "chair_plasty",
+		"plstic_chair":  "chair_plasty",
+	}
 	roomEntities     = map[int]room.Entity{}
 	roomMu           sync.Mutex
 	users28ByToken   = map[string]string{}
@@ -93,6 +104,13 @@ type TradeItem struct {
 	RawData  string // Store raw field for debugging
 }
 
+type tradeShortage struct {
+	Name       string
+	Required   int
+	Have       int
+	PayoutTotal int
+}
+
 type App struct {
 	ext    *g.Ext
 	assets embed.FS
@@ -113,7 +131,6 @@ type PokerDisplayConfig struct {
 	TwoPair      string `json:"two_pair"`
 	OnePair      string `json:"one_pair"`
 	Nothing      string `json:"nothing"`
-	MaxBetCoins    string `json:"max_bet_coins"`
 }
 
 func NewApp(ext *g.Ext, assets embed.FS) *App {
@@ -157,7 +174,6 @@ func (a *App) LoadConfig() *PokerDisplayConfig {
 			TwoPair:      "Two Pair: %ss",
 			OnePair:      "One Pair: %ss",
 			Nothing:      "Nothing",
-			MaxBetCoins:    "0",
 		}
 	}
 	defer file.Close()
@@ -166,11 +182,6 @@ func (a *App) LoadConfig() *PokerDisplayConfig {
 	if err := json.NewDecoder(file).Decode(&config); err != nil {
 		a.AddLogMsg("Error decoding config file: " + err.Error())
 		return nil
-	}
-
-	// Backfill newly added game settings for users with older config files.
-	if strings.TrimSpace(config.MaxBetCoins) == "" {
-		config.MaxBetCoins = "0"
 	}
 
 	// Config file loaded successfully
@@ -196,13 +207,7 @@ func (a *App) SaveConfig(config *PokerDisplayConfig) {
 }
 
 func (a *App) dealerOpenMessage() string {
-	maxBet := "0"
-	if cfg := a.LoadConfig(); cfg != nil {
-		if v := strings.TrimSpace(cfg.MaxBetCoins); v != "" {
-			maxBet = v
-		}
-	}
-	return fmt.Sprintf("Dealer Open, Trade Away. Max Bet: %s Coins", maxBet)
+	return "Dealer Open, Trade Away"
 }
 
 func getConfigFilePath() string {
@@ -296,6 +301,22 @@ func handleMutePacket(e *g.Intercept) {
 
 // Trade detection logic (called within InterceptAll)
 func handleTradePacket(a *App, e *g.Intercept) {
+	if e.Packet.Header.Dir == g.Out && (e.Packet.Header.Value == 69 || e.Packet.Header.Value == 402) {
+		shortages := a.getTradeCoverageShortages()
+		if len(shortages) > 0 {
+			notice := formatTradeShortages(shortages)
+			msg := fmt.Sprintf("Trade blocked: insufficient payout stock (%s)", notice)
+			e.Block()
+			a.AddLogMsg("[TRADE_GUARD] " + msg)
+			log.Printf("[TRADE_GUARD] %s", msg)
+			if notice != lastTradeBlockNotice {
+				lastTradeBlockNotice = notice
+				ext.Send(out.SHOUT, msg)
+			}
+			return
+		}
+	}
+
 	// TRADE_ADDITEM outgoing 72 - we are adding an item; flag next TRADE_ITEMS as ours
 	if e.Packet.Header.Dir == g.Out && e.Packet.Header.Value == 72 {
 		addItemMu.Lock()
@@ -355,6 +376,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		}
 
 		a.emitTradeItemsUpdate(side)
+		a.notifyTradeQuantityCoverage()
 		return
 	}
 	
@@ -373,6 +395,9 @@ func handleTradePacket(a *App, e *g.Intercept) {
 	}
 	
 	if e.Packet.Header.Value == 104 {
+		stopUnderfundedTradeMonitor()
+		lastTradeCoverageNotice = ""
+		lastTradeBlockNotice = ""
 		if !awaitingTradeOpen {
 			return
 		}
@@ -452,6 +477,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 	// TRADE_CLOSE appears as incoming header 110 in your client logs.
 	if e.Packet.Header.Value == 110 {
+		stopUnderfundedTradeMonitor()
 		wasCompleted := tradeCompleted
 		tradeAutoConfirmed = true
 		tradeAutoConfirmPending = false
@@ -513,6 +539,55 @@ func resetTradeAutoFlow() {
 	tradeCloseAnnounced = false
 }
 
+func stopUnderfundedTradeMonitor() {
+	underfundedTradeMonitorID++
+	underfundedTradeMonitorNotice = ""
+}
+
+func startUnderfundedTradeMonitor(a *App, notice string) {
+	underfundedTradeMonitorID++
+	monitorID := underfundedTradeMonitorID
+	underfundedTradeMonitorNotice = notice
+
+	go func(id int) {
+		warn := func(message string) bool {
+			if id != underfundedTradeMonitorID {
+				return false
+			}
+			if len(a.getTradeCoverageShortages()) == 0 {
+				return false
+			}
+			a.AddLogMsg("[TRADE_COVERAGE] " + message)
+			log.Printf("[TRADE_COVERAGE] %s", message)
+			ext.Send(out.SHOUT, message)
+			return true
+		}
+
+		if !warn("Closing trade in 20secs if offer is not reduced.") {
+			return
+		}
+		time.Sleep(10 * time.Second)
+
+		if !warn("Closing trade in 10secs if offer is not reduced.") {
+			return
+		}
+		time.Sleep(5 * time.Second)
+
+		if !warn("Closing trade in 5secs if offer is not reduced.") {
+			return
+		}
+		time.Sleep(5 * time.Second)
+
+		if id != underfundedTradeMonitorID || len(a.getTradeCoverageShortages()) == 0 {
+			return
+		}
+
+		a.AddLogMsg("[TRADE_COVERAGE] closing underfunded trade now")
+		log.Printf("[TRADE_COVERAGE] closing underfunded trade now")
+		ext.Send(out.TRADE_CLOSE)
+	}(monitorID)
+}
+
 func startDealerOpenHeartbeat(a *App) {
 	dealerOpenHeartbeatID++
 	heartbeatID := dealerOpenHeartbeatID
@@ -554,6 +629,11 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 	if tradeAutoAccepted || tradeAutoAcceptPending {
 		return
 	}
+	if len(a.getTradeCoverageShortages()) > 0 {
+		a.AddLogMsg("[TRADE_ACCEPT] skipped auto-accept due to insufficient payout stock")
+		log.Printf("[TRADE_ACCEPT] skipped auto-accept due to insufficient payout stock")
+		return
+	}
 
 	tradeAutoAcceptPending = true
 	flowID := tradeAutoFlowID
@@ -568,6 +648,13 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 			return
 		}
 
+		if len(a.getTradeCoverageShortages()) > 0 {
+			tradeAutoAcceptPending = false
+			a.AddLogMsg("[TRADE_ACCEPT] canceled auto-accept due to insufficient payout stock")
+			log.Printf("[TRADE_ACCEPT] canceled auto-accept due to insufficient payout stock")
+			return
+		}
+
 		ext.Send(out.TRADE_ACCEPT)
 		tradeAutoAcceptPending = false
 		tradeAutoAccepted = true
@@ -578,6 +665,11 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 
 func scheduleAutoTradeConfirm(a *App, payload string) {
 	if tradeAutoConfirmed || tradeAutoConfirmPending {
+		return
+	}
+	if len(a.getTradeCoverageShortages()) > 0 {
+		a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] skipped auto-confirm due to insufficient payout stock")
+		log.Printf("[TRADE_CONFIRM_ACCEPT] skipped auto-confirm due to insufficient payout stock")
 		return
 	}
 
@@ -600,6 +692,13 @@ func scheduleAutoTradeConfirm(a *App, payload string) {
 
 			if flow != tradeAutoFlowID || tradeAutoConfirmed {
 				tradeAutoConfirmPending = false
+				return
+			}
+
+			if len(a.getTradeCoverageShortages()) > 0 {
+				tradeAutoConfirmPending = false
+				a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] canceled auto-confirm due to insufficient payout stock")
+				log.Printf("[TRADE_CONFIRM_ACCEPT] canceled auto-confirm due to insufficient payout stock")
 				return
 			}
 
@@ -777,6 +876,10 @@ func parseTradeItemsPacket(data []byte) []TradeItem {
 		if !ok {
 			continue
 		}
+		itemName, ok = canonicalAllowedTradeItem(itemName)
+		if !ok {
+			continue
+		}
 
 		counts[itemName]++
 		if _, exists := rawByName[itemName]; !exists {
@@ -852,6 +955,23 @@ func normalizeTradeItemName(raw string) (string, bool) {
 	return name, true
 }
 
+func canonicalAllowedTradeItem(name string) (string, bool) {
+	name = strings.TrimSpace(strings.ToLower(name))
+	if name == "" {
+		return "", false
+	}
+
+	if canonical, ok := allowedTradeItemAliases[name]; ok {
+		return canonical, true
+	}
+
+	if strings.HasPrefix(name, "chair_plasty") || strings.HasPrefix(name, "plastic_chair") || strings.HasPrefix(name, "plstic_chair") {
+		return "chair_plasty", true
+	}
+
+	return "", false
+}
+
 // isCoordinatePattern checks if a string looks like coordinates (e.g., "0,0,0")
 func isCoordinatePattern(s string) bool {
 	if !strings.Contains(s, ",") {
@@ -918,6 +1038,8 @@ func (a *App) ClearTradeItems() {
 	currentTradeItems = []TradeItem{}
 	currentOwnTradeItems = []TradeItem{}
 	tradeItemsMu.Unlock()
+	stopUnderfundedTradeMonitor()
+	lastTradeCoverageNotice = ""
 	a.AddLogMsg("[TRADE_ITEMS] cleared partner and own trade items")
 	log.Printf("[TRADE_ITEMS] cleared partner and own trade items")
 	a.emitTradeItemsUpdate("both")
@@ -978,8 +1100,6 @@ func handleStripPacket(a *App, e *g.Intercept) {
 	var inv inventory.Inventory
 	e.Packet.Read(&inv)
 
-	catalogNames := a.GetCatalogNameSet()
-
 	stripScanMu.Lock()
 	active := stripScanActive
 	if !active {
@@ -989,7 +1109,7 @@ func handleStripPacket(a *App, e *g.Intercept) {
 		stripScanRawByName = map[string]string{}
 		active = true
 	}
-	wrapped := accumulateStripScan(inv.Items, catalogNames)
+	wrapped := accumulateStripScan(inv.Items)
 	pageCount := len(inv.Items)
 	lastPage := pageCount < 9
 
@@ -998,7 +1118,7 @@ func handleStripPacket(a *App, e *g.Intercept) {
 		stripScanActive = false
 		stripScanMu.Unlock()
 
-		rawItems := parseStripItemsPacketRaw(rawData, catalogNames)
+		rawItems := parseStripItemsPacketRaw(rawData)
 		if len(items) == 0 && len(rawItems) > 0 {
 			items = rawItems
 			a.AddLogMsg("[STRIP] scan decode had no matches; raw fallback parser recovered hand items")
@@ -1011,8 +1131,8 @@ func handleStripPacket(a *App, e *g.Intercept) {
 		currentHandItems = items
 		handItemsMu.Unlock()
 
-		a.AddLogMsg(fmt.Sprintf("[STRIP] scan complete (%d page item(s)); catalog hand item types=%d", pageCount, len(items)))
-		log.Printf("[STRIP] scan complete (%d page item(s)); catalog hand item types=%d", pageCount, len(items))
+		a.AddLogMsg(fmt.Sprintf("[STRIP] scan complete (%d page item(s)); hand item types=%d", pageCount, len(items)))
+		log.Printf("[STRIP] scan complete (%d page item(s)); hand item types=%d", pageCount, len(items))
 		for i, item := range items {
 			a.AddLogMsg(fmt.Sprintf("[STRIP] hand[%d] name=%q qty=%d", i, item.Name, item.Quantity))
 			log.Printf("[STRIP] hand[%d] name=%q qty=%d", i, item.Name, item.Quantity)
@@ -1033,7 +1153,7 @@ func handleStripPacket(a *App, e *g.Intercept) {
 	return
 }
 
-func accumulateStripScan(invItems []inventory.Item, catalogNames map[string]struct{}) (wrapped bool) {
+func accumulateStripScan(invItems []inventory.Item) (wrapped bool) {
 	for _, invItem := range invItems {
 		if _, exists := stripScanSeenItemIDs[invItem.ItemId]; exists {
 			return true
@@ -1046,10 +1166,6 @@ func accumulateStripScan(invItems []inventory.Item, catalogNames map[string]stru
 
 		itemName, qty, ok := normalizeCatalogClassWithQuantity(invItem.Class)
 		if !ok {
-			continue
-		}
-
-		if _, allowed := catalogNames[itemName]; !allowed {
 			continue
 		}
 
@@ -1087,7 +1203,7 @@ func buildStripScanItems() []TradeItem {
 
 // parseStripItemsPacketRaw is a fallback parser for STRIPINFO_2 payloads that extracts
 // class names from raw fields and counts occurrences.
-func parseStripItemsPacketRaw(data []byte, catalogNames map[string]struct{}) []TradeItem {
+func parseStripItemsPacketRaw(data []byte) []TradeItem {
 	counts := map[string]int{}
 	rawByName := map[string]string{}
 
@@ -1107,10 +1223,6 @@ func parseStripItemsPacketRaw(data []byte, catalogNames map[string]struct{}) []T
 			if inferred, ok := inferStackCountFromMetaField(string(fields[i-1])); ok {
 				qty = inferred
 			}
-		}
-
-		if _, allowed := catalogNames[itemName]; !allowed {
-			continue
 		}
 
 		counts[itemName] += qty
@@ -1246,6 +1358,11 @@ func normalizeCatalogClassWithQuantity(raw string) (name string, qty int, ok boo
 		return "", 0, false
 	}
 
+	name, ok = canonicalAllowedTradeItem(name)
+	if !ok {
+		return "", 0, false
+	}
+
 	return name, qty, true
 }
 
@@ -1258,7 +1375,11 @@ func extractStripItemName(field string) (string, bool) {
 func extractStripItemAndQuantity(field string) (string, int, bool) {
 	// Try existing trade formats first (handles | and { delimiters).
 	if name, ok := extractTradeItemName(field); ok {
-		return name, 1, ok
+		name, ok = canonicalAllowedTradeItem(name)
+		if !ok {
+			return "", 0, false
+		}
+		return name, 1, true
 	}
 
 	matches := stripItemNameRe.FindAllString(field, -1)
@@ -1297,6 +1418,79 @@ func (a *App) emitHandItemsUpdate() {
 		return
 	}
 	runtime.EventsEmit(a.ctx, "handItemsUpdate", string(jsonData))
+}
+
+func (a *App) notifyTradeQuantityCoverage() {
+	shortages := a.getTradeCoverageShortages()
+	if len(shortages) == 0 {
+		stopUnderfundedTradeMonitor()
+		lastTradeCoverageNotice = ""
+		lastTradeBlockNotice = ""
+		a.AddLogMsg("[TRADE_COVERAGE] hand has enough stock to pay double (bet + match)")
+		log.Printf("[TRADE_COVERAGE] hand has enough stock to pay double (bet + match)")
+		return
+	}
+
+	notice := formatTradeShortages(shortages)
+	if notice == lastTradeCoverageNotice {
+		return
+	}
+	lastTradeCoverageNotice = notice
+
+	primary := shortages[0]
+	msg := fmt.Sprintf("Total \"%s\" available \"%d\": please offer less.", formatTradeItemName(primary.Name), primary.Have)
+	a.AddLogMsg("[TRADE_COVERAGE] " + msg)
+	log.Printf("[TRADE_COVERAGE] %s", msg)
+	ext.Send(out.SHOUT, msg)
+
+	if notice != underfundedTradeMonitorNotice {
+		startUnderfundedTradeMonitor(a, notice)
+	}
+}
+
+func (a *App) getTradeCoverageShortages() []tradeShortage {
+	tradeItemsMu.Lock()
+	partnerItems := make([]TradeItem, len(currentTradeItems))
+	copy(partnerItems, currentTradeItems)
+	tradeItemsMu.Unlock()
+
+	handItemsMu.Lock()
+	handItems := make([]TradeItem, len(currentHandItems))
+	copy(handItems, currentHandItems)
+	handItemsMu.Unlock()
+
+	if len(partnerItems) == 0 {
+		return nil
+	}
+
+	haveByName := map[string]int{}
+	for _, item := range handItems {
+		haveByName[item.Name] += item.Quantity
+	}
+
+	shortages := make([]tradeShortage, 0)
+	for _, item := range partnerItems {
+		required := item.Quantity
+		payoutTotal := item.Quantity * 2
+		have := haveByName[item.Name]
+		if have < required {
+			shortages = append(shortages, tradeShortage{
+				Name: item.Name,
+				Required: required,
+				Have: have,
+				PayoutTotal: payoutTotal,
+			})
+		}
+	}
+	return shortages
+}
+
+func formatTradeShortages(shortages []tradeShortage) string {
+	parts := make([]string, 0, len(shortages))
+	for _, shortage := range shortages {
+		parts = append(parts, fmt.Sprintf("%s available %d need %d (payout %d)", formatTradeItemName(shortage.Name), shortage.Have, shortage.Required, shortage.PayoutTotal))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // sendTradeCompletionMessage builds and sends a chat message with the items from the completed trade

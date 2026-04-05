@@ -20,6 +20,36 @@ var defaultCatalog = []CatalogItem{
 	{Name: "chair_plasty", DisplayName: "Chair Plasty", Value: 0},
 }
 
+func normalizeCatalogItems(items []CatalogItem) []CatalogItem {
+	canonical := map[string]CatalogItem{
+		"club_sofa":    {Name: "club_sofa", DisplayName: "Club Sofa", Value: 0},
+		"chair_plasty": {Name: "chair_plasty", DisplayName: "Chair Plasty", Value: 0},
+	}
+
+	for _, item := range items {
+		name := strings.TrimSpace(strings.ToLower(item.Name))
+		switch name {
+		case "hc_sofa":
+			name = "club_sofa"
+		case "chair_plasty", "club_sofa":
+			// supported names
+		default:
+			continue
+		}
+
+		entry := canonical[name]
+		if item.Value >= 0 {
+			entry.Value = item.Value
+		}
+		canonical[name] = entry
+	}
+
+	return []CatalogItem{
+		canonical["club_sofa"],
+		canonical["chair_plasty"],
+	}
+}
+
 func getCatalogFilePath() string {
 	configDir, _ := os.UserConfigDir()
 	configPath := filepath.Join(configDir, "Gamba-Suite")
@@ -44,19 +74,15 @@ func (a *App) LoadCatalog() []CatalogItem {
 		return nil
 	}
 
+	items = normalizeCatalogItems(items)
+
 	a.AddLogMsg("[CATALOG] loaded successfully")
 	return items
 }
 
 // SaveCatalog writes the catalog to disk.
 func (a *App) SaveCatalog(items []CatalogItem) {
-	// Normalise names before saving
-	for i := range items {
-		items[i].Name = strings.TrimSpace(strings.ToLower(items[i].Name))
-		if items[i].DisplayName == "" {
-			items[i].DisplayName = formatTradeItemName(items[i].Name)
-		}
-	}
+	items = normalizeCatalogItems(items)
 
 	// Keep list sorted by name for deterministic output
 	sort.Slice(items, func(i, j int) bool {

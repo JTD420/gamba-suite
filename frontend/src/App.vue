@@ -62,6 +62,22 @@
     <!-- Trade/Bet tab -->
     <div v-if="activeTab === 'Trade/Bet'">
 
+      <!-- Game Settings -->
+      <h2 class="section-title">Game Settings</h2>
+      <div class="game-settings-box">
+        <div class="game-settings-row">
+          <label class="game-settings-label">Home Money (from hand)</label>
+          <span class="game-settings-value">{{ handTotal }}</span>
+        </div>
+        <div class="game-settings-row">
+          <label class="game-settings-label" for="max-bet-coins">Max Bet Coins</label>
+          <input id="max-bet-coins" v-model.trim="config.max_bet_coins" type="text" class="game-settings-input" />
+        </div>
+        <button @click="saveGameSettings" class="save-button game-settings-save">Save Game Settings</button>
+      </div>
+
+      <hr class="trade-divider" />
+
       <!-- Your Hand -->
       <h2 class="section-title">Your Hand</h2>
       <div v-if="handItems.length === 0" class="trade-empty">
@@ -184,6 +200,7 @@ export default {
         two_pair: '',
         one_pair: '',
         nothing: '',
+        max_bet_coins: '0',
       },
       catalog: [],
       tradeItems: [],
@@ -268,6 +285,15 @@ export default {
         this.addLogMsg('Configuration saved');
       } catch (error) {
         this.addLogMsg('Error saving configuration');
+        console.error(error);
+      }
+    },
+    async saveGameSettings() {
+      try {
+        await window.go.main.App.SaveConfig(this.config);
+        this.addLogMsg('Game settings saved');
+      } catch (error) {
+        this.addLogMsg('Error saving game settings');
         console.error(error);
       }
     },
@@ -618,5 +644,55 @@ input[type="text"]::placeholder {
   color: #888;
   margin-top: 10px;
   text-align: center;
+}
+
+.game-settings-box {
+  border: 1px solid #333;
+  border-radius: 6px;
+  padding: 12px;
+  background: #151515;
+}
+
+.game-settings-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.game-settings-row:last-of-type {
+  margin-bottom: 0;
+}
+
+.game-settings-label {
+  flex: 1;
+  text-align: left;
+  margin-right: 0;
+}
+
+.game-settings-input {
+  flex: 1;
+  max-width: 180px;
+  padding: 8px;
+  background-color: #2e2e2e;
+  border: 1px solid #444;
+  border-radius: 4px;
+  color: #fff;
+  font-size: 14px;
+}
+
+.game-settings-value {
+  flex: 1;
+  max-width: 180px;
+  padding: 8px;
+  border: 1px solid #333;
+  border-radius: 4px;
+  background-color: #1f1f1f;
+  color: #ffd700;
+  font-weight: 700;
+}
+
+.game-settings-save {
+  margin-top: 12px;
 }
 </style>

@@ -26,6 +26,7 @@ export namespace main {
 	    two_pair: string;
 	    one_pair: string;
 	    nothing: string;
+	    max_bet_coins: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new PokerDisplayConfig(source);
@@ -42,6 +43,7 @@ export namespace main {
 	        this.two_pair = source["two_pair"];
 	        this.one_pair = source["one_pair"];
 	        this.nothing = source["nothing"];
+	        this.max_bet_coins = source["max_bet_coins"];
 	    }
 	}
 	export class TradeItem {

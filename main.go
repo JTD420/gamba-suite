@@ -113,6 +113,7 @@ type PokerDisplayConfig struct {
 	TwoPair      string `json:"two_pair"`
 	OnePair      string `json:"one_pair"`
 	Nothing      string `json:"nothing"`
+	MaxBetCoins    string `json:"max_bet_coins"`
 }
 
 func NewApp(ext *g.Ext, assets embed.FS) *App {
@@ -129,6 +130,9 @@ func (a *App) startup(ctx context.Context) {
 		a.runExt()
 	}()
 	go func() {
+		time.Sleep(1500 * time.Millisecond)
+		a.requestPlayerStrip()
+
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
@@ -153,6 +157,7 @@ func (a *App) LoadConfig() *PokerDisplayConfig {
 			TwoPair:      "Two Pair: %ss",
 			OnePair:      "One Pair: %ss",
 			Nothing:      "Nothing",
+			MaxBetCoins:    "0",
 		}
 	}
 	defer file.Close()
@@ -161,6 +166,11 @@ func (a *App) LoadConfig() *PokerDisplayConfig {
 	if err := json.NewDecoder(file).Decode(&config); err != nil {
 		a.AddLogMsg("Error decoding config file: " + err.Error())
 		return nil
+	}
+
+	// Backfill newly added game settings for users with older config files.
+	if strings.TrimSpace(config.MaxBetCoins) == "" {
+		config.MaxBetCoins = "0"
 	}
 
 	// Config file loaded successfully
@@ -183,6 +193,16 @@ func (a *App) SaveConfig(config *PokerDisplayConfig) {
 	}
 
 	a.AddLogMsg("Config file saved successfully")
+}
+
+func (a *App) dealerOpenMessage() string {
+	maxBet := "0"
+	if cfg := a.LoadConfig(); cfg != nil {
+		if v := strings.TrimSpace(cfg.MaxBetCoins); v != "" {
+			maxBet = v
+		}
+	}
+	return fmt.Sprintf("Dealer Open, Trade Away. Max Bet: %s Coins", maxBet)
 }
 
 func getConfigFilePath() string {
@@ -467,7 +487,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			awaitingTradeOpen = true
 			a.AddLogMsg("[TRADE_REOPEN] trade closed before completion, restarting dealer cycle")
 			log.Printf("[TRADE_REOPEN] trade closed before completion, restarting dealer cycle")
-			go sendMessageWithDelay("Dealer Open, Trade Away.")
+			go sendMessageWithDelay(a.dealerOpenMessage())
 			startDealerOpenHeartbeat(a)
 		}
 
@@ -514,7 +534,7 @@ func startDealerOpenHeartbeat(a *App) {
 
 			a.AddLogMsg("[TRADE_REOPEN] no new trade yet, re-announcing dealer open")
 			log.Printf("[TRADE_REOPEN] no new trade yet, re-announcing dealer open")
-			sendMessageWithDelay("Dealer Open, Trade Away.")
+			sendMessageWithDelay(a.dealerOpenMessage())
 		}
 	}(heartbeatID)
 }
@@ -609,7 +629,7 @@ func handleTradeConfirmTimeout(a *App) {
 	if !isMuted {
 		tradeCloseAnnounced = true
 		sendMessageWithDelay(closeMsg)
-		sendMessageWithDelay("Dealer Open, Trade Away.")
+		sendMessageWithDelay(a.dealerOpenMessage())
 	} else {
 		a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] user muted; skipped timeout close announcement")
 		log.Printf("[TRADE_CONFIRM_ACCEPT] user muted; skipped timeout close announcement")
@@ -1782,7 +1802,7 @@ func (a *App) handleThrowDice(e *g.Intercept) {
 			go requestRoomUsers(a)
 			awaitingTradeOpen = true
 			if !isMuted {
-				go sendMessageWithDelay("Dealer Open, Trade Away.")
+				go sendMessageWithDelay(a.dealerOpenMessage())
 			} else {
 				log.Printf("User is muted. Skipping dealer open prompt message.")
 			}

@@ -82,6 +82,26 @@
 
       <hr class="trade-divider" />
 
+      <h2 class="section-title">Room Identity Map (G_USERS)</h2>
+      <div v-if="roomIdentity.length === 0" class="trade-empty">
+        No room users decoded yet.<br />
+        <span style="font-size:12px;color:#666">Updates when users join/leave and on periodic G_USRS refresh.</span>
+      </div>
+      <table v-else class="catalog-table">
+        <thead><tr><th>Name</th><th>Short</th><th>Chat ID</th><th>Room ID</th><th>Token</th></tr></thead>
+        <tbody>
+          <tr v-for="(entry, index) in roomIdentity" :key="`room-id-${index}`">
+            <td><span class="catalog-label">{{ entry.name || '-' }}</span></td>
+            <td><span class="catalog-label">{{ entry.short || '-' }}</span></td>
+            <td><span class="catalog-label">{{ entry.chatIndex > 0 ? entry.chatIndex : '-' }}</span></td>
+            <td><span class="catalog-label">{{ entry.roomIndex > 0 ? entry.roomIndex : '-' }}</span></td>
+            <td><span class="catalog-label">{{ entry.token || '-' }}</span></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <hr class="trade-divider" />
+
       <!-- Partner's Offer -->
       <h2 class="section-title">Partner's Offer</h2>
       <div v-if="tradeItems.length === 0" class="trade-empty">
@@ -163,6 +183,7 @@ export default {
       tradeItems: [],
       ownTradeItems: [],
       handItems: [],
+      roomIdentity: [],
       log: [],
       chatLog: [],
       isOutdated: false,
@@ -397,6 +418,14 @@ export default {
         }));
       } catch (_) {
         this.handItems = [];
+      }
+    });
+
+    window.runtime.EventsOn("roomIdentityUpdate", (jsonStr) => {
+      try {
+        this.roomIdentity = JSON.parse(jsonStr) || [];
+      } catch (_) {
+        this.roomIdentity = [];
       }
     });
 

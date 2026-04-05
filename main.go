@@ -28,97 +28,101 @@ import (
 
 // Global variables for dice management, rolling state, mutex, and wait group
 var (
-	diceList         []*Dice
-	mutedDuration    int
-	isMuted          bool
-	currentSum       int
-	commandList      string
-	awaitingTradeOpen bool
-	dealerTradeWindowOpen bool
-	tradeOpenCount    int
-	tradeCloseCount   int
-	lastTradePartnerID int
-	lastTradePartnerName string
-	lastTradePartnerToken string
-	tradeAutoFlowID    int
-	tradeAutoAccepted  bool
-	tradeAutoConfirmed bool
-	tradeAutoAcceptPending bool
-	tradeAutoConfirmPending bool
-	tradeCompleted bool
-	tradeCloseAnnounced bool
+	diceList                           []*Dice
+	mutedDuration                      int
+	isMuted                            bool
+	currentSum                         int
+	commandList                        string
+	awaitingTradeOpen                  bool
+	dealerTradeWindowOpen              bool
+	tradeOpenCount                     int
+	tradeCloseCount                    int
+	lastTradePartnerID                 int
+	lastTradePartnerName               string
+	lastTradePartnerToken              string
+	tradeAutoFlowID                    int
+	tradeAutoAccepted                  bool
+	tradeAutoConfirmed                 bool
+	tradeAutoAcceptPending             bool
+	tradeAutoConfirmPending            bool
+	tradeCompleted                     bool
+	tradeCloseAnnounced                bool
 	suppressNextTradeCloseAnnouncement bool
-	lastTradeCoverageNotice string
-	lastTradeBlockNotice string
-	awaitingGameChoice bool
-	awaitingGameChoicePartnerID int
-	awaitingGameChoicePartnerName string
-	pokerSequenceStage int
-	pokerSequencePlayerName string
-	pokerSequencePlayerResult PokerHandResult
-	pokerSequencePlayerHand string
-	pokerPayoutMode        bool
-	pokerPayoutTradeActive bool
-	pokerPayoutTargetID    int
-	pokerPayoutTargetName  string
-	pokerPayoutAttempts    int
-	pokerPayoutSessionID   int
-	pokerPayoutTradeSent   bool
-	payoutExpectedAddCount int
-	payoutActualAddCount   int
-	underfundedTradeMonitorID int
-	underfundedTradeMonitorNotice string
-	lastTradeOpenData string
-	lastTradeOpen     string
-	isPokerRolling   bool
-	isTriRolling     bool
-	isBJRolling      bool
-	is13Rolling      bool
-	is13Hitting      bool
-	isHitting        bool
-	isClosing        bool
-	ChatIsDisabled   bool
-	mutex            sync.Mutex
-	resultsWaitGroup sync.WaitGroup
-	rollDelay        = 550 * time.Millisecond
-	stripNextDelay   = 2250 * time.Millisecond
-	stripGetNewPayload  = "new"
-	stripGetNextPayload = "next"
-	tradeUserPattern = regexp.MustCompile(`\[(\d+)\]`)
-	stripItemNameRe  = regexp.MustCompile(`(?:CF_\d+_[a-z][a-z_]*|[a-z][a-z0-9_]*_[a-z0-9_]+)(?:\*\d+)?`)
-	gameChoiceCleanupRe = regexp.MustCompile(`[^a-z0-9]+`)
-	roomEntities     = map[int]room.Entity{}
-	roomMu           sync.Mutex
-	users28ByToken   = map[string]string{}
-	users28ByIndex   = map[int]string{}     // roomIndex -> name
-	users28Mu        sync.Mutex
-	headerSniffUntil time.Time
-	headerSniffSeen  = map[uint16]bool{}
-	headerSniffMu    sync.Mutex
-	currentTradeItems    []TradeItem
-	currentOwnTradeItems []TradeItem
-	tradeItemsMu         sync.Mutex
-	lastAddItemWasOurs   bool
-	addItemMu            sync.Mutex
-	currentHandItems  []TradeItem
-	currentHandItemIDs map[string][]int
-	handItemsMu       sync.Mutex
-	pokerGameBetItems []TradeItem
-	stripScanMu       sync.Mutex
-	stripScanActive   bool
-	stripScanSessionID = 0
-	stripScanPageCount = 0
-	stripScanSeenItemIDs = map[int]struct{}{}
-	stripScanCounts      = map[string]int{}
-	stripScanItemIDs     = map[string][]int{}
-	knownDiceIDs     = map[int]struct{}{}
-	fakeDiceTestingMode bool
-	dealerOpenHeartbeatID int
-	dealerOpenHeartbeatActive bool
-	dealerResyncInProgress bool
-	lastOutgoingTradeOpenID int
-	lastOutgoingTradeOpenAt time.Time
-	tradeOpenStateMu sync.Mutex
+	lastTradeCoverageNotice            string
+	lastTradeBlockNotice               string
+	awaitingGameChoice                 bool
+	awaitingGameChoicePartnerID        int
+	awaitingGameChoicePartnerName      string
+	pokerSequenceStage                 int
+	pokerSequencePlayerName            string
+	pokerSequencePlayerResult          PokerHandResult
+	pokerSequencePlayerHand            string
+	pokerPayoutMode                    bool
+	pokerPayoutTradeActive             bool
+	pokerPayoutTargetID                int
+	pokerPayoutTargetName              string
+	pokerPayoutAttempts                int
+	pokerPayoutSessionID               int
+	pokerPayoutTradeSent               bool
+	payoutExpectedAddCount             int
+	payoutActualAddCount               int
+	underfundedTradeMonitorID          int
+	underfundedTradeMonitorNotice      string
+	lastTradeOpenData                  string
+	lastTradeOpen                      string
+	isPokerRolling                     bool
+	isTriRolling                       bool
+	isBJRolling                        bool
+	is13Rolling                        bool
+	is13Hitting                        bool
+	isHitting                          bool
+	isClosing                          bool
+	ChatIsDisabled                     bool
+	mutex                              sync.Mutex
+	resultsWaitGroup                   sync.WaitGroup
+	rollDelay                          = 550 * time.Millisecond
+	stripNextDelay                     = 2250 * time.Millisecond
+	stripGetNewPayload                 = "new"
+	stripGetNextPayload                = "next"
+	tradeUserPattern                   = regexp.MustCompile(`\[(\d+)\]`)
+	stripItemNameRe                    = regexp.MustCompile(`(?:CF_\d+_[a-z][a-z_]*|[a-z][a-z0-9_]*_[a-z0-9_]+)(?:\*\d+)?`)
+	gameChoiceCleanupRe                = regexp.MustCompile(`[^a-z0-9]+`)
+	roomEntities                       = map[int]room.Entity{}
+	roomMu                             sync.Mutex
+	lastRoomUsersRequestAt             time.Time
+	roomUsersReqMu                     sync.Mutex
+	users28ByToken                     = map[string]string{}
+	users28ByIndex                     = map[int]string{} // roomIndex -> name
+	users28ByShortToken                = map[string]string{}
+	roomIdentityByShortToken           = map[string]RoomIdentityEntry{}
+	users28Mu                          sync.Mutex
+	headerSniffUntil                   time.Time
+	headerSniffSeen                    = map[uint16]bool{}
+	headerSniffMu                      sync.Mutex
+	currentTradeItems                  []TradeItem
+	currentOwnTradeItems               []TradeItem
+	tradeItemsMu                       sync.Mutex
+	lastAddItemWasOurs                 bool
+	addItemMu                          sync.Mutex
+	currentHandItems                   []TradeItem
+	currentHandItemIDs                 map[string][]int
+	handItemsMu                        sync.Mutex
+	pokerGameBetItems                  []TradeItem
+	stripScanMu                        sync.Mutex
+	stripScanActive                    bool
+	stripScanSessionID                 = 0
+	stripScanPageCount                 = 0
+	stripScanSeenItemIDs               = map[int]struct{}{}
+	stripScanCounts                    = map[string]int{}
+	stripScanItemIDs                   = map[string][]int{}
+	knownDiceIDs                       = map[int]struct{}{}
+	fakeDiceTestingMode                bool
+	dealerOpenHeartbeatID              int
+	dealerOpenHeartbeatActive          bool
+	dealerResyncInProgress             bool
+	lastOutgoingTradeOpenID            int
+	lastOutgoingTradeOpenAt            time.Time
+	tradeOpenStateMu                   sync.Mutex
 )
 
 type TradeItem struct {
@@ -127,21 +131,29 @@ type TradeItem struct {
 	RawData  string // Store raw field for debugging
 }
 
+type RoomIdentityEntry struct {
+	Name      string `json:"name"`
+	Token     string `json:"token"`
+	Short     string `json:"short"`
+	ChatIndex int    `json:"chatIndex"`
+	RoomIndex int    `json:"roomIndex"`
+}
+
 type tradeShortage struct {
-	Name       string
-	Required   int
-	Have       int
+	Name        string
+	Required    int
+	Have        int
 	PayoutTotal int
 }
 
 type App struct {
-	ext    *g.Ext
-	assets embed.FS
-	log    []string
-	logMu  sync.Mutex
+	ext       *g.Ext
+	assets    embed.FS
+	log       []string
+	logMu     sync.Mutex
 	chatLog   []string
 	chatLogMu sync.Mutex
-	ctx    context.Context
+	ctx       context.Context
 }
 
 type PokerDisplayConfig struct {
@@ -168,6 +180,16 @@ func (a *App) startup(ctx context.Context) {
 	a.setupExt()
 	go func() {
 		a.runExt()
+	}()
+	go func() {
+		time.Sleep(1200 * time.Millisecond)
+		requestRoomUsers(a)
+
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			requestRoomUsers(a)
+		}
 	}()
 	go func() {
 		time.Sleep(1500 * time.Millisecond)
@@ -458,7 +480,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		}
 		return
 	}
-	
+
 	// TRADE_COMPLETED header 112 - send chat message with the traded items
 	if e.Packet.Header.Value == 112 {
 		tradeCompleted = true
@@ -490,7 +512,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		}
 		return
 	}
-	
+
 	if e.Packet.Header.Value == 104 {
 		a.ShowWindow()
 		stopUnderfundedTradeMonitor()
@@ -518,7 +540,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				a.AddLogMsg(fmt.Sprintf("[PAYOUT] trade opened successfully with %s, proceeding", savedPayoutTargetName))
 				log.Printf("[PAYOUT] trade opened successfully with %s, proceeding", savedPayoutTargetName)
 				// Fall through to normal trade-open handling below
-						go a.autoAddPayoutItems()
+				go a.autoAddPayoutItems()
 			} else {
 				// Someone else opened a trade with us during payout — block it
 				a.AddLogMsg(fmt.Sprintf("[PAYOUT] incoming trade blocked during payout to %s, closing", pokerPayoutTargetName))
@@ -702,7 +724,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		a.AddLogMsg(fmt.Sprintf("[TRADE_CLOSE #%d] %s", tradeCloseCount, closeLog))
 		resetTradeAutoFlow()
 		lastTradePartnerToken = ""
-		
+
 		// Clear trade items when trade closes
 		a.ClearTradeItems()
 
@@ -1491,17 +1513,88 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 	}
 
 	users28Mu.Lock()
+	prev := map[string]RoomIdentityEntry{}
+	for k, v := range roomIdentityByShortToken {
+		prev[k] = v
+	}
+	clear(users28ByToken)
+	clear(users28ByIndex)
+	clear(users28ByShortToken)
+	clear(roomIdentityByShortToken)
+
 	for _, entry := range entries {
-		users28ByToken[entry.Token] = entry.Name
+		name := strings.TrimSpace(entry.Name)
+		chatIndex := 0
+		if idx, ok := chatIndexFromShortToken(entry.ShortToken); ok && idx > 0 {
+			chatIndex = idx
+		}
+
+		if entry.Token != "" {
+			users28ByToken[entry.Token] = name
+		}
+		if entry.ShortToken != "" {
+			users28ByShortToken[entry.ShortToken] = name
+			if chatIndex > 0 {
+				users28ByIndex[chatIndex] = name
+			}
+		}
 		if entry.RoomIndex > 0 {
-			users28ByIndex[entry.RoomIndex] = entry.Name
+			users28ByIndex[entry.RoomIndex] = name
+			if short := shortTokenFromIndex(entry.RoomIndex); isLikelyChatToken(short) {
+				users28ByShortToken[short] = name
+			}
+		}
+
+		for _, short := range shortTokenCandidates(entry.Token) {
+			users28ByShortToken[short] = name
+			if idx, ok := chatIndexFromShortToken(short); ok && idx > 0 {
+				users28ByIndex[idx] = name
+				if chatIndex <= 0 {
+					chatIndex = idx
+				}
+			}
+		}
+
+		if entry.ShortToken != "" {
+			roomIdentityByShortToken[entry.ShortToken] = RoomIdentityEntry{
+				Name:      name,
+				Token:     entry.Token,
+				Short:     entry.ShortToken,
+				ChatIndex: chatIndex,
+				RoomIndex: entry.RoomIndex,
+			}
+		}
+	}
+
+	joined := make([]string, 0)
+	left := make([]string, 0)
+	for short, curr := range roomIdentityByShortToken {
+		if _, ok := prev[short]; !ok {
+			joined = append(joined, fmt.Sprintf("%s(%s)", curr.Name, short))
+		}
+	}
+	for short, old := range prev {
+		if _, ok := roomIdentityByShortToken[short]; !ok {
+			left = append(left, fmt.Sprintf("%s(%s)", old.Name, short))
 		}
 	}
 	users28Mu.Unlock()
 
+	sort.Strings(joined)
+	sort.Strings(left)
+	if len(joined) > 0 {
+		a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] joined: %s", strings.Join(joined, ", ")))
+		log.Printf("[ROOM_USERS] joined: %s", strings.Join(joined, ", "))
+	}
+	if len(left) > 0 {
+		a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] left: %s", strings.Join(left, ", ")))
+		log.Printf("[ROOM_USERS] left: %s", strings.Join(left, ", "))
+	}
+	a.emitRoomIdentityUpdate()
+
 	for _, entry := range entries {
-		a.AddLogMsg(fmt.Sprintf("[USERS28] header=%d token=%q name=%q roomIndex=%d", e.Packet.Header.Value, entry.Token, entry.Name, entry.RoomIndex))
-		log.Printf("[USERS28] header=%d token=%q name=%q roomIndex=%d", e.Packet.Header.Value, entry.Token, entry.Name, entry.RoomIndex)
+		a.AddLogMsg(fmt.Sprintf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, entry.Token, entry.ShortToken, entry.Name, entry.RoomIndex))
+		log.Printf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, entry.Token, entry.ShortToken, entry.Name, entry.RoomIndex)
 	}
 }
 
@@ -1516,6 +1609,14 @@ func lookupUsers28Index(index int) (string, bool) {
 	users28Mu.Lock()
 	defer users28Mu.Unlock()
 	name, ok := users28ByIndex[index]
+	if (!ok || strings.TrimSpace(name) == "") && index > 0 {
+		if short := shortTokenFromIndex(index); short != "" {
+			if byShort, ok2 := users28ByShortToken[short]; ok2 {
+				name = byShort
+				ok = true
+			}
+		}
+	}
 	if !ok {
 		return "", false
 	}
@@ -1564,6 +1665,99 @@ func waitForUsers28NameIndex(name string, timeout time.Duration) (int, bool) {
 	return 0, false
 }
 
+func shortTokenFromIndex(index int) string {
+	if index <= 0 {
+		return ""
+	}
+	return encodeB64(index, 2)
+}
+
+func isLikelyChatToken(s string) bool {
+	if len(s) != 2 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < 32 || s[i] > 126 {
+			return false
+		}
+	}
+	return true
+}
+
+func decodeShortChatToken(token string) (idx int, ok bool) {
+	if !isLikelyChatToken(token) {
+		return 0, false
+	}
+	defer func() {
+		if recover() != nil {
+			idx = 0
+			ok = false
+		}
+	}()
+	idx = gencoding.B64Decode([]byte(token))
+	if idx <= 0 {
+		return 0, false
+	}
+	return idx, true
+}
+
+func chatIndexFromShortToken(token string) (idx int, ok bool) {
+	if !isLikelyChatToken(token) {
+		return 0, false
+	}
+	defer func() {
+		if recover() != nil {
+			idx = 0
+			ok = false
+		}
+	}()
+	idx = gencoding.B64Decode([]byte(token[:1]))
+	if idx <= 0 {
+		return 0, false
+	}
+	return idx, true
+}
+
+func lookupRoomIdentityByChatIndex(index int) (string, bool) {
+	if index <= 0 {
+		return "", false
+	}
+
+	users28Mu.Lock()
+	defer users28Mu.Unlock()
+
+	for short, entry := range roomIdentityByShortToken {
+		if idx, ok := chatIndexFromShortToken(short); ok && idx == index {
+			name := strings.TrimSpace(entry.Name)
+			if name != "" {
+				return name, true
+			}
+		}
+	}
+
+	return "", false
+}
+
+func shortTokenCandidates(token string) []string {
+	if len(token) < 2 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, 4)
+	for i := 0; i+2 <= len(token); i++ {
+		cand := token[i : i+2]
+		if !isLikelyChatToken(cand) {
+			continue
+		}
+		if _, ok := seen[cand]; ok {
+			continue
+		}
+		seen[cand] = struct{}{}
+		out = append(out, cand)
+	}
+	return out
+}
+
 func lookupRoomEntityIndexByName(name string) (int, bool) {
 	needle := strings.ToLower(strings.TrimSpace(name))
 	if needle == "" {
@@ -1594,6 +1788,29 @@ func waitForRoomEntityIndexByName(name string, timeout time.Duration) (int, bool
 		time.Sleep(75 * time.Millisecond)
 	}
 	return 0, false
+}
+
+func lookupRoomEntityNameByIndex(index int) (string, bool) {
+	if index <= 0 {
+		return "", false
+	}
+
+	roomMu.Lock()
+	defer roomMu.Unlock()
+	entity, ok := roomEntities[index]
+	if !ok {
+		return "", false
+	}
+
+	name := strings.TrimSpace(entity.Name)
+	if _, clean, hasToken := splitTokenAndName(name); hasToken {
+		name = strings.TrimSpace(clean)
+	}
+	if name == "" {
+		return "", false
+	}
+
+	return name, true
 }
 
 // parseTradeItemsPacket extracts trade items from TRADE_ITEMS packet (header 108)
@@ -1761,14 +1978,14 @@ func isCoordinatePattern(s string) bool {
 	if !strings.Contains(s, ",") {
 		return false
 	}
-	
+
 	parts := strings.Split(s, ",")
 	for _, part := range parts {
 		if _, err := strconv.Atoi(strings.TrimSpace(part)); err != nil {
 			return false
 		}
 	}
-	
+
 	return len(parts) >= 2
 }
 
@@ -1809,7 +2026,7 @@ func (a *App) GetLastTradePartnerName() string {
 func (a *App) GetCurrentTradeItems() []TradeItem {
 	tradeItemsMu.Lock()
 	defer tradeItemsMu.Unlock()
-	
+
 	// Return a copy to prevent external modifications
 	itemsCopy := make([]TradeItem, len(currentTradeItems))
 	copy(itemsCopy, currentTradeItems)
@@ -1973,8 +2190,8 @@ func handleStripPacket(a *App, e *g.Intercept) {
 	pageRepeated := false
 	if firstMainID != 0 {
 		if _, seen := stripScanSeenItemIDs[firstMainID]; seen {
-		pageRepeated = true
-	} else {
+			pageRepeated = true
+		} else {
 			stripScanSeenItemIDs[firstMainID] = struct{}{}
 		}
 	}
@@ -1982,9 +2199,9 @@ func handleStripPacket(a *App, e *g.Intercept) {
 	if !pageRepeated {
 		for className, qty := range classQtys {
 			stripScanCounts[className] += qty
-				for className, ids := range classItemIDs {
-					stripScanItemIDs[className] = append(stripScanItemIDs[className], ids...)
-				}
+			for className, ids := range classItemIDs {
+				stripScanItemIDs[className] = append(stripScanItemIDs[className], ids...)
+			}
 		}
 	}
 
@@ -2089,10 +2306,12 @@ func buildStripScanItems() []TradeItem {
 // parseStripInfoPageRaw decodes a STRIPINFO_2 packet body (e.Packet.Data) using
 // the real Shockwave grouped format.
 // Each record groups all physical items of the same class:
-//   Field 1 (until \x02): [mainItemId VL64][extraCount VL64]([extraItemId VL64]×N)[Pos VL64][S|I]
-//   Field 2 (until \x02): [templateId VL64][VL64][VL64][className string]
-//   Field 3 (until \x02): for "S": [DimX VL64][DimY VL64][Colors string]
-//                          for "I": [Props string]
+//
+//	Field 1 (until \x02): [mainItemId VL64][extraCount VL64]([extraItemId VL64]×N)[Pos VL64][S|I]
+//	Field 2 (until \x02): [templateId VL64][VL64][VL64][className string]
+//	Field 3 (until \x02): for "S": [DimX VL64][DimY VL64][Colors string]
+//	                       for "I": [Props string]
+//
 // Quantity per record = 1 + extraCount.
 // Returns: firstMainID (for wrap detection), record count, className→quantity map.
 func parseStripInfoPageRaw(data []byte) (firstMainID int, pageRecords int, classQtys map[string]int, classItemIDs map[string][]int) {
@@ -2190,8 +2409,8 @@ func parseStripInfoPageRaw(data []byte) (firstMainID int, pageRecords int, class
 		// --- Field 3 ---
 		switch typeChar {
 		case 'S':
-			readVL64() // DimX
-			readVL64() // DimY
+			readVL64()       // DimX
+			readVL64()       // DimY
 			skipUntilDelim() // Colors
 		case 'I':
 			skipUntilDelim() // Props
@@ -2210,6 +2429,7 @@ func parseStripInfoPageRaw(data []byte) (firstMainID int, pageRecords int, class
 	}
 	return
 }
+
 // Used to compute one trader's items from the combined TRADE_ITEMS packet.
 func diffItems(all []TradeItem, subtract []TradeItem) []TradeItem {
 	subtractQty := make(map[string]int, len(subtract))
@@ -2465,9 +2685,9 @@ func (a *App) getTradeCoverageShortages() []tradeShortage {
 		have := haveByName[item.Name] + incomingByName[item.Name]
 		if have < payoutTotal {
 			shortages = append(shortages, tradeShortage{
-				Name: item.Name,
-				Required: required,
-				Have: have,
+				Name:        item.Name,
+				Required:    required,
+				Have:        have,
 				PayoutTotal: payoutTotal,
 			})
 		}
@@ -2498,7 +2718,19 @@ func (a *App) sendTradeCompletionMessage() {
 	}
 
 	partnerName := strings.TrimSpace(lastTradePartnerName)
-	if partnerName == "" {
+	if partnerName == "" || strings.EqualFold(partnerName, "Unknown") {
+		if resolved, ok := lookupUsers28Index(lastTradePartnerID); ok {
+			partnerName = strings.TrimSpace(resolved)
+			lastTradePartnerName = partnerName
+		} else if resolved, ok := lookupUsers28Token(lastTradePartnerToken); ok {
+			partnerName = strings.TrimSpace(resolved)
+			lastTradePartnerName = partnerName
+		} else if resolved, ok := lookupRoomEntityNameByIndex(lastTradePartnerID); ok {
+			partnerName = strings.TrimSpace(resolved)
+			lastTradePartnerName = partnerName
+		}
+	}
+	if partnerName == "" || strings.EqualFold(partnerName, "Unknown") {
 		partnerName = "Player"
 	}
 
@@ -2506,9 +2738,11 @@ func (a *App) sendTradeCompletionMessage() {
 	second := "Say Poker, 21, 13"
 	awaitingGameChoice = true
 	awaitingGameChoicePartnerName = strings.TrimSpace(lastTradePartnerName)
-	// Prefer the real room chat index over the USERS28 virtual id.
-	// Chat messages use small room indices (e.g. 32), not the large USERS28 ids (e.g. 227177).
-	if chatIdx, ok := lookupUsers28NameIndex(awaitingGameChoicePartnerName); ok && chatIdx > 0 {
+	// Prefer the live room entity index for chat sender matching.
+	// USERS28 indices are often larger room ids and can differ from chat indices.
+	if chatIdx, ok := lookupRoomEntityIndexByName(awaitingGameChoicePartnerName); ok && chatIdx > 0 {
+		awaitingGameChoicePartnerID = chatIdx
+	} else if chatIdx, ok := lookupUsers28NameIndex(awaitingGameChoicePartnerName); ok && chatIdx > 0 {
 		awaitingGameChoicePartnerID = chatIdx
 	} else {
 		awaitingGameChoicePartnerID = lastTradePartnerID
@@ -2538,9 +2772,10 @@ func formatTradeItemName(name string) string {
 }
 
 type user28Entry struct {
-	Token     string
-	Name      string
-	RoomIndex int
+	Token      string
+	ShortToken string
+	Name       string
+	RoomIndex  int
 }
 
 func extractUsers28Entries(raw string) []user28Entry {
@@ -2548,66 +2783,76 @@ func extractUsers28Entries(raw string) []user28Entry {
 	entries := make([]user28Entry, 0)
 	seen := map[string]struct{}{}
 
-	for i := 0; i < len(b); i++ {
-		vlen := gencoding.VL64DecodeLen(b[i])
-		if vlen <= 0 || vlen > 6 || i+vlen >= len(b) {
+	for i := 0; i < len(b)-6; i++ {
+		if b[i] != 0x02 {
 			continue
 		}
 
-		roomIdx := gencoding.VL64Decode(b[i : i+vlen])
-		if roomIdx <= 0 {
+		// Name must end at this delimiter.
+		nameEnd := i
+		nameStart := nameEnd
+		for nameStart > 0 && isLikelyNameChar(b[nameStart-1]) {
+			nameStart--
+		}
+		if nameEnd-nameStart < 2 {
 			continue
 		}
 
-		nameStart := i + vlen
-		nameEnd := nameStart
-		for nameEnd < len(b) && isLikelyNameChar(b[nameEnd]) {
-			nameEnd++
+		// Shockwave often prefixes names with a length marker (e.g. MWebsedit).
+		// If first two chars are uppercase, drop the first byte as the marker.
+		adjNameStart := nameStart
+		if nameEnd-nameStart >= 3 && b[nameStart] >= 'A' && b[nameStart] <= 'Z' && b[nameStart+1] >= 'A' && b[nameStart+1] <= 'Z' {
+			adjNameStart = nameStart + 1
 		}
 
-		nameLen := nameEnd - nameStart
-		if nameLen < 2 || nameLen > 32 {
+		name := strings.TrimSpace(string(b[adjNameStart:nameEnd]))
+		if len(name) < 2 {
 			continue
 		}
 
-		if nameEnd >= len(b) || b[nameEnd] != 0x02 {
-			continue
+		roomIndex := 0
+		for startOff := adjNameStart - 1; startOff >= 0 && startOff >= adjNameStart-8; startOff-- {
+			vlen := gencoding.VL64DecodeLen(b[startOff])
+			if vlen > 0 && vlen <= 6 && startOff+vlen == adjNameStart {
+				v := gencoding.VL64Decode(b[startOff : startOff+vlen])
+				if v > 0 {
+					roomIndex = v
+					break
+				}
+			}
 		}
-
-		nextFieldStart := nameEnd + 1
-		nextFieldEnd := nextFieldStart
-		for nextFieldEnd < len(b) && b[nextFieldEnd] != 0x02 {
-			nextFieldEnd++
-		}
-		if nextFieldEnd <= nextFieldStart {
-			continue
-		}
-
-		figureField := string(b[nextFieldStart:nextFieldEnd])
-		if !isLikelyFigureField(figureField) {
-			continue
-		}
-
-		name := strings.TrimSpace(string(b[nameStart:nameEnd]))
-		if name == "" {
+		if roomIndex <= 0 {
 			continue
 		}
 
 		token := ""
-		if i >= 4 {
-			candidate := string(b[i-4 : i])
+		if nameStart >= 4 {
+			candidate := string(b[nameStart-4 : nameStart])
 			if isLikelyToken(candidate) {
 				token = candidate
 			}
 		}
 
-		key := fmt.Sprintf("%d|%s", roomIdx, strings.ToLower(name))
-		if _, exists := seen[key]; exists {
+		shortToken := ""
+		if adjNameStart >= 6 {
+			shortCandidate := string(b[adjNameStart-6 : adjNameStart-4])
+			if isLikelyChatToken(shortCandidate) {
+				shortToken = shortCandidate
+			}
+		}
+
+		key := fmt.Sprintf("%d|%s|%s", roomIndex, strings.ToLower(name), shortToken)
+		if _, ok := seen[key]; ok {
 			continue
 		}
 		seen[key] = struct{}{}
 
-		entries = append(entries, user28Entry{Token: token, Name: name, RoomIndex: roomIdx})
+		entries = append(entries, user28Entry{
+			Token:      token,
+			ShortToken: shortToken,
+			Name:       name,
+			RoomIndex:  roomIndex,
+		})
 	}
 
 	return entries
@@ -2705,6 +2950,13 @@ func (a *App) handleRoomReady(e *g.Intercept) {
 	roomMu.Lock()
 	defer roomMu.Unlock()
 	clear(roomEntities)
+	users28Mu.Lock()
+	clear(users28ByToken)
+	clear(users28ByIndex)
+	clear(users28ByShortToken)
+	clear(roomIdentityByShortToken)
+	users28Mu.Unlock()
+	a.emitRoomIdentityUpdate()
 	a.AddLogMsg("[ROOM_USERS] cleared cached room users")
 	log.Printf("[ROOM_USERS] cleared cached room users")
 	go requestRoomUsers(a)
@@ -2721,6 +2973,14 @@ func (a *App) handleRoomUsers(e *g.Intercept) {
 	a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] received packet %d len=%d", e.Packet.Header.Value, len(e.Packet.Data)))
 	log.Printf("[ROOM_USERS] received packet %d len=%d", e.Packet.Header.Value, len(e.Packet.Data))
 
+	// In this client, header 28 often uses raw USERS28 layout, not room.Entity wire format.
+	// That payload is handled by handleUsers28Packet; skip structured decode here.
+	if e.Packet.Header.Value == 28 {
+		a.AddLogMsg("[ROOM_USERS] header 28 uses raw USERS28 layout; skipping room.Entity decode")
+		log.Printf("[ROOM_USERS] header 28 uses raw USERS28 layout; skipping room.Entity decode")
+		return
+	}
+
 	count := e.Packet.ReadInt()
 	parsedUsers := map[int]room.Entity{}
 
@@ -2731,6 +2991,36 @@ func (a *App) handleRoomUsers(e *g.Intercept) {
 			parsedUsers[entity.Index] = entity
 		}
 	}
+
+	// Keep USERS28-like caches warm from the structured USERS list too.
+	users28Mu.Lock()
+	for idx, entity := range parsedUsers {
+		name := strings.TrimSpace(entity.Name)
+		token := ""
+		if entityToken, clean, ok := splitTokenAndName(name); ok {
+			name = clean
+			token = entityToken
+			users28ByToken[entityToken] = clean
+			for _, short := range shortTokenCandidates(entityToken) {
+				users28ByShortToken[short] = clean
+			}
+		}
+		if name != "" {
+			users28ByIndex[idx] = name
+			if short := shortTokenFromIndex(idx); isLikelyChatToken(short) {
+				users28ByShortToken[short] = name
+				roomIdentityByShortToken[short] = RoomIdentityEntry{
+					Name:      name,
+					Token:     token,
+					Short:     short,
+					ChatIndex: idx,
+					RoomIndex: idx,
+				}
+			}
+		}
+	}
+	users28Mu.Unlock()
+	a.emitRoomIdentityUpdate()
 
 	roomMu.Lock()
 	for index, entity := range parsedUsers {
@@ -2752,6 +3042,10 @@ func requestRoomUsers(a *App) {
 		}
 	}()
 
+	roomUsersReqMu.Lock()
+	lastRoomUsersRequestAt = time.Now()
+	roomUsersReqMu.Unlock()
+
 	// G_USRS is the packet this client uses to request the in-room USERS list (header 61).
 	a.ext.Send(out.G_USRS)
 	// Keep legacy request as a secondary path in case the server expects both in some sessions.
@@ -2759,6 +3053,84 @@ func requestRoomUsers(a *App) {
 	startIncomingHeaderSniff(8 * time.Second)
 	a.AddLogMsg("[ROOM_USERS] requested current room users via G_USRS + GETSPACENODEUSERS")
 	log.Printf("[ROOM_USERS] requested current room users via G_USRS + GETSPACENODEUSERS")
+}
+
+func shouldRefreshRoomUsers() bool {
+	roomUsersReqMu.Lock()
+	last := lastRoomUsersRequestAt
+	roomUsersReqMu.Unlock()
+	return time.Since(last) > 5*time.Second
+}
+
+func (a *App) emitRoomIdentityUpdate() {
+	users28Mu.Lock()
+	entries := make([]RoomIdentityEntry, 0, len(roomIdentityByShortToken))
+	for _, entry := range roomIdentityByShortToken {
+		entries = append(entries, entry)
+	}
+	users28Mu.Unlock()
+
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].ChatIndex == entries[j].ChatIndex {
+			return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name)
+		}
+		if entries[i].ChatIndex <= 0 {
+			return false
+		}
+		if entries[j].ChatIndex <= 0 {
+			return true
+		}
+		return entries[i].ChatIndex < entries[j].ChatIndex
+	})
+
+	jsonData, err := json.Marshal(entries)
+	if err != nil {
+		a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] failed to marshal room identity update: %v", err))
+		log.Printf("[ROOM_USERS] failed to marshal room identity update: %v", err)
+		return
+	}
+	runtime.EventsEmit(a.ctx, "roomIdentityUpdate", string(jsonData))
+}
+
+func resolveChatSenderName(index int) (string, bool) {
+	if index <= 0 {
+		return "", false
+	}
+
+	// Prefer the structured room user cache.
+	roomMu.Lock()
+	entity, ok := roomEntities[index]
+	roomMu.Unlock()
+	if ok {
+		name := strings.TrimSpace(entity.Name)
+		if _, clean, ok2 := splitTokenAndName(name); ok2 {
+			name = clean
+		}
+		if name != "" {
+			return name, true
+		}
+	}
+
+	// Fall back to the USERS28 scan cache.
+	name, ok := lookupUsers28Index(index)
+	if ok {
+		return name, true
+	}
+
+	// Fall back to live room identity map keyed by short token -> name.
+	if mappedName, mappedOk := lookupRoomIdentityByChatIndex(index); mappedOk {
+		return mappedName, true
+	}
+
+	// Final fallback: match via 2-char chat token (e.g. "SD", "QD", "RD").
+	short := shortTokenFromIndex(index)
+	if !isLikelyChatToken(short) {
+		return "", false
+	}
+	users28Mu.Lock()
+	name, ok = users28ByShortToken[short]
+	users28Mu.Unlock()
+	return name, ok
 }
 
 func startIncomingHeaderSniff(duration time.Duration) {
@@ -3843,8 +4215,18 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 		chatType = "SHOUT"
 	}
 
-	log.Printf("[INCOMING %s] %d -> %s", chatType, index, msg)
-	a.AddChatLog(fmt.Sprintf("[IN %s] %d -> %s", chatType, index, msg))
+	senderName, senderOk := resolveChatSenderName(index)
+	if !senderOk && shouldRefreshRoomUsers() {
+		go requestRoomUsers(a)
+	}
+
+	if senderOk {
+		log.Printf("[INCOMING %s] %s(%d) -> %s", chatType, senderName, index, msg)
+		a.AddChatLog(fmt.Sprintf("[IN %s] %s(%d) -> %s", chatType, senderName, index, msg))
+	} else {
+		log.Printf("[INCOMING %s] %d -> %s", chatType, index, msg)
+		a.AddChatLog(fmt.Sprintf("[IN %s] %d -> %s", chatType, index, msg))
+	}
 
 	if !awaitingGameChoice {
 		return
@@ -3855,21 +4237,7 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 		return
 	}
 
-	// Resolve the chat sender's name: try roomEntities first, fall back to users28ByIndex.
-	senderName := ""
-	roomMu.Lock()
-	if entity, ok := roomEntities[index]; ok {
-		senderName = strings.TrimSpace(entity.Name)
-		if _, clean, ok2 := splitTokenAndName(senderName); ok2 {
-			senderName = clean
-		}
-	}
-	roomMu.Unlock()
-	if senderName == "" {
-		if n, ok := lookupUsers28Index(index); ok {
-			senderName = n
-		}
-	}
+	// senderName already resolved above.
 
 	// Accept only if sender matches by room index OR by name.
 	indexMatch := awaitingGameChoicePartnerID > 0 && index == awaitingGameChoicePartnerID
@@ -3887,10 +4255,51 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 			indexMatch = true
 		}
 	}
+	// Fallback 3: if this incoming index maps to the same trade partner name, accept it.
+	if !indexMatch && !nameMatch {
+		partnerName := strings.TrimSpace(awaitingGameChoicePartnerName)
+		if partnerName == "" || strings.EqualFold(partnerName, "Unknown") {
+			partnerName = strings.TrimSpace(lastTradePartnerName)
+		}
+		if partnerName != "" && !strings.EqualFold(partnerName, "Unknown") {
+			if mappedName, ok := lookupRoomIdentityByChatIndex(index); ok {
+				if strings.EqualFold(strings.TrimSpace(mappedName), partnerName) {
+					nameMatch = true
+					senderName = mappedName
+					a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] accepted %q by partner-name match: index %d -> %q", choice, index, mappedName))
+					log.Printf("[GAME_SELECT] accepted %q by partner-name match: index %d -> %q", choice, index, mappedName)
+				}
+			}
+		}
+	}
+	if !indexMatch && !nameMatch {
+		partnerUnknown := strings.TrimSpace(awaitingGameChoicePartnerName) == "" || strings.EqualFold(strings.TrimSpace(awaitingGameChoicePartnerName), "Unknown")
+		senderKnown := strings.TrimSpace(senderName) != "" && !strings.EqualFold(strings.TrimSpace(senderName), "Unknown")
+		if partnerUnknown {
+			if senderKnown {
+				nameMatch = true
+				awaitingGameChoicePartnerName = strings.TrimSpace(senderName)
+				lastTradePartnerName = strings.TrimSpace(senderName)
+				a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] accepted %q from resolved sender %q while partner name was unknown", choice, senderName))
+				log.Printf("[GAME_SELECT] accepted %q from resolved sender %q while partner name was unknown", choice, senderName)
+			} else if (awaitingGameChoicePartnerID <= 0 || awaitingGameChoicePartnerID > 512) && index > 0 && index <= 512 {
+				// Last-resort path when trade partner id is unresolved or in a different id space.
+				indexMatch = true
+				a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] accepted %q by index fallback (incoming=%d expected=%d partner=%q)", choice, index, awaitingGameChoicePartnerID, awaitingGameChoicePartnerName))
+				log.Printf("[GAME_SELECT] accepted %q by index fallback (incoming=%d expected=%d partner=%q)", choice, index, awaitingGameChoicePartnerID, awaitingGameChoicePartnerName)
+			}
+		}
+	}
 	if !indexMatch && !nameMatch {
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] ignoring %q from %q (index %d); waiting for %q (index %d)", choice, senderName, index, awaitingGameChoicePartnerName, awaitingGameChoicePartnerID))
 		log.Printf("[GAME_SELECT] ignoring %q from %q (index %d); waiting for %q (index %d)", choice, senderName, index, awaitingGameChoicePartnerName, awaitingGameChoicePartnerID)
 		return
+	}
+
+	if strings.TrimSpace(senderName) != "" && (strings.TrimSpace(lastTradePartnerName) == "" || strings.EqualFold(strings.TrimSpace(lastTradePartnerName), "Unknown")) {
+		lastTradePartnerName = strings.TrimSpace(senderName)
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] backfilled trade partner name from chat sender: %q", lastTradePartnerName))
+		log.Printf("[GAME_SELECT] backfilled trade partner name from chat sender: %q", lastTradePartnerName)
 	}
 
 	e.Block()

@@ -840,10 +840,17 @@ func (a *App) autoAddPayoutItems() {
 		return
 	}
 
+	a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] auto-add start: bet item types=%d", len(betItems)))
+	for i, betItem := range betItems {
+		a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] bet[%d] name=%q qty=%d payoutTarget=%d", i, betItem.Name, betItem.Quantity, betItem.Quantity*2))
+	}
+
 	total := 0
+	plannedIDs := make([]int, 0)
 	for _, betItem := range betItems {
 		needed := betItem.Quantity * 2
 		toAdd := handItemIDs[betItem.Name]
+		a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] source ids for %s: available=%d needed=%d", betItem.Name, len(toAdd), needed))
 		if len(toAdd) > needed {
 			toAdd = toAdd[:needed]
 		}
@@ -858,13 +865,60 @@ func (a *App) autoAddPayoutItems() {
 			}
 			time.Sleep(550 * time.Millisecond)
 			ext.Send(out.TRADE_ADDITEM, -itemID)
+			plannedIDs = append(plannedIDs, itemID)
 			total++
-			a.AddLogMsg(fmt.Sprintf("[PAYOUT] added item %d (%s) %d/%d", itemID, betItem.Name, total, needed))
-			log.Printf("[PAYOUT] added item %d (%s) %d/%d", itemID, betItem.Name, total, needed)
+			payload := string(ext.NewPacket(out.TRADE_ADDITEM, -itemID).Data)
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT] added item %d (%s) %d/%d payload=%q", itemID, betItem.Name, total, needed, payload))
+			log.Printf("[PAYOUT] added item %d (%s) %d/%d payload=%q", itemID, betItem.Name, total, needed, payload)
 		}
 	}
 	a.AddLogMsg(fmt.Sprintf("[PAYOUT] auto-add complete: %d item(s) offered", total))
 	log.Printf("[PAYOUT] auto-add complete: %d item(s) offered", total)
+
+	go a.verifyAndRetryPayoutAdds(plannedIDs)
+}
+
+func ownTradeOfferTotal() int {
+	tradeItemsMu.Lock()
+	defer tradeItemsMu.Unlock()
+	total := 0
+	for _, item := range currentOwnTradeItems {
+		total += item.Quantity
+	}
+	return total
+}
+
+func (a *App) verifyAndRetryPayoutAdds(plannedIDs []int) {
+	if len(plannedIDs) == 0 {
+		return
+	}
+
+	// Give the server time to echo TRADE_ITEMS updates.
+	time.Sleep(2500 * time.Millisecond)
+	if !pokerPayoutTradeActive {
+		return
+	}
+
+	ownTotal := ownTradeOfferTotal()
+	a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] post-add own offer total=%d planned=%d", ownTotal, len(plannedIDs)))
+	log.Printf("[PAYOUT_DEBUG] post-add own offer total=%d planned=%d", ownTotal, len(plannedIDs))
+	if ownTotal > 0 {
+		return
+	}
+
+	// Fallback for sessions where TRADE_ADDITEM expects a positive item id.
+	a.AddLogMsg("[PAYOUT_DEBUG] own offer still empty after auto-add, retrying with positive item IDs")
+	log.Printf("[PAYOUT_DEBUG] own offer still empty after auto-add, retrying with positive item IDs")
+	for _, itemID := range plannedIDs {
+		if !pokerPayoutTradeActive {
+			return
+		}
+		time.Sleep(450 * time.Millisecond)
+		ext.Send(out.TRADE_ADDITEM, itemID)
+		payload := string(ext.NewPacket(out.TRADE_ADDITEM, itemID).Data)
+		a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] retry add item +%d payload=%q", itemID, payload))
+		log.Printf("[PAYOUT_DEBUG] retry add item +%d payload=%q", itemID, payload)
+	}
 }
 
 func stopUnderfundedTradeMonitor() {
@@ -1295,12 +1349,15 @@ func (a *App) parseTradeItemsPacket(data []byte) []TradeItem {
 		}
 
 		fieldStr := strings.TrimSpace(string(field))
-		itemName, ok := a.extractTradeItemName(fieldStr)
+		itemName, qty, ok := a.extractTradeItemAndQuantity(fieldStr)
 		if !ok {
 			continue
 		}
+		if qty <= 0 {
+			qty = 1
+		}
 
-		counts[itemName]++
+		counts[itemName] += qty
 		if _, exists := rawByName[itemName]; !exists {
 			rawByName[itemName] = fieldStr
 		}
@@ -1328,49 +1385,55 @@ func (a *App) parseTradeItemsPacket(data []byte) []TradeItem {
 	return items
 }
 
-func (a *App) extractTradeItemName(field string) (string, bool) {
+func (a *App) extractTradeItemAndQuantity(field string) (string, int, bool) {
 	// Legacy format example: "itkoHP|club_sofa"
 	if strings.Contains(field, "|") {
 		parts := strings.Split(field, "|")
 		if len(parts) >= 2 {
-			if name, ok := a.normalizeTradeFieldClass(parts[len(parts)-1]); ok {
-				return name, true
+			if name, qty, ok := a.normalizeTradeFieldClassWithQty(parts[len(parts)-1]); ok {
+				return name, qty, true
 			}
 		}
 	}
 
-	// Current format example: "irbUAXb{chair_plasty*109"
+	// Current format example: "irbUAXb{chair_plasty*2" or "irbUAXb{chair_plasty*109"
 	if strings.Contains(field, "{") {
 		parts := strings.SplitN(field, "{", 2)
 		if len(parts) == 2 {
-			if name, ok := a.normalizeTradeFieldClass(parts[1]); ok {
-				return name, true
+			if name, qty, ok := a.normalizeTradeFieldClassWithQty(parts[1]); ok {
+				return name, qty, true
 			}
 		}
 	}
 
-	return "", false
+	return "", 0, false
+}
+
+func (a *App) extractTradeItemName(field string) (string, bool) {
+	name, _, ok := a.extractTradeItemAndQuantity(field)
+	return name, ok
 }
 
 func (a *App) normalizeTradeFieldClass(raw string) (string, bool) {
-	raw = strings.TrimSpace(strings.ToLower(raw))
-	if raw == "" {
-		return "", false
-	}
+	name, _, ok := a.normalizeTradeFieldClassWithQty(raw)
+	return name, ok
+}
 
-	if star := strings.Index(raw, "*"); star >= 0 {
-		raw = raw[:star]
-	}
-
-	name, ok := normalizeTradeItemName(raw)
+func (a *App) normalizeTradeFieldClassWithQty(raw string) (string, int, bool) {
+	name, qty, ok := normalizeCatalogClassWithQuantity(raw)
 	if !ok {
-		return "", false
+		return "", 0, false
 	}
 
-	if isKnownTradeClassName(a, name) {
-		return name, true
+	if !isKnownTradeClassName(a, name) {
+		return "", 0, false
 	}
-	return "", false
+
+	if qty <= 0 {
+		qty = 1
+	}
+
+	return name, qty, true
 }
 
 func isKnownTradeClassName(a *App, name string) bool {

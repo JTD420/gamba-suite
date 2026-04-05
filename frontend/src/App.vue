@@ -121,13 +121,19 @@
     <div v-if="activeTab === 'Logs'">
       <div class="log-grid">
         <div>
-          <h2 class="section-title">Roll Logs</h2>
+          <div class="log-title-row">
+            <h2 class="section-title">Roll Logs</h2>
+            <button class="copy-btn" @click="copyRollLogs">Copy</button>
+          </div>
           <div id="log" ref="logbox" class="log-section">
             <div v-for="(msg, index) in log" :key="`roll-${index}`">{{ msg }}</div>
           </div>
         </div>
         <div>
-          <h2 class="section-title">Chat Logs</h2>
+          <div class="log-title-row">
+            <h2 class="section-title">Chat Logs</h2>
+            <button class="copy-btn" @click="copyChatLogs">Copy</button>
+          </div>
           <div ref="chatlogbox" class="log-section chat-log-section">
             <div v-for="(msg, index) in chatLog" :key="`chat-${index}`">{{ msg }}</div>
           </div>
@@ -270,6 +276,35 @@ export default {
     addChatLogMsg(msg) {
       this.chatLog.push(msg);
       this.scrollBox('chatlogbox');
+    },
+    async copyTextToClipboard(text, label) {
+      try {
+        if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+        } else {
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.position = 'fixed';
+          ta.style.left = '-9999px';
+          document.body.appendChild(ta);
+          ta.focus();
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+        }
+        this.addLogMsg(`[UI] Copied ${label} to clipboard`);
+      } catch (error) {
+        this.addLogMsg(`[UI] Failed to copy ${label}`);
+        console.error(error);
+      }
+    },
+    async copyRollLogs() {
+      const text = this.log.join('\n');
+      await this.copyTextToClipboard(text, 'roll logs');
+    },
+    async copyChatLogs() {
+      const text = this.chatLog.join('\n');
+      await this.copyTextToClipboard(text, 'chat logs');
     },
     formatLabel(key) {
       return key.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
@@ -468,6 +503,27 @@ input[type="text"]::placeholder {
   display: grid;
   grid-template-columns: 1fr;
   gap: 16px;
+}
+
+.log-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.copy-btn {
+  padding: 6px 10px;
+  background-color: #1f1f1f;
+  color: #d8d8d8;
+  border: 1px solid #4a4a4a;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.copy-btn:hover {
+  background-color: #2a2a2a;
 }
 
 .chat-log-section {

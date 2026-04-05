@@ -56,6 +56,12 @@ var (
 	pokerSequencePlayerName string
 	pokerSequencePlayerResult PokerHandResult
 	pokerSequencePlayerHand string
+	pokerPayoutMode        bool
+	pokerPayoutTargetID    int
+	pokerPayoutTargetName  string
+	pokerPayoutAttempts    int
+	pokerPayoutSessionID   int
+	pokerPayoutTradeSent   bool
 	underfundedTradeMonitorID int
 	underfundedTradeMonitorNotice string
 	lastTradeOpenData string
@@ -432,7 +438,29 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		lastTradeCoverageNotice = ""
 		lastTradeBlockNotice = ""
 
-		if !dealerReadyForNewTrade() {
+		// During payout mode, someone else opened a trade with us — close it and let the payout loop retry
+		isPayoutTradeOpen := false
+		if pokerPayoutMode {
+			if pokerPayoutTradeSent {
+				// Our outgoing TRADE_OPEN was accepted — this is the payout trade opening successfully
+				pokerPayoutTradeSent = false
+				pokerPayoutMode = false
+				isPayoutTradeOpen = true
+				a.AddLogMsg(fmt.Sprintf("[PAYOUT] trade opened successfully with %s, proceeding", pokerPayoutTargetName))
+				log.Printf("[PAYOUT] trade opened successfully with %s, proceeding", pokerPayoutTargetName)
+				// Fall through to normal trade-open handling below
+			} else {
+				// Someone else opened a trade with us during payout — block it
+				a.AddLogMsg(fmt.Sprintf("[PAYOUT] incoming trade blocked during payout to %s, closing", pokerPayoutTargetName))
+				log.Printf("[PAYOUT] incoming trade blocked during payout to %s, closing", pokerPayoutTargetName)
+				suppressNextTradeCloseAnnouncement = true
+				e.Block()
+				ext.Send(out.TRADE_CLOSE)
+				return
+			}
+		}
+
+		if !isPayoutTradeOpen && !dealerReadyForNewTrade() {
 			reason := "dealer not open"
 			if dealerGameActive() {
 				reason = "dealer busy in active game"
@@ -610,6 +638,77 @@ func resetPokerSequence() {
 	pokerSequencePlayerName = ""
 	pokerSequencePlayerResult = PokerHandResult{}
 	pokerSequencePlayerHand = ""
+}
+
+func stopPokerPayout() {
+	pokerPayoutMode = false
+	pokerPayoutTargetID = 0
+	pokerPayoutTargetName = ""
+	pokerPayoutAttempts = 0
+	pokerPayoutSessionID++
+	pokerPayoutTradeSent = false
+}
+
+func startPokerPayout(a *App, targetID int, targetName string) {
+	stopPokerPayout()
+	pokerPayoutMode = true
+	pokerPayoutTargetID = targetID
+	pokerPayoutTargetName = targetName
+	pokerPayoutSessionID++
+	sessionID := pokerPayoutSessionID
+
+	go func() {
+		// Small delay so the winner shout clears Habbo's rate limiter first
+		time.Sleep(1200 * time.Millisecond)
+
+		for attempt := 1; attempt <= 5; attempt++ {
+			if sessionID != pokerPayoutSessionID {
+				return
+			}
+			pokerPayoutAttempts = attempt
+
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT] opening trade with %s (%d), attempt %d/5", targetName, targetID, attempt))
+			log.Printf("[PAYOUT] opening trade with %s (%d), attempt %d/5", targetName, targetID, attempt)
+			pokerPayoutTradeSent = true
+			ext.Send(out.TRADE_OPEN, targetID)
+
+			if attempt > 1 {
+				msg := fmt.Sprintf("Tried to open trade %d times", attempt)
+				time.Sleep(800 * time.Millisecond)
+				if sessionID != pokerPayoutSessionID {
+					return
+				}
+				sendMessageWithDelay(msg)
+			}
+
+			// Wait up to 5 seconds for the trade to open (header 104 will call stopPokerPayout)
+			for i := 0; i < 50; i++ {
+				time.Sleep(100 * time.Millisecond)
+				if sessionID != pokerPayoutSessionID {
+					// Trade opened (or externally cancelled) — done
+					return
+				}
+			}
+
+			// Trade didn't open after 5s, loop for next attempt
+		}
+
+		// All 5 attempts exhausted
+		if sessionID == pokerPayoutSessionID {
+			msg := "Recorded game history and flagged"
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT] all attempts exhausted, shouting: %q", msg))
+			log.Printf("[PAYOUT] all attempts exhausted, shouting: %q", msg)
+			sendMessageWithDelay(msg)
+			stopPokerPayout()
+			// Resume normal dealer-open cycle
+			awaitingTradeOpen = true
+			if canAnnounceDealerOpen() {
+				dealerTradeWindowOpen = true
+				go sendMessageWithDelay(a.dealerOpenMessage())
+			}
+			startDealerOpenHeartbeat(a)
+		}
+	}()
 }
 
 func stopUnderfundedTradeMonitor() {

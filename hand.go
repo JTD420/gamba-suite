@@ -73,7 +73,23 @@ func (a *App) evaluatePokerHand() {
 		time.Sleep(800 * time.Millisecond)
 		sendMessageWithDelay(winnerMsg)
 
+		payoutTargetID := lastTradePartnerID
+		payoutTargetName := playerName
 		resetPokerSequence()
+
+		if winner == PokerWinnerPlayer && payoutTargetID > 0 {
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT] player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID))
+			log.Printf("[PAYOUT] player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID)
+			startPokerPayout(a, payoutTargetID, payoutTargetName)
+		} else {
+			// Dealer wins — resume normal dealer-open cycle
+			awaitingTradeOpen = true
+			if canAnnounceDealerOpen() {
+				dealerTradeWindowOpen = true
+				go sendMessageWithDelay(a.dealerOpenMessage())
+			}
+			startDealerOpenHeartbeat(a)
+		}
 	}
 
 	isPokerRolling = false

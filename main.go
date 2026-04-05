@@ -49,6 +49,8 @@ var (
 	tradeCloseAnnounced bool
 	lastTradeCoverageNotice string
 	lastTradeBlockNotice string
+	awaitingGameChoice bool
+	awaitingGameChoicePartnerID int
 	underfundedTradeMonitorID int
 	underfundedTradeMonitorNotice string
 	lastTradeOpenData string
@@ -73,6 +75,7 @@ var (
 		"plastic_chair": "chair_plasty",
 		"plstic_chair":  "chair_plasty",
 	}
+	gameChoiceCleanupRe = regexp.MustCompile(`[^a-z0-9]+`)
 	roomEntities     = map[int]room.Entity{}
 	roomMu           sync.Mutex
 	users28ByToken   = map[string]string{}
@@ -396,6 +399,8 @@ func handleTradePacket(a *App, e *g.Intercept) {
 	
 	if e.Packet.Header.Value == 104 {
 		stopUnderfundedTradeMonitor()
+		awaitingGameChoice = false
+		awaitingGameChoicePartnerID = 0
 		lastTradeCoverageNotice = ""
 		lastTradeBlockNotice = ""
 		if !awaitingTradeOpen {
@@ -1510,6 +1515,8 @@ func (a *App) sendTradeCompletionMessage() {
 
 	first := fmt.Sprintf("%s what game do you want to play?", partnerName)
 	second := "Say Poker, 21, 13"
+	awaitingGameChoice = true
+	awaitingGameChoicePartnerID = lastTradePartnerID
 
 	a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE] shouting: %q", first))
 	log.Printf("[TRADE_MESSAGE] shouting: %q", first)
@@ -2615,4 +2622,75 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 
 	log.Printf("[INCOMING %s] %d -> %s", chatType, index, msg)
 	a.AddChatLog(fmt.Sprintf("[IN %s] %d -> %s", chatType, index, msg))
+
+	if !awaitingGameChoice || index != awaitingGameChoicePartnerID {
+		return
+	}
+
+	choice, ok := normalizeIncomingGameChoice(msg)
+	if !ok {
+		return
+	}
+
+	e.Block()
+	if isPokerRolling || isTriRolling || isBJRolling || is13Rolling || isHitting || is13Hitting || isClosing {
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %s selected but dice are busy", choice))
+		log.Printf("[GAME_SELECT] %s selected but dice are busy", choice)
+		return
+	}
+
+	awaitingGameChoice = false
+	awaitingGameChoicePartnerID = 0
+
+	ack := fmt.Sprintf("%s! Lets Play!", gameChoiceDisplay(choice))
+	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", ack))
+	log.Printf("[GAME_SELECT] shouting: %q", ack)
+	ext.Send(out.SHOUT, ack)
+
+	switch choice {
+	case "poker":
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected Poker; starting internal roll", index))
+		log.Printf("[GAME_SELECT] %d selected Poker; starting internal roll", index)
+		a.startPokerRoll()
+	case "21":
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected 21; starting internal roll", index))
+		log.Printf("[GAME_SELECT] %d selected 21; starting internal roll", index)
+		isBJRolling = true
+		a.AddLogMsg("21 Roll:\n")
+		go a.rollBjDice()
+	case "13":
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected 13; starting internal roll", index))
+		log.Printf("[GAME_SELECT] %d selected 13; starting internal roll", index)
+		is13Rolling = true
+		a.AddLogMsg("13 Roll:\n")
+		go a.roll13Dice()
+	}
+}
+
+func normalizeIncomingGameChoice(msg string) (string, bool) {
+	cleaned := strings.ToLower(strings.TrimSpace(msg))
+	cleaned = gameChoiceCleanupRe.ReplaceAllString(cleaned, "")
+	switch cleaned {
+	case "poker":
+		return "poker", true
+	case "21":
+		return "21", true
+	case "13":
+		return "13", true
+	default:
+		return "", false
+	}
+}
+
+func gameChoiceDisplay(choice string) string {
+	switch choice {
+	case "poker":
+		return "Poker"
+	case "21":
+		return "21"
+	case "13":
+		return "13"
+	default:
+		return choice
+	}
 }

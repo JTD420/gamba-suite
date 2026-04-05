@@ -21,6 +21,7 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 	g "xabbo.b7c.io/goearth"
 	gencoding "xabbo.b7c.io/goearth/encoding"
+	"xabbo.b7c.io/goearth/shockwave/inventory"
 	"xabbo.b7c.io/goearth/shockwave/in"
 	"xabbo.b7c.io/goearth/shockwave/out"
 	room "xabbo.b7c.io/goearth/shockwave/room"
@@ -60,7 +61,7 @@ var (
 	resultsWaitGroup sync.WaitGroup
 	rollDelay        = 550 * time.Millisecond
 	tradeUserPattern = regexp.MustCompile(`\[(\d+)\]`)
-	stripItemNameRe   = regexp.MustCompile(`(?:CF_\d+_[a-z][a-z_]*|[a-z][a-z0-9_]*_[a-z0-9_]+)(?:\*\d+)?`)
+	stripItemNameRe  = regexp.MustCompile(`(?:CF_\d+_[a-z][a-z_]*|[a-z][a-z0-9_]*_[a-z0-9_]+)(?:\*\d+)?`)
 	roomEntities     = map[int]room.Entity{}
 	roomMu           sync.Mutex
 	users28ByToken   = map[string]string{}
@@ -72,6 +73,11 @@ var (
 	tradeItemsMu     sync.Mutex
 	currentHandItems  []TradeItem
 	handItemsMu       sync.Mutex
+	stripScanMu       sync.Mutex
+	stripScanActive   bool
+	stripScanSeenItemIDs = map[int]struct{}{}
+	stripScanCounts      = map[string]int{}
+	stripScanRawByName   = map[string]string{}
 	knownDiceIDs     = map[int]struct{}{}
 	fakeDiceTestingMode bool
 	dealerOpenHeartbeatID int
@@ -892,9 +898,17 @@ func (a *App) requestPlayerStrip() {
 			log.Printf("[STRIP] GETSTRIP request panicked: %v", r)
 		}
 	}()
+
+	stripScanMu.Lock()
+	stripScanActive = true
+	stripScanSeenItemIDs = map[int]struct{}{}
+	stripScanCounts = map[string]int{}
+	stripScanRawByName = map[string]string{}
+	stripScanMu.Unlock()
+
 	a.ext.Send(out.GETSTRIP, "new")
-	a.AddLogMsg("[STRIP] requested player hand (GETSTRIP)")
-	log.Printf("[STRIP] requested player hand (GETSTRIP)")
+	a.AddLogMsg("[STRIP] requested player hand scan (GETSTRIP new)")
+	log.Printf("[STRIP] requested player hand scan (GETSTRIP new)")
 }
 
 // handleStripPacket parses STRIPINFO_2 [140] to track items in the player's hand.
@@ -903,41 +917,147 @@ func handleStripPacket(a *App, e *g.Intercept) {
 		return
 	}
 
+	rawData := append([]byte(nil), e.Packet.Data...)
+
+	var inv inventory.Inventory
+	e.Packet.Read(&inv)
+
 	catalogNames := a.GetCatalogNameSet()
-	items := parseStripItemsPacket(e.Packet.Data, catalogNames)
 
-	handItemsMu.Lock()
-	currentHandItems = items
-	handItemsMu.Unlock()
-
-	a.AddLogMsg(fmt.Sprintf("[STRIP] parsed %d hand items", len(items)))
-	log.Printf("[STRIP] parsed %d hand items", len(items))
-	for i, item := range items {
-		a.AddLogMsg(fmt.Sprintf("[STRIP] hand[%d] name=%q qty=%d", i, item.Name, item.Quantity))
-		log.Printf("[STRIP] hand[%d] name=%q qty=%d", i, item.Name, item.Quantity)
+	stripScanMu.Lock()
+	active := stripScanActive
+	if !active {
+		stripScanActive = true
+		stripScanSeenItemIDs = map[int]struct{}{}
+		stripScanCounts = map[string]int{}
+		stripScanRawByName = map[string]string{}
+		active = true
 	}
-	a.emitHandItemsUpdate()
+	wrapped := accumulateStripScan(inv.Items, catalogNames)
+	pageCount := len(inv.Items)
+	lastPage := pageCount < 9
+
+	if wrapped || lastPage {
+		items := buildStripScanItems()
+		stripScanActive = false
+		stripScanMu.Unlock()
+
+		rawItems := parseStripItemsPacketRaw(rawData, catalogNames)
+		if len(items) == 0 && len(rawItems) > 0 {
+			items = rawItems
+			a.AddLogMsg("[STRIP] scan decode had no matches; raw fallback parser recovered hand items")
+			log.Printf("[STRIP] scan decode had no matches; raw fallback parser recovered hand items")
+		} else if len(items) > 0 && len(rawItems) > 0 {
+			items = mergePreferHigherQuantity(items, rawItems)
+		}
+
+		handItemsMu.Lock()
+		currentHandItems = items
+		handItemsMu.Unlock()
+
+		a.AddLogMsg(fmt.Sprintf("[STRIP] scan complete (%d page item(s)); catalog hand item types=%d", pageCount, len(items)))
+		log.Printf("[STRIP] scan complete (%d page item(s)); catalog hand item types=%d", pageCount, len(items))
+		for i, item := range items {
+			a.AddLogMsg(fmt.Sprintf("[STRIP] hand[%d] name=%q qty=%d", i, item.Name, item.Quantity))
+			log.Printf("[STRIP] hand[%d] name=%q qty=%d", i, item.Name, item.Quantity)
+		}
+		a.emitHandItemsUpdate()
+		return
+	}
+
+	stripScanMu.Unlock()
+
+	go func() {
+		time.Sleep(550 * time.Millisecond)
+		a.ext.Send(out.GETSTRIP, "next")
+	}()
+
+	a.AddLogMsg(fmt.Sprintf("[STRIP] continuing scan: page had %d item(s), requesting next", pageCount))
+	log.Printf("[STRIP] continuing scan: page had %d item(s), requesting next", pageCount)
+	return
 }
 
-// parseStripItemsPacket extracts item names/counts from STRIPINFO_2 packet data.
-func parseStripItemsPacket(data []byte, catalogNames map[string]struct{}) []TradeItem {
+func accumulateStripScan(invItems []inventory.Item, catalogNames map[string]struct{}) (wrapped bool) {
+	for _, invItem := range invItems {
+		if _, exists := stripScanSeenItemIDs[invItem.ItemId]; exists {
+			return true
+		}
+		stripScanSeenItemIDs[invItem.ItemId] = struct{}{}
+
+		if strings.TrimSpace(invItem.Class) == "" {
+			continue
+		}
+
+		itemName, qty, ok := normalizeCatalogClassWithQuantity(invItem.Class)
+		if !ok {
+			continue
+		}
+
+		if _, allowed := catalogNames[itemName]; !allowed {
+			continue
+		}
+
+		stripScanCounts[itemName] += qty
+		if _, exists := stripScanRawByName[itemName]; !exists {
+			stripScanRawByName[itemName] = invItem.String()
+		}
+	}
+
+	return false
+}
+
+func buildStripScanItems() []TradeItem {
+	if len(stripScanCounts) == 0 {
+		return []TradeItem{}
+	}
+
+	names := make([]string, 0, len(stripScanCounts))
+	for name := range stripScanCounts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	items := make([]TradeItem, 0, len(names))
+	for _, name := range names {
+		items = append(items, TradeItem{
+			Name:     name,
+			Quantity: stripScanCounts[name],
+			RawData:  stripScanRawByName[name],
+		})
+	}
+
+	return items
+}
+
+// parseStripItemsPacketRaw is a fallback parser for STRIPINFO_2 payloads that extracts
+// class names from raw fields and counts occurrences.
+func parseStripItemsPacketRaw(data []byte, catalogNames map[string]struct{}) []TradeItem {
 	counts := map[string]int{}
 	rawByName := map[string]string{}
 
 	fields := bytes.Split(data, []byte{0x02})
-	for _, field := range fields {
+	for i, field := range fields {
 		if len(field) == 0 {
 			continue
 		}
+
 		fieldStr := string(field)
-		itemName, ok := extractStripItemName(fieldStr)
+		itemName, qty, ok := extractStripItemAndQuantity(fieldStr)
 		if !ok {
 			continue
 		}
+
+		if qty <= 1 && i > 0 {
+			if inferred, ok := inferStackCountFromMetaField(string(fields[i-1])); ok {
+				qty = inferred
+			}
+		}
+
 		if _, allowed := catalogNames[itemName]; !allowed {
 			continue
 		}
-		counts[itemName]++
+
+		counts[itemName] += qty
 		if _, exists := rawByName[itemName]; !exists {
 			rawByName[itemName] = fieldStr
 		}
@@ -961,31 +1081,99 @@ func parseStripItemsPacket(data []byte, catalogNames map[string]struct{}) []Trad
 			RawData:  rawByName[name],
 		})
 	}
+
 	return items
 }
 
-// extractStripItemName extracts the furniture class name from a STRIPINFO_2 field.
-// It handles three formats:
-//  1. Legacy trade: "itkoHP|club_sofa"
-//  2. Modern trade: "irbUAXb{chair_plasty*109"
-//  3. Strip/inventory: binary prefix + class name (e.g. "jxbUAHHchair_plasty*109",
-//     "iM]OHHICF_1_coin_bronze")
-func extractStripItemName(field string) (string, bool) {
-	// Try existing trade formats first (handles | and { delimiters)
-	if name, ok := extractTradeItemName(field); ok {
-		return name, ok
+func mergePreferHigherQuantity(base []TradeItem, candidate []TradeItem) []TradeItem {
+	byName := make(map[string]TradeItem, len(base))
+	for _, item := range base {
+		byName[item.Name] = item
 	}
 
-	// Strip format: scan for item name patterns embedded in binary-prefixed fields.
-	// Patterns matched (case-sensitive for CF_ coins, lowercase for furniture):
-	//   CF_<digits>_<lowercase>  e.g. CF_1_coin_bronze
-	//   <lower><lower/digit/under>+_<lower/digit/under>+ e.g. chair_plasty, club_sofa
+	for _, item := range candidate {
+		existing, ok := byName[item.Name]
+		if !ok || item.Quantity > existing.Quantity {
+			byName[item.Name] = item
+		}
+	}
+
+	names := make([]string, 0, len(byName))
+	for name := range byName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	merged := make([]TradeItem, 0, len(names))
+	for _, name := range names {
+		merged = append(merged, byName[name])
+	}
+
+	return merged
+}
+
+func inferStackCountFromMetaField(meta string) (int, bool) {
+	// In observed STRIPINFO_2 metadata, stacked furni count correlates with
+	// repeated "bUA" segments in the metadata field directly before class name.
+	// Example:
+	//   1x -> "nxbUAHJS"           (1 occurrence)
+	//   2x -> "nxbUAIntbUAJS"      (2 occurrences)
+	//   3x -> "nxbUAJntbUAmrbUAJS" (3 occurrences)
+	if strings.Contains(meta, "bUA") {
+		c := strings.Count(meta, "bUA")
+		if c >= 1 && c <= 50 {
+			return c, true
+		}
+	}
+
+	// Avoid VL64-based guessing for non-bUA metadata because it can overcount
+	// when unrelated items are present on the same page.
+	return 0, false
+}
+
+func normalizeCatalogClassWithQuantity(raw string) (name string, qty int, ok bool) {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	if raw == "" {
+		return "", 0, false
+	}
+
+	qty = 1
+	if star := strings.LastIndex(raw, "*"); star > 0 && star < len(raw)-1 {
+		suffix := raw[star+1:]
+		if n, err := strconv.Atoi(suffix); err == nil {
+			// In strip payloads a small suffix can represent a stack amount; larger values are typically ids.
+			if n >= 2 && n <= 50 {
+				qty = n
+			}
+			raw = raw[:star]
+		}
+	}
+
+	name, ok = normalizeTradeItemName(raw)
+	if !ok {
+		return "", 0, false
+	}
+
+	return name, qty, true
+}
+
+// extractStripItemName extracts the furniture class name from a STRIPINFO_2 field.
+func extractStripItemName(field string) (string, bool) {
+	name, _, ok := extractStripItemAndQuantity(field)
+	return name, ok
+}
+
+func extractStripItemAndQuantity(field string) (string, int, bool) {
+	// Try existing trade formats first (handles | and { delimiters).
+	if name, ok := extractTradeItemName(field); ok {
+		return name, 1, ok
+	}
+
 	matches := stripItemNameRe.FindAllString(field, -1)
 	if len(matches) == 0 {
-		return "", false
+		return "", 0, false
 	}
 
-	// Take longest match — most likely to be the complete class name.
 	best := ""
 	for _, m := range matches {
 		if len(m) > len(best) {
@@ -993,12 +1181,16 @@ func extractStripItemName(field string) (string, bool) {
 		}
 	}
 
-	// Strip *N suffix (e.g. *109) if present.
 	if star := strings.LastIndex(best, "*"); star > 0 {
-		best = best[:star]
+		// Keep suffix handling in one place.
 	}
 
-	return normalizeTradeItemName(best)
+	name, qty, ok := normalizeCatalogClassWithQuantity(best)
+	if !ok {
+		return "", 0, false
+	}
+
+	return name, qty, true
 }
 
 // emitHandItemsUpdate pushes the player's current hand items to the frontend.

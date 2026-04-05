@@ -367,6 +367,17 @@ func (a *App) GetGameHistoryJSON() string {
 	return string(jsonData)
 }
 
+func (a *App) ClearGameHistory() {
+	a.gameHistoryMu.Lock()
+	a.gameHistory = nil
+	a.currentGameHistoryID = ""
+	a.gameHistoryMu.Unlock()
+
+	_ = os.Remove(getGameHistoryFilePath())
+	a.emitGameHistoryUpdate()
+	a.AddLogMsg("[GAME_HISTORY] cleared all saved game history")
+}
+
 func (a *App) saveGameHistoryLocked() {
 	jsonData, err := json.MarshalIndent(a.gameHistory, "", "  ")
 	if err != nil {

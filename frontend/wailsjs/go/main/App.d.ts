@@ -6,6 +6,8 @@ export function AddChatLog(arg1:string):Promise<void>;
 
 export function AddLogMsg(arg1:string):Promise<void>;
 
+export function ClearGameHistory():Promise<void>;
+
 export function ClearTradeItems():Promise<void>;
 
 export function GetCatalogItemValue(arg1:string):Promise<number|boolean>;

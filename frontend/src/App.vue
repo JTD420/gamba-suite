@@ -155,6 +155,10 @@
         Saved on disk and kept between sessions so you can review previous rounds, payout issues, and manual follow-up cases.
       </p>
 
+      <div class="history-actions">
+        <button type="button" class="copy-btn history-danger-btn" @click="showClearHistoryConfirm = true">Clear History</button>
+      </div>
+
       <input
         v-model="historySearch"
         type="text"
@@ -253,6 +257,19 @@
             <div v-else class="history-notes">
               <div v-for="(note, index) in selectedHistory.notes" :key="`note-${index}`" class="game-guide-text">{{ note }}</div>
             </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="game-guide-modal-backdrop" v-if="showClearHistoryConfirm" @click="closeClearHistoryConfirm">
+        <div class="game-guide-modal confirm-modal" @click.stop>
+          <div class="game-guide-header">
+            <h3 class="section-title game-guide-title">Clear Game History</h3>
+          </div>
+          <p class="game-guide-text">Are you sure? This will remove all saved game history from the app and delete the persisted history file.</p>
+          <div class="confirm-actions">
+            <button type="button" class="copy-btn" @click="closeClearHistoryConfirm">Cancel</button>
+            <button type="button" class="copy-btn history-danger-btn" @click="confirmClearHistory">Clear Everything</button>
           </div>
         </div>
       </div>
@@ -374,6 +391,7 @@ export default {
       gameHistory: [],
       historySearch: '',
       selectedHistory: null,
+      showClearHistoryConfirm: false,
       roomIdentity: [],
       log: [],
       debugLog: [],
@@ -466,6 +484,21 @@ export default {
     },
     closeHistoryEntry() {
       this.selectedHistory = null;
+    },
+    closeClearHistoryConfirm() {
+      this.showClearHistoryConfirm = false;
+    },
+    async confirmClearHistory() {
+      try {
+        await window.go.main.App.ClearGameHistory();
+        this.selectedHistory = null;
+        this.historySearch = '';
+        this.showClearHistoryConfirm = false;
+        this.addLogMsg('[UI] Cleared game history');
+      } catch (error) {
+        this.addLogMsg('Error clearing game history');
+        console.error(error);
+      }
     },
     historyStatusClass(entry) {
       if (entry.issue) {
@@ -864,6 +897,12 @@ input[type="text"]::placeholder {
   box-sizing: border-box;
 }
 
+.history-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 12px;
+}
+
 .history-list {
   display: grid;
   gap: 12px;
@@ -882,6 +921,16 @@ input[type="text"]::placeholder {
 .history-card-issue {
   border-color: #a94442;
   background: #1d1414;
+}
+
+.history-danger-btn {
+  background: #4a1f1f;
+  border-color: #a94442;
+  color: #ffd0d0;
+}
+
+.history-danger-btn:hover {
+  background: #5a2323;
 }
 
 .history-card-top,
@@ -956,6 +1005,17 @@ input[type="text"]::placeholder {
 .history-notes {
   display: grid;
   gap: 8px;
+}
+
+.confirm-modal {
+  width: min(520px, 100%);
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 18px;
 }
 
 .log-section {

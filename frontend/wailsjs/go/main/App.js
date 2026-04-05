@@ -10,6 +10,10 @@ export function AddLogMsg(arg1) {
   return window['go']['main']['App']['AddLogMsg'](arg1);
 }
 
+export function ClearGameHistory() {
+  return window['go']['main']['App']['ClearGameHistory']();
+}
+
 export function ClearTradeItems() {
   return window['go']['main']['App']['ClearTradeItems']();
 }

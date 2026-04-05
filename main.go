@@ -3201,12 +3201,15 @@ func extractUsers28Entries(raw string) []user28Entry {
 	entries := make([]user28Entry, 0)
 	seen := map[string]struct{}{}
 
-	for i := 0; i < len(b)-6; i++ {
+	for i := 0; i < len(b)-4; i++ {
 		if b[i] != 0x02 {
 			continue
 		}
+		if !(strings.HasPrefix(raw[i+1:], "hr-") || strings.HasPrefix(raw[i+1:], "hd-")) {
+			continue
+		}
 
-		// Name must end at this delimiter.
+		// Figure field delimiter found; name is immediately before this delimiter.
 		nameEnd := i
 		nameStart := nameEnd
 		for nameStart > 0 && isLikelyNameChar(b[nameStart-1]) {
@@ -3218,9 +3221,10 @@ func extractUsers28Entries(raw string) []user28Entry {
 
 		// Shockwave often prefixes names with a length marker (e.g. MWebsedit).
 		// If first two chars are uppercase, drop the first byte as the marker.
-		adjNameStart := nameStart
+		rawNameStart := nameStart
+		adjNameStart := rawNameStart
 		if nameEnd-nameStart >= 3 && b[nameStart] >= 'A' && b[nameStart] <= 'Z' && b[nameStart+1] >= 'A' && b[nameStart+1] <= 'Z' {
-			adjNameStart = nameStart + 1
+			adjNameStart = rawNameStart + 1
 		}
 
 		name := strings.TrimSpace(string(b[adjNameStart:nameEnd]))
@@ -3228,11 +3232,21 @@ func extractUsers28Entries(raw string) []user28Entry {
 			continue
 		}
 
+		if adjNameStart < 4 {
+			continue
+		}
+		// Token is directly before the actual name start (after optional marker trim).
+		tokenStart := adjNameStart - 4
+
 		roomIndex := 0
-		for startOff := adjNameStart - 1; startOff >= 0 && startOff >= adjNameStart-8; startOff-- {
+		scanStart := tokenStart - 6
+		if scanStart < 0 {
+			scanStart = 0
+		}
+		for startOff := scanStart; startOff < tokenStart; startOff++ {
 			vlen := gencoding.VL64DecodeLen(b[startOff])
-			if vlen > 0 && vlen <= 6 && startOff+vlen == adjNameStart {
-				v := gencoding.VL64Decode(b[startOff : startOff+vlen])
+			if vlen > 0 && vlen <= 6 && startOff+vlen == tokenStart {
+				v := gencoding.VL64Decode(b[startOff:tokenStart])
 				if v > 0 {
 					roomIndex = v
 					break
@@ -3243,17 +3257,11 @@ func extractUsers28Entries(raw string) []user28Entry {
 			continue
 		}
 
-		token := ""
-		if nameStart >= 4 {
-			candidate := string(b[nameStart-4 : nameStart])
-			if isLikelyToken(candidate) {
-				token = candidate
-			}
-		}
+		token := string(b[tokenStart:adjNameStart])
 
 		shortToken := ""
-		if adjNameStart >= 6 {
-			shortCandidate := string(b[adjNameStart-6 : adjNameStart-4])
+		if tokenStart >= 2 {
+			shortCandidate := string(b[tokenStart-2 : tokenStart])
 			if isLikelyChatToken(shortCandidate) {
 				shortToken = shortCandidate
 			}
@@ -4686,6 +4694,12 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 	senderName, senderOk := resolveChatSenderName(index)
 	if !senderOk && shouldRefreshRoomUsers() {
 		go requestRoomUsers(a)
+	}
+	if !senderOk {
+		if waitedName, waitedOk := waitForUsers28IndexName(index, 300*time.Millisecond); waitedOk {
+			senderName = waitedName
+			senderOk = true
+		}
 	}
 
 	if senderOk {

@@ -143,6 +143,24 @@ type RoomIdentityEntry struct {
 	RoomIndex int    `json:"roomIndex"`
 }
 
+type GameHistoryEntry struct {
+	ID           string      `json:"id"`
+	PlayerName   string      `json:"playerName"`
+	StartedAt    string      `json:"startedAt"`
+	UpdatedAt    string      `json:"updatedAt"`
+	CompletedAt  string      `json:"completedAt,omitempty"`
+	Game         string      `json:"game"`
+	Winner       string      `json:"winner"`
+	Status       string      `json:"status"`
+	Issue        bool        `json:"issue"`
+	IssueReason  string      `json:"issueReason"`
+	PlayerResult string      `json:"playerResult"`
+	DealerResult string      `json:"dealerResult"`
+	BetItems     []TradeItem `json:"betItems"`
+	PayoutItems  []TradeItem `json:"payoutItems"`
+	Notes        []string    `json:"notes"`
+}
+
 type tradeShortage struct {
 	Name        string
 	Required    int
@@ -151,14 +169,17 @@ type tradeShortage struct {
 }
 
 type App struct {
-	ext       *g.Ext
-	assets    embed.FS
-	log       []string
-	debugLog  []string
-	logMu     sync.Mutex
-	chatLog   []string
-	chatLogMu sync.Mutex
-	ctx       context.Context
+	ext                  *g.Ext
+	assets               embed.FS
+	log                  []string
+	debugLog             []string
+	logMu                sync.Mutex
+	chatLog              []string
+	chatLogMu            sync.Mutex
+	gameHistory          []GameHistoryEntry
+	gameHistoryMu        sync.Mutex
+	currentGameHistoryID string
+	ctx                  context.Context
 }
 
 type PokerDisplayConfig struct {
@@ -182,6 +203,7 @@ func NewApp(ext *g.Ext, assets embed.FS) *App {
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	a.loadGameHistory()
 	a.setupExt()
 	go func() {
 		a.runExt()
@@ -291,6 +313,243 @@ func getConfigFilePath() string {
 	configPath := filepath.Join(configDir, "Gamba-Suite")
 	os.MkdirAll(configPath, 0700)
 	return filepath.Join(configPath, "poker_display_config.json")
+}
+
+func getGameHistoryFilePath() string {
+	configDir, _ := os.UserConfigDir()
+	configPath := filepath.Join(configDir, "Gamba-Suite")
+	os.MkdirAll(configPath, 0700)
+	return filepath.Join(configPath, "game_history.json")
+}
+
+func cloneTradeItems(items []TradeItem) []TradeItem {
+	copyItems := make([]TradeItem, len(items))
+	copy(copyItems, items)
+	return copyItems
+}
+
+func gameHistoryTimestamp() string {
+	return time.Now().Format(time.RFC3339)
+}
+
+func (a *App) loadGameHistory() {
+	path := getGameHistoryFilePath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			a.AddLogMsg(fmt.Sprintf("[GAME_HISTORY] failed to read history file: %v", err))
+		}
+		return
+	}
+
+	var entries []GameHistoryEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		a.AddLogMsg(fmt.Sprintf("[GAME_HISTORY] failed to decode history file: %v", err))
+		return
+	}
+
+	a.gameHistoryMu.Lock()
+	a.gameHistory = entries
+	a.gameHistoryMu.Unlock()
+	a.emitGameHistoryUpdate()
+}
+
+func (a *App) GetGameHistoryJSON() string {
+	a.gameHistoryMu.Lock()
+	entries := make([]GameHistoryEntry, len(a.gameHistory))
+	copy(entries, a.gameHistory)
+	a.gameHistoryMu.Unlock()
+
+	jsonData, err := json.Marshal(entries)
+	if err != nil {
+		return "[]"
+	}
+	return string(jsonData)
+}
+
+func (a *App) saveGameHistoryLocked() {
+	jsonData, err := json.MarshalIndent(a.gameHistory, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(getGameHistoryFilePath(), jsonData, 0600)
+}
+
+func (a *App) emitGameHistoryUpdate() {
+	a.gameHistoryMu.Lock()
+	entries := make([]GameHistoryEntry, len(a.gameHistory))
+	copy(entries, a.gameHistory)
+	a.gameHistoryMu.Unlock()
+
+	jsonData, err := json.Marshal(entries)
+	if err != nil {
+		return
+	}
+	runtime.EventsEmit(a.ctx, "gameHistoryUpdate", string(jsonData))
+}
+
+func (a *App) syncGameHistoryLocked() {
+	a.saveGameHistoryLocked()
+	if a.ctx == nil {
+		return
+	}
+	jsonData, err := json.Marshal(a.gameHistory)
+	if err != nil {
+		return
+	}
+	runtime.EventsEmit(a.ctx, "gameHistoryUpdate", string(jsonData))
+}
+
+func (a *App) findCurrentGameHistoryIndexLocked() int {
+	if strings.TrimSpace(a.currentGameHistoryID) == "" {
+		return -1
+	}
+	for i := range a.gameHistory {
+		if a.gameHistory[i].ID == a.currentGameHistoryID {
+			return i
+		}
+	}
+	return -1
+}
+
+func (a *App) updateCurrentGameHistoryLocked(update func(entry *GameHistoryEntry)) bool {
+	idx := a.findCurrentGameHistoryIndexLocked()
+	if idx < 0 {
+		return false
+	}
+	update(&a.gameHistory[idx])
+	a.gameHistory[idx].UpdatedAt = gameHistoryTimestamp()
+	return true
+}
+
+func (a *App) beginGameHistory(playerName string, betItems []TradeItem) {
+	a.gameHistoryMu.Lock()
+	defer a.gameHistoryMu.Unlock()
+
+	if a.updateCurrentGameHistoryLocked(func(entry *GameHistoryEntry) {
+		if entry.CompletedAt == "" {
+			entry.Status = "Issue"
+			entry.Issue = true
+			entry.IssueReason = "Round was replaced before it fully finished"
+			entry.CompletedAt = gameHistoryTimestamp()
+			entry.Notes = append(entry.Notes, "New round started before previous round was fully resolved")
+		}
+	}) {
+		a.currentGameHistoryID = ""
+	}
+
+	startedAt := gameHistoryTimestamp()
+	entry := GameHistoryEntry{
+		ID:         fmt.Sprintf("%d", time.Now().UnixNano()),
+		PlayerName: strings.TrimSpace(playerName),
+		StartedAt:  startedAt,
+		UpdatedAt:  startedAt,
+		Game:       "Waiting For Choice",
+		Winner:     "",
+		Status:     "Awaiting Game Choice",
+		BetItems:   cloneTradeItems(betItems),
+		Notes:      []string{"Trade completed and bet recorded"},
+	}
+	if entry.PlayerName == "" {
+		entry.PlayerName = "Unknown"
+	}
+
+	a.gameHistory = append([]GameHistoryEntry{entry}, a.gameHistory...)
+	a.currentGameHistoryID = entry.ID
+	a.syncGameHistoryLocked()
+}
+
+func (a *App) noteCurrentGameHistory(note string) {
+	a.gameHistoryMu.Lock()
+	defer a.gameHistoryMu.Unlock()
+	if !a.updateCurrentGameHistoryLocked(func(entry *GameHistoryEntry) {
+		entry.Notes = append(entry.Notes, note)
+	}) {
+		return
+	}
+	a.syncGameHistoryLocked()
+}
+
+func (a *App) setCurrentGameHistoryGame(game string) {
+	a.gameHistoryMu.Lock()
+	defer a.gameHistoryMu.Unlock()
+	if !a.updateCurrentGameHistoryLocked(func(entry *GameHistoryEntry) {
+		entry.Game = game
+		entry.Status = "In Progress"
+		entry.Notes = append(entry.Notes, fmt.Sprintf("Game selected: %s", game))
+	}) {
+		return
+	}
+	a.syncGameHistoryLocked()
+}
+
+func (a *App) setCurrentGameHistoryResults(playerResult string, dealerResult string, winner string, status string, complete bool) {
+	a.gameHistoryMu.Lock()
+	defer a.gameHistoryMu.Unlock()
+	if !a.updateCurrentGameHistoryLocked(func(entry *GameHistoryEntry) {
+		if strings.TrimSpace(playerResult) != "" {
+			entry.PlayerResult = playerResult
+		}
+		if strings.TrimSpace(dealerResult) != "" {
+			entry.DealerResult = dealerResult
+		}
+		if strings.TrimSpace(winner) != "" {
+			entry.Winner = winner
+		}
+		if strings.TrimSpace(status) != "" {
+			entry.Status = status
+		}
+		if complete {
+			entry.CompletedAt = gameHistoryTimestamp()
+		}
+	}) {
+		return
+	}
+	if complete {
+		a.currentGameHistoryID = ""
+	}
+	a.syncGameHistoryLocked()
+}
+
+func (a *App) markCurrentGameHistoryIssue(reason string, complete bool) {
+	a.gameHistoryMu.Lock()
+	defer a.gameHistoryMu.Unlock()
+	if !a.updateCurrentGameHistoryLocked(func(entry *GameHistoryEntry) {
+		entry.Issue = true
+		entry.IssueReason = reason
+		entry.Status = "Issue"
+		entry.Notes = append(entry.Notes, reason)
+		if complete {
+			entry.CompletedAt = gameHistoryTimestamp()
+		}
+	}) {
+		return
+	}
+	if complete {
+		a.currentGameHistoryID = ""
+	}
+	a.syncGameHistoryLocked()
+}
+
+func (a *App) captureCurrentGameHistoryPayoutItems(items []TradeItem, note string, complete bool) {
+	a.gameHistoryMu.Lock()
+	defer a.gameHistoryMu.Unlock()
+	if !a.updateCurrentGameHistoryLocked(func(entry *GameHistoryEntry) {
+		entry.PayoutItems = cloneTradeItems(items)
+		if strings.TrimSpace(note) != "" {
+			entry.Notes = append(entry.Notes, note)
+		}
+		if complete {
+			entry.Status = "Completed"
+			entry.CompletedAt = gameHistoryTimestamp()
+		}
+	}) {
+		return
+	}
+	if complete {
+		a.currentGameHistoryID = ""
+	}
+	a.syncGameHistoryLocked()
 }
 
 func (a *App) setupExt() {
@@ -495,6 +754,9 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		tradeAutoConfirmed = true
 		tradeAutoConfirmPending = false
 		if pokerPayoutTradeActive {
+			tradeItemsMu.Lock()
+			payoutItems := cloneTradeItems(currentOwnTradeItems)
+			tradeItemsMu.Unlock()
 			partnerName := strings.TrimSpace(lastTradePartnerName)
 			if partnerName == "" || partnerName == "Unknown" {
 				partnerName = strings.TrimSpace(pokerPayoutTargetName)
@@ -505,6 +767,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 			a.AddLogMsg("[TRADE_COMPLETED #112] payout trade completed")
 			log.Printf("[TRADE_COMPLETED #112] payout trade completed")
+			a.captureCurrentGameHistoryPayoutItems(payoutItems, "Payout trade completed successfully", true)
 
 			completeMsg := fmt.Sprintf("Trade Completed: \"%s\"", partnerName)
 			a.AddLogMsg(fmt.Sprintf("[TRADE_COMPLETED] shouting: %q", completeMsg))
@@ -749,6 +1012,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				pokerPayoutTradeActive = false
 				a.AddLogMsg(fmt.Sprintf("[PAYOUT] payout trade cancelled by %s, retrying", retryTargetName))
 				log.Printf("[PAYOUT] payout trade cancelled by %s, retrying", retryTargetName)
+				a.noteCurrentGameHistory("Payout trade closed before completion; retrying payout")
 				startPokerPayout(a, retryTargetID, retryTargetName)
 			} else {
 				a.AddLogMsg("[TRADE_REOPEN] trade closed before completion, performing full dealer reset")
@@ -760,6 +1024,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			pokerPayoutTradeActive = false
 			a.AddLogMsg("[PAYOUT] payout trade completed successfully")
 			log.Printf("[PAYOUT] payout trade completed successfully")
+			a.noteCurrentGameHistory("Dealer payout flow finished successfully")
 
 			// Resync hand before reopening dealer trades.
 			go a.resyncHandThenOpenDealer()
@@ -813,6 +1078,7 @@ func startPokerPayout(a *App, targetID int, targetName string) {
 	pokerPayoutTargetName = targetName
 	pokerPayoutSessionID++
 	sessionID := pokerPayoutSessionID
+	a.noteCurrentGameHistory(fmt.Sprintf("Payout started for %s", targetName))
 
 	go func() {
 		// Small delay so the winner shout clears Habbo's rate limiter first
@@ -880,6 +1146,7 @@ func startPokerPayout(a *App, targetID int, targetName string) {
 			msg := "Recorded game history and flagged"
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT] all attempts exhausted, shouting: %q", msg))
 			log.Printf("[PAYOUT] all attempts exhausted, shouting: %q", msg)
+			a.markCurrentGameHistoryIssue("Payout trade failed to open after all retry attempts", true)
 			sendMessageWithDelay(msg)
 			stopPokerPayout()
 			// Resume normal dealer-open cycle
@@ -1207,6 +1474,7 @@ func (a *App) verifyAndRetryPayoutAdds(plannedIDs []int) {
 
 	a.AddLogMsg("[PAYOUT_DEBUG] payout items still not fully reflected in own trade offer; waiting for manual intervention")
 	log.Printf("[PAYOUT_DEBUG] payout items still not fully reflected in own trade offer; waiting for manual intervention")
+	a.noteCurrentGameHistory("Payout items did not fully reflect in trade offer; manual review may be needed")
 }
 
 func stopUnderfundedTradeMonitor() {
@@ -1242,6 +1510,7 @@ func startTradeWindowTimeoutMonitor(a *App) {
 			msg := "closing trade window opened for too long"
 			a.AddLogMsg("[TRADE_TIMEOUT] " + msg)
 			log.Printf("[TRADE_TIMEOUT] %s", msg)
+			a.markCurrentGameHistoryIssue("Trade window stayed open too long and was force closed", true)
 			ext.Send(out.SHOUT, msg)
 			ext.Send(out.TRADE_CLOSE)
 			return
@@ -1465,6 +1734,7 @@ func handleTradeConfirmTimeout(a *App) {
 
 	a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] max attempts reached; sending trade close")
 	log.Printf("[TRADE_CONFIRM_ACCEPT] max attempts reached; sending trade close")
+	a.markCurrentGameHistoryIssue("Trade confirm timed out and trade was force closed", true)
 	ext.Send(out.TRADE_CLOSE)
 
 	closeMsg := fmt.Sprintf("Trade Closed: \"%s\"", partnerName)
@@ -1686,6 +1956,7 @@ func clearRoomUserCaches(a *App) {
 }
 
 func (a *App) resetDealerSessionState(reason string) {
+	a.markCurrentGameHistoryIssue(fmt.Sprintf("Dealer session reset before round fully resolved (%s)", reason), true)
 	awaitingTradeOpen = false
 	dealerTradeWindowOpen = false
 	awaitingGameChoice = false
@@ -2868,6 +3139,7 @@ func (a *App) sendTradeCompletionMessage() {
 	if partnerName == "" || strings.EqualFold(partnerName, "Unknown") {
 		partnerName = "Player"
 	}
+	a.beginGameHistory(partnerName, pokerGameBetItems)
 
 	first := fmt.Sprintf("%s what game do you want to play?", partnerName)
 	second := "Say Poker, 21, 13"
@@ -4499,6 +4771,7 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 	awaitingGameChoicePartnerName = ""
 
 	ack := fmt.Sprintf("%s! Lets Play!", gameChoiceDisplay(choice))
+	a.setCurrentGameHistoryGame(gameChoiceDisplay(choice))
 	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", ack))
 	log.Printf("[GAME_SELECT] shouting: %q", ack)
 	ext.Send(out.SHOUT, ack)

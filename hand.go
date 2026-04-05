@@ -42,6 +42,8 @@ func (a *App) evaluatePokerHand() {
 	if pokerSequenceStage == 1 {
 		pokerSequencePlayerResult = result
 		pokerSequencePlayerHand = hand
+		a.setCurrentGameHistoryResults(hand, "", "", "In Progress", false)
+		a.noteCurrentGameHistory("Player poker hand recorded")
 		pokerSequenceStage = 2
 		go func() {
 			time.Sleep(700 * time.Millisecond)
@@ -75,13 +77,18 @@ func (a *App) evaluatePokerHand() {
 
 		payoutTargetID := lastTradePartnerID
 		payoutTargetName := playerName
+		playerHand := pokerSequencePlayerHand
 		resetPokerSequence()
 
 		if winner == PokerWinnerPlayer && payoutTargetID > 0 {
+			a.setCurrentGameHistoryResults(playerHand, hand, playerName, "Payout Pending", false)
+			a.noteCurrentGameHistory(winnerMsg)
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT] player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID))
 			log.Printf("[PAYOUT] player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID)
 			startPokerPayout(a, payoutTargetID, payoutTargetName)
 		} else {
+			a.setCurrentGameHistoryResults(playerHand, hand, "Dealer", "Completed", true)
+			a.noteCurrentGameHistory(winnerMsg)
 			// Dealer wins — resume normal dealer-open cycle
 			awaitingTradeOpen = true
 			if canAnnounceDealerOpen() {
@@ -115,6 +122,8 @@ func (a *App) evaluateBlackjackHand() {
 		logRollResult := fmt.Sprintf("21 Result: %s\n", hand)
 		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
 		a.AddLogMsg(logRollResult)
+		a.setCurrentGameHistoryResults(hand, "", "Not Recorded", "Result Recorded", true)
+		a.noteCurrentGameHistory("21 result recorded; winner was not automatically tracked")
 
 		if !isMuted {
 			// If the user is not muted, send the message
@@ -141,6 +150,8 @@ func (a *App) evaluateBlackjackHand() {
 		logRollResult := fmt.Sprintf("21 Result: %s\n", hand)
 		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
 		a.AddLogMsg(logRollResult)
+		a.setCurrentGameHistoryResults(hand, "", "Not Recorded", "Result Recorded", true)
+		a.noteCurrentGameHistory("21 result recorded; winner was not automatically tracked")
 	}
 	isBJRolling = false
 	isHitting = false
@@ -166,6 +177,8 @@ func (a *App) evaluate13Hand() {
 		logRollResult := fmt.Sprintf("13 Result: %s\n", hand)
 		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
 		a.AddLogMsg(logRollResult)
+		a.setCurrentGameHistoryResults(hand, "", "Not Recorded", "Result Recorded", true)
+		a.noteCurrentGameHistory("13 result recorded; winner was not automatically tracked")
 		if !isMuted {
 			// If the user is not muted, send the message
 			sendMessageWithDelay(hand)
@@ -191,6 +204,8 @@ func (a *App) evaluate13Hand() {
 		logRollResult := fmt.Sprintf("13 Result: %s\n", hand)
 		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
 		a.AddLogMsg(logRollResult)
+		a.setCurrentGameHistoryResults(hand, "", "Not Recorded", "Result Recorded", true)
+		a.noteCurrentGameHistory("13 result recorded; winner was not automatically tracked")
 	}
 	is13Rolling = false
 	is13Hitting = false

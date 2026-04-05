@@ -30,6 +30,10 @@ export function GetCurrentVersion() {
   return window['go']['main']['App']['GetCurrentVersion']();
 }
 
+export function GetGameHistoryJSON() {
+  return window['go']['main']['App']['GetGameHistoryJSON']();
+}
+
 export function GetLastTradePartnerName() {
   return window['go']['main']['App']['GetLastTradePartnerName']();
 }

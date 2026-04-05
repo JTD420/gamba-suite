@@ -16,6 +16,8 @@ export function GetCurrentTradeItems():Promise<Array<main.TradeItem>>;
 
 export function GetCurrentVersion():Promise<string>;
 
+export function GetGameHistoryJSON():Promise<string>;
+
 export function GetLastTradePartnerName():Promise<string>;
 
 export function GetTradeItemsJSON():Promise<string>;

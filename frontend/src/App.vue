@@ -4,7 +4,7 @@
     <!-- Tab bar -->
     <div class="tab-bar">
       <button
-        v-for="tab in ['Config', 'Trade', 'Logs']"
+        v-for="tab in ['Config', 'Trade', 'Game History', 'Logs']"
         :key="tab"
         :class="['tab-btn', { active: activeTab === tab }]"
         @click="activeTab = tab"
@@ -13,15 +13,48 @@
 
     <!-- Config tab -->
     <div v-if="activeTab === 'Config'">
-      <h2 class="section-title">Poker Hand Configurations</h2>
-      <form @submit.prevent="saveConfig">
-        <div class="form-group" v-for="(value, key) in config" :key="key">
-          <label :for="key">{{ formatLabel(key) }}:</label>
-          <input v-model="config[key]" type="text" :id="key" />
-        </div>
-        <button type="submit" class="save-button">Save</button>
-      </form>
+      <h2 class="section-title">Games</h2>
+      <p class="config-intro">
+        This page is now read-only. Game behaviour is controlled in code, so players only see what each game does and how the flow works.
+      </p>
 
+      <div class="game-card-grid">
+        <button
+          v-for="game in gameGuides"
+          :key="game.key"
+          type="button"
+          class="game-card"
+          @click="openGameGuide(game)"
+        >
+          <span class="game-card-title">{{ game.title }}</span>
+          <span class="game-card-summary">{{ game.summary }}</span>
+          <span class="game-card-action">Click for details</span>
+        </button>
+      </div>
+
+      <div class="game-guide-modal-backdrop" v-if="activeGameGuide" @click="closeGameGuide">
+        <div class="game-guide-modal" @click.stop>
+          <div class="game-guide-header">
+            <h3 class="section-title game-guide-title">{{ activeGameGuide.title }}</h3>
+            <button type="button" class="copy-btn" @click="closeGameGuide">Close</button>
+          </div>
+          <p class="game-guide-text">{{ activeGameGuide.description }}</p>
+          <div class="game-guide-block">
+            <div class="game-guide-label">How it works</div>
+            <div class="game-guide-text">{{ activeGameGuide.howItWorks }}</div>
+          </div>
+          <div class="game-guide-block">
+            <div class="game-guide-label">What the player does</div>
+            <div class="game-guide-text">{{ activeGameGuide.playerFlow }}</div>
+          </div>
+          <div class="game-guide-block">
+            <div class="game-guide-label">What the dealer does</div>
+            <div class="game-guide-text">{{ activeGameGuide.dealerFlow }}</div>
+          </div>
+        </div>
+      </div>
+
+      <h2 class="section-title">Utilities</h2>
       <button @click="handleShowCommands" class="save-button">Show Commands</button>
       <button @click="handleOpenLastTrade" class="save-button">
         Open Last Trade: {{ lastTradePartnerName }}
@@ -30,9 +63,6 @@
         Skip Dice Setup (Testing)
       </button>
 
-      <div v-if="isOutdated" class="update-notice">
-        A new version of this application is available. Please update to the latest version.
-      </div>
     </div>
 
     <!-- Trade tab -->
@@ -119,6 +149,115 @@
 
     </div>
 
+    <div v-if="activeTab === 'Game History'">
+      <h2 class="section-title">Game History</h2>
+      <p class="config-intro">
+        Saved on disk and kept between sessions so you can review previous rounds, payout issues, and manual follow-up cases.
+      </p>
+
+      <input
+        v-model="historySearch"
+        type="text"
+        class="history-search"
+        placeholder="Search by player name"
+      />
+
+      <div v-if="filteredGameHistory.length === 0" class="trade-empty">
+        No game history matched your search.
+      </div>
+
+      <div v-else class="history-list">
+        <button
+          v-for="entry in filteredGameHistory"
+          :key="entry.id"
+          type="button"
+          class="history-card"
+          :class="{ 'history-card-issue': entry.issue }"
+          @click="openHistoryEntry(entry)"
+        >
+          <div class="history-card-top">
+            <span class="history-player">{{ entry.playerName || 'Unknown' }}</span>
+            <span class="history-status" :class="historyStatusClass(entry)">{{ entry.status || 'Unknown' }}</span>
+          </div>
+          <div class="history-meta-row">
+            <span>{{ entry.game || 'Unknown Game' }}</span>
+            <span>{{ formatDateTime(entry.startedAt) }}</span>
+          </div>
+          <div class="history-meta-row">
+            <span>Winner: {{ entry.winner || 'Not Recorded' }}</span>
+            <span v-if="entry.issue" class="history-issue-text">Flagged</span>
+          </div>
+          <div class="history-summary">
+            Bet: {{ summarizeTradeItems(entry.betItems) || 'No bet items recorded' }}
+          </div>
+          <div class="history-summary" v-if="entry.issueReason">
+            Issue: {{ entry.issueReason }}
+          </div>
+          <div class="game-card-action">Click for full details</div>
+        </button>
+      </div>
+
+      <div class="game-guide-modal-backdrop" v-if="selectedHistory" @click="closeHistoryEntry">
+        <div class="game-guide-modal history-modal" @click.stop>
+          <div class="game-guide-header">
+            <h3 class="section-title game-guide-title">{{ selectedHistory.playerName || 'Unknown' }}</h3>
+            <button type="button" class="copy-btn" @click="closeHistoryEntry">Close</button>
+          </div>
+
+          <div class="history-detail-grid">
+            <div class="history-detail-item">
+              <div class="game-guide-label">Game</div>
+              <div class="game-guide-text">{{ selectedHistory.game || 'Unknown' }}</div>
+            </div>
+            <div class="history-detail-item">
+              <div class="game-guide-label">Started</div>
+              <div class="game-guide-text">{{ formatDateTime(selectedHistory.startedAt) }}</div>
+            </div>
+            <div class="history-detail-item">
+              <div class="game-guide-label">Completed</div>
+              <div class="game-guide-text">{{ formatDateTime(selectedHistory.completedAt) || 'Still open / not recorded' }}</div>
+            </div>
+            <div class="history-detail-item">
+              <div class="game-guide-label">Winner</div>
+              <div class="game-guide-text">{{ selectedHistory.winner || 'Not Recorded' }}</div>
+            </div>
+            <div class="history-detail-item">
+              <div class="game-guide-label">Status</div>
+              <div class="game-guide-text">{{ selectedHistory.status || 'Unknown' }}</div>
+            </div>
+            <div class="history-detail-item">
+              <div class="game-guide-label">Issue</div>
+              <div class="game-guide-text">{{ selectedHistory.issue ? (selectedHistory.issueReason || 'Flagged for review') : 'No issue flagged' }}</div>
+            </div>
+            <div class="history-detail-item">
+              <div class="game-guide-label">Player Result</div>
+              <div class="game-guide-text">{{ selectedHistory.playerResult || 'Not recorded' }}</div>
+            </div>
+            <div class="history-detail-item">
+              <div class="game-guide-label">Dealer Result</div>
+              <div class="game-guide-text">{{ selectedHistory.dealerResult || 'Not recorded' }}</div>
+            </div>
+          </div>
+
+          <div class="game-guide-block">
+            <div class="game-guide-label">Bet Items</div>
+            <div class="game-guide-text">{{ summarizeTradeItems(selectedHistory.betItems) || 'No bet items recorded' }}</div>
+          </div>
+          <div class="game-guide-block">
+            <div class="game-guide-label">Payout Items</div>
+            <div class="game-guide-text">{{ summarizeTradeItems(selectedHistory.payoutItems) || 'No payout items recorded' }}</div>
+          </div>
+          <div class="game-guide-block">
+            <div class="game-guide-label">Round Notes</div>
+            <div v-if="(selectedHistory.notes || []).length === 0" class="game-guide-text">No additional notes recorded.</div>
+            <div v-else class="history-notes">
+              <div v-for="(note, index) in selectedHistory.notes" :key="`note-${index}`" class="game-guide-text">{{ note }}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Logs tab -->
     <div v-if="activeTab === 'Logs'">
       <div class="log-grid">
@@ -180,27 +319,65 @@ export default {
   data() {
     return {
       activeTab: 'Config',
-      config: {
-        five_of_a_kind: '',
-        four_of_a_kind: '',
-        full_house: '',
-        high_straight: '',
-        low_straight: '',
-        three_of_a_kind: '',
-        two_pair: '',
-        one_pair: '',
-        nothing: '',
-      },
+      activeGameGuide: null,
+      gameGuides: [
+        {
+          key: 'poker',
+          title: 'Poker',
+          summary: 'Five dice poker hand showdown with automatic dealer response.',
+          description: 'Poker uses five dice and compares the player hand against the dealer hand after the trade is completed. The higher poker hand wins the round.',
+          howItWorks: 'The app asks which game the player wants, waits for Poker, then runs the poker sequence, evaluates both hands, and handles the result flow automatically.',
+          playerFlow: 'Trade the bet, choose Poker in chat when prompted, then wait for the player and dealer rolls to finish.',
+          dealerFlow: 'The dealer records the bet, starts the poker sequence, calculates which hand wins, and prepares payout handling if the player beats the dealer.',
+        },
+        {
+          key: '21',
+          title: '21',
+          summary: 'Automatic dice roll aiming for a strong total without going too low.',
+          description: '21 is a fast internal dice game where the app rolls and evaluates the result automatically. The side with the better valid 21 result wins the round.',
+          howItWorks: 'After trade completion the player chooses 21, the app starts the 21 roll flow, compares totals, and announces the result through the normal game pipeline.',
+          playerFlow: 'Trade the bet, say 21 when prompted, and let the roll complete.',
+          dealerFlow: 'The dealer starts the 21 routine, tracks the totals, decides who won the round, and continues into payout handling if the player wins.',
+        },
+        {
+          key: '13',
+          title: '13',
+          summary: 'Automatic dice roll flow tuned for the 13 game rules.',
+          description: '13 runs as its own internal dice routine after the player picks it from chat. The better valid 13 result wins the round.',
+          howItWorks: 'The app listens for the 13 selection, starts the dedicated 13 rolling logic, compares the outcome, then processes the winner the same way as other games.',
+          playerFlow: 'Trade the bet, say 13 when prompted, and wait for the roll and outcome.',
+          dealerFlow: 'The dealer starts the 13 routine, calculates who won, and manages the rest of the round automatically.',
+        },
+        {
+          key: 'tri',
+          title: 'Tri',
+          summary: 'Three-dice formation roll available through command flow.',
+          description: 'Tri is a command-driven roll mode using three dice instead of the trade-selected round flow.',
+          howItWorks: 'It is triggered from chat commands and rolls three dice in the configured formation. This is a utility roll mode rather than the main trade-game flow.',
+          playerFlow: 'Use the Tri command when needed and let the app roll the three dice.',
+          dealerFlow: 'The dealer/app handles the roll output and result logging automatically, but the house rules for who wins depend on how you are using the tri command.',
+        },
+        {
+          key: 'roll',
+          title: 'Standard Roll',
+          summary: 'Basic five-dice roll and result output using commands.',
+          description: 'Standard Roll is the quick manual dice roll mode available from the command list.',
+          howItWorks: 'The app rolls the available dice, tracks the values, and outputs the result. This is a utility roll and does not decide a winner by itself.',
+          playerFlow: 'Use the roll command when you want a standard five-dice result outside the trade-selected games.',
+          dealerFlow: 'The dealer/app tracks the active dice, gathers the results, and logs the final roll for you to use however you want.',
+        },
+      ],
       tradeItems: [],
       activeGameBetItems: [],
       ownTradeItems: [],
       handItems: [],
+      gameHistory: [],
+      historySearch: '',
+      selectedHistory: null,
       roomIdentity: [],
       log: [],
       debugLog: [],
       chatLog: [],
-      isOutdated: false,
-      currentVersion: '',
       lastTradePartnerName: 'None',
       tradeNamePollTimer: null,
     };
@@ -269,34 +446,70 @@ export default {
       }
       return '';
     },
+    filteredGameHistory() {
+      const query = this.historySearch.trim().toLowerCase();
+      if (!query) {
+        return this.gameHistory;
+      }
+      return this.gameHistory.filter((entry) => String(entry.playerName || '').toLowerCase().includes(query));
+    },
   },
   methods: {
+    openGameGuide(game) {
+      this.activeGameGuide = game;
+    },
+    closeGameGuide() {
+      this.activeGameGuide = null;
+    },
+    openHistoryEntry(entry) {
+      this.selectedHistory = entry;
+    },
+    closeHistoryEntry() {
+      this.selectedHistory = null;
+    },
+    historyStatusClass(entry) {
+      if (entry.issue) {
+        return 'history-status-issue';
+      }
+      const status = String(entry.status || '').toLowerCase();
+      if (status.includes('completed')) {
+        return 'history-status-complete';
+      }
+      if (status.includes('pending') || status.includes('awaiting')) {
+        return 'history-status-pending';
+      }
+      if (status.includes('result')) {
+        return 'history-status-info';
+      }
+      return 'history-status-info';
+    },
+    summarizeTradeItems(items) {
+      return (items || []).map((item) => `${item.Quantity}x ${this.formatItemName(item.Name)}`).join(', ');
+    },
+    formatDateTime(value) {
+      if (!value) {
+        return '';
+      }
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) {
+        return value;
+      }
+      return date.toLocaleString();
+    },
+    async refreshGameHistory() {
+      try {
+        const jsonStr = await window.go.main.App.GetGameHistoryJSON();
+        this.gameHistory = JSON.parse(jsonStr || '[]') || [];
+      } catch (error) {
+        this.addLogMsg('Error loading game history');
+        console.error(error);
+      }
+    },
      async handleShowCommands() {
       try {
         await window.go.main.App.ShowCommands();
       } catch (error) {
         this.addLogMsg('Error showing commands');
-        console.error(error);
-      }
-    },
-    async loadConfig() {
-      try {
-        const response = await window.go.main.App.LoadConfig();
-        if (response) {
-          this.config = response;
-        }
-        this.addLogMsg('Configuration loaded');
-      } catch (error) {
-        this.addLogMsg('Error loading configuration');
-        console.error(error);
-      }
-    },
-    async saveConfig() {
-      try {
-        await window.go.main.App.SaveConfig(this.config);
-        this.addLogMsg('Configuration saved');
-      } catch (error) {
-        this.addLogMsg('Error saving configuration');
         console.error(error);
       }
     },
@@ -367,9 +580,6 @@ export default {
       const text = this.debugLog.join('\n');
       await this.copyTextToClipboard(text, 'debug logs');
     },
-    formatLabel(key) {
-      return key.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
-    },
     formatItemName(name) {
       return String(name || '')
         .split('_')
@@ -385,40 +595,10 @@ export default {
         }
       });
     },
-    async checkForUpdates() {
-      try {
-        const response = await fetch(
-          "https://raw.githubusercontent.com/JTD420/G-ExtensionStore/repo/1.5.3/store/extensions/%5BAIO%5D%20Gamba%20Suite/extension.json"
-        );
-        const data = await response.json();
-        const latestVersion = data.version;
-
-        if (this.currentVersion !== latestVersion) {
-          this.isOutdated = true;
-        }
-      } catch (error) {
-        this.addLogMsg('Error checking for updates');
-        console.error(error);
-      }
-    },
-    async fetchCurrentVersion() {
-      try {
-        const version = await window.go.main.App.GetCurrentVersion(); // Fetch version from Go
-        this.currentVersion = version;
-      } catch (error) {
-        this.addLogMsg('Error fetching current version');
-        console.error(error);
-      }
-    },
-    fetch() {
-      this.loadConfig();
-    },
   },
   async mounted() {
-    await this.fetchCurrentVersion();
-    this.fetch();
     await this.refreshLastTradePartnerName();
-    await this.checkForUpdates();
+    await this.refreshGameHistory();
     window.runtime.EventsOn("logUpdate", (message) => {
       this.log = message.split('\n');
       this.scrollBox('logbox');
@@ -481,6 +661,13 @@ export default {
         this.roomIdentity = JSON.parse(jsonStr) || [];
       } catch (_) {
         this.roomIdentity = [];
+      }
+    });
+    window.runtime.EventsOn("gameHistoryUpdate", (jsonStr) => {
+      try {
+        this.gameHistory = JSON.parse(jsonStr) || [];
+      } catch (_) {
+        this.gameHistory = [];
       }
     });
 
@@ -564,6 +751,213 @@ input[type="text"]::placeholder {
   background-color: #1e1e1e;
 }
 
+.config-intro {
+  margin: 0 0 16px;
+  color: #b8b8b8;
+  font-size: 14px;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.game-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.game-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 14px;
+  background: #181818;
+  border: 1px solid #3a3a3a;
+  border-radius: 8px;
+  color: #e8e8e8;
+  text-align: left;
+  cursor: pointer;
+}
+
+.game-card:hover {
+  background: #202020;
+  border-color: #5a5a5a;
+}
+
+.game-card-title {
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.game-card-summary {
+  color: #a6a6a6;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.game-card-action {
+  color: #ffd700;
+  font-size: 12px;
+}
+
+.game-guide-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  z-index: 999;
+}
+
+.game-guide-modal {
+  width: min(680px, 100%);
+  background: #141414;
+  border: 1px solid #444;
+  border-radius: 10px;
+  padding: 18px;
+}
+
+.game-guide-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.game-guide-title {
+  margin: 0;
+  text-align: left;
+}
+
+.game-guide-block {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid #2f2f2f;
+}
+
+.game-guide-label {
+  color: #ffd700;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+
+.game-guide-text {
+  color: #d0d0d0;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.history-search {
+  width: 100%;
+  padding: 10px 12px;
+  background-color: #1a1a1a;
+  border: 1px solid #3f3f3f;
+  border-radius: 8px;
+  color: #f0f0f0;
+  margin-bottom: 14px;
+  box-sizing: border-box;
+}
+
+.history-list {
+  display: grid;
+  gap: 12px;
+}
+
+.history-card {
+  padding: 14px;
+  background: #161616;
+  border: 1px solid #343434;
+  border-radius: 8px;
+  text-align: left;
+  color: #efefef;
+  cursor: pointer;
+}
+
+.history-card-issue {
+  border-color: #a94442;
+  background: #1d1414;
+}
+
+.history-card-top,
+.history-meta-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.history-player {
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.history-status {
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.history-status-complete {
+  background: #16351f;
+  color: #8ef0aa;
+}
+
+.history-status-pending {
+  background: #3f3113;
+  color: #ffd36d;
+}
+
+.history-status-info {
+  background: #1b3042;
+  color: #8fc8ff;
+}
+
+.history-status-issue {
+  background: #4a1f1f;
+  color: #ff9e9e;
+}
+
+.history-summary,
+.history-issue-text {
+  color: #bdbdbd;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.history-issue-text {
+  color: #ff9e9e;
+}
+
+.history-modal {
+  max-height: 85vh;
+  overflow-y: auto;
+}
+
+.history-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.history-detail-item {
+  padding: 10px;
+  background: #191919;
+  border: 1px solid #2b2b2b;
+  border-radius: 8px;
+}
+
+.history-notes {
+  display: grid;
+  gap: 8px;
+}
+
 .log-section {
   background-color: #000000; /* Black background for the console */
   padding: 10px;
@@ -618,17 +1012,6 @@ input[type="text"]::placeholder {
 .debug-log-section {
   color: #fda4af;
   border-color: #fda4af;
-}
-
-/* Update notice style */
-.update-notice {
-  margin-top: 15px;
-  padding: 10px;
-  background-color: #ffcc00;
-  color: #000;
-  text-align: center;
-  border-radius: 4px;
-  font-weight: bold;
 }
 
 /* Tab navigation */

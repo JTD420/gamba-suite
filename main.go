@@ -34,6 +34,7 @@ var (
 	currentSum       int
 	commandList      string
 	awaitingTradeOpen bool
+	dealerTradeWindowOpen bool
 	tradeOpenCount    int
 	tradeCloseCount   int
 	lastTradePartnerID int
@@ -46,6 +47,7 @@ var (
 	tradeAutoConfirmPending bool
 	tradeCompleted bool
 	tradeCloseAnnounced bool
+	suppressNextTradeCloseAnnouncement bool
 	lastTradeCoverageNotice string
 	lastTradeBlockNotice string
 	awaitingGameChoice bool
@@ -209,6 +211,32 @@ func (a *App) SaveConfig(config *PokerDisplayConfig) {
 
 func (a *App) dealerOpenMessage() string {
 	return "Dealer Open, Trade Away"
+}
+
+func dealerGameActive() bool {
+	return awaitingGameChoice || pokerSequenceStage > 0 || isPokerRolling || isTriRolling || isBJRolling || is13Rolling || isHitting || is13Hitting || isClosing
+}
+
+func dealerReadyForNewTrade() bool {
+	return awaitingTradeOpen && dealerTradeWindowOpen && !dealerGameActive()
+}
+
+func dealerDiceReadyLocked() bool {
+	return fakeDiceTestingMode || len(diceList) >= 5
+}
+
+func dealerDiceReady() bool {
+	mutex.Lock()
+	defer mutex.Unlock()
+	return dealerDiceReadyLocked()
+}
+
+func canAnnounceDealerOpenLocked() bool {
+	return !isMuted && dealerDiceReadyLocked()
+}
+
+func canAnnounceDealerOpen() bool {
+	return !isMuted && dealerDiceReady()
 }
 
 func getConfigFilePath() string {
@@ -399,15 +427,31 @@ func handleTradePacket(a *App, e *g.Intercept) {
 	if e.Packet.Header.Value == 104 {
 		a.ShowWindow()
 		stopUnderfundedTradeMonitor()
+		lastTradeCoverageNotice = ""
+		lastTradeBlockNotice = ""
+
+		if !dealerReadyForNewTrade() {
+			reason := "dealer not open"
+			if dealerGameActive() {
+				reason = "dealer busy in active game"
+			} else if !awaitingTradeOpen {
+				reason = "dealer not accepting trades"
+			} else if !dealerTradeWindowOpen {
+				reason = "dealer open announcement not active"
+			}
+
+			a.AddLogMsg(fmt.Sprintf("[TRADE_GUARD] blocking incoming trade open: %s", reason))
+			log.Printf("[TRADE_GUARD] blocking incoming trade open: %s", reason)
+			suppressNextTradeCloseAnnouncement = true
+			e.Block()
+			ext.Send(out.TRADE_CLOSE)
+			return
+		}
+
 		awaitingGameChoice = false
 		awaitingGameChoicePartnerID = 0
 		pokerSequenceStage = 0
 		pokerSequencePlayerName = ""
-		lastTradeCoverageNotice = ""
-		lastTradeBlockNotice = ""
-		if !awaitingTradeOpen {
-			return
-		}
 		stopDealerOpenHeartbeat()
 
 		resetTradeAutoFlow()
@@ -467,6 +511,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			log.Printf("[TRADE_OPEN #%d] unresolved reopen target: waiting for room-user mapping", tradeOpenCount)
 		}
 		awaitingTradeOpen = false
+		dealerTradeWindowOpen = false
 		log.Printf("[TRADE_OPEN #%d] %s", tradeOpenCount, lastTradeOpen)
 		a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #%d] %s", tradeOpenCount, lastTradeOpen))
 
@@ -493,12 +538,18 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			partnerName = "Unknown"
 		}
 
-		if !tradeCompleted && !tradeCloseAnnounced {
+		suppressCloseAnnouncement := suppressNextTradeCloseAnnouncement
+		suppressNextTradeCloseAnnouncement = false
+
+		if !tradeCompleted && !tradeCloseAnnounced && !suppressCloseAnnouncement {
 			closeMsg := fmt.Sprintf("Trade Closed: \"%s\"", partnerName)
 			a.AddLogMsg(fmt.Sprintf("[TRADE_CLOSE] shouting: %q", closeMsg))
 			log.Printf("[TRADE_CLOSE] shouting: %q", closeMsg)
 			ext.Send(out.SHOUT, closeMsg)
 			tradeCloseAnnounced = true
+		} else if suppressCloseAnnouncement {
+			a.AddLogMsg("[TRADE_GUARD] suppressed trade closed announcement for forced guard-close")
+			log.Printf("[TRADE_GUARD] suppressed trade closed announcement for forced guard-close")
 		}
 
 		tradeClosePayload := strings.TrimSpace(string(e.Packet.Data))
@@ -520,7 +571,13 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			awaitingTradeOpen = true
 			a.AddLogMsg("[TRADE_REOPEN] trade closed before completion, restarting dealer cycle")
 			log.Printf("[TRADE_REOPEN] trade closed before completion, restarting dealer cycle")
-			go sendMessageWithDelay(a.dealerOpenMessage())
+			if canAnnounceDealerOpen() {
+				dealerTradeWindowOpen = true
+				go sendMessageWithDelay(a.dealerOpenMessage())
+			} else {
+				dealerTradeWindowOpen = false
+				log.Printf("User is muted. Dealer open announcement skipped; incoming trades will be blocked.")
+			}
 			startDealerOpenHeartbeat(a)
 		}
 
@@ -614,14 +671,20 @@ func startDealerOpenHeartbeat(a *App) {
 				return
 			}
 
-			if !awaitingTradeOpen {
+			if !awaitingTradeOpen || !dealerTradeWindowOpen {
 				dealerOpenHeartbeatActive = false
 				return
 			}
 
 			a.AddLogMsg("[TRADE_REOPEN] no new trade yet, re-announcing dealer open")
 			log.Printf("[TRADE_REOPEN] no new trade yet, re-announcing dealer open")
-			sendMessageWithDelay(a.dealerOpenMessage())
+			if canAnnounceDealerOpen() {
+				sendMessageWithDelay(a.dealerOpenMessage())
+			} else {
+				dealerTradeWindowOpen = false
+				dealerOpenHeartbeatActive = false
+				return
+			}
 		}
 	}(heartbeatID)
 }
@@ -737,11 +800,13 @@ func handleTradeConfirmTimeout(a *App) {
 	ext.Send(out.TRADE_CLOSE)
 
 	closeMsg := fmt.Sprintf("Trade Closed: \"%s\"", partnerName)
-	if !isMuted {
+	if canAnnounceDealerOpen() {
 		tradeCloseAnnounced = true
 		sendMessageWithDelay(closeMsg)
 		sendMessageWithDelay(a.dealerOpenMessage())
+		dealerTradeWindowOpen = true
 	} else {
+		dealerTradeWindowOpen = false
 		a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] user muted; skipped timeout close announcement")
 		log.Printf("[TRADE_CONFIRM_ACCEPT] user muted; skipped timeout close announcement")
 	}
@@ -2070,6 +2135,7 @@ func resetDiceState() {
 	resultsWaitGroup.Wait() // Ensure all dice roll results are processed
 	diceList = []*Dice{}
 	awaitingTradeOpen = false
+	dealerTradeWindowOpen = false
 	resetPokerSequence()
 	fakeDiceTestingMode = false
 	isPokerRolling, isTriRolling, isBJRolling, is13Rolling, isHitting, is13Hitting, isClosing = false, false, false, false, false, false, false
@@ -2092,6 +2158,13 @@ func (a *App) SkipDiceSetupForTesting() {
 	}
 	fakeDiceTestingMode = true
 	awaitingTradeOpen = true
+	if canAnnounceDealerOpenLocked() {
+		dealerTradeWindowOpen = true
+		go sendMessageWithDelay(a.dealerOpenMessage())
+	} else {
+		dealerTradeWindowOpen = false
+		log.Printf("User is muted. Dealer open announcement skipped; incoming trades will be blocked.")
+	}
 	a.AddLogMsg("Dice setup bypass enabled for testing. Using 5 fake dice values.")
 }
 
@@ -2132,9 +2205,11 @@ func (a *App) handleThrowDice(e *g.Intercept) {
 			a.AddLogMsg(message)
 			go requestRoomUsers(a)
 			awaitingTradeOpen = true
-			if !isMuted {
+			if canAnnounceDealerOpenLocked() {
+				dealerTradeWindowOpen = true
 				go sendMessageWithDelay(a.dealerOpenMessage())
 			} else {
+				dealerTradeWindowOpen = false
 				log.Printf("User is muted. Skipping dealer open prompt message.")
 			}
 		}

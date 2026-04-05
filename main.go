@@ -21,7 +21,6 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 	g "xabbo.b7c.io/goearth"
 	gencoding "xabbo.b7c.io/goearth/encoding"
-	"xabbo.b7c.io/goearth/shockwave/inventory"
 	"xabbo.b7c.io/goearth/shockwave/in"
 	"xabbo.b7c.io/goearth/shockwave/out"
 	room "xabbo.b7c.io/goearth/shockwave/room"
@@ -92,14 +91,8 @@ var (
 	stripScanActive   bool
 	stripScanSessionID = 0
 	stripScanPageCount = 0
-	stripScanLoopStreak = 0
-	stripScanSeenPageFingerprints = map[string]struct{}{}
 	stripScanSeenItemIDs = map[int]struct{}{}
 	stripScanCounts      = map[string]int{}
-	stripScanRawByName   = map[string]string{}
-	stripScanFallbackCounts = map[string]int{}
-	stripScanFallbackRawByName = map[string]string{}
-	stripScanRepeatRetryLimit = 8
 	knownDiceIDs     = map[int]struct{}{}
 	fakeDiceTestingMode bool
 	dealerOpenHeartbeatID int
@@ -1080,12 +1073,8 @@ func (a *App) requestPlayerStrip() {
 	sessionID := stripScanSessionID
 	stripScanActive = true
 	stripScanPageCount = 0
-	stripScanSeenPageFingerprints = map[string]struct{}{}
 	stripScanSeenItemIDs = map[int]struct{}{}
 	stripScanCounts = map[string]int{}
-	stripScanRawByName = map[string]string{}
-	stripScanFallbackCounts = map[string]int{}
-	stripScanFallbackRawByName = map[string]string{}
 	stripScanMu.Unlock()
 	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] start scan session=%d", sessionID))
 	log.Printf("[STRIP_DEBUG] start scan session=%d", sessionID)
@@ -1104,21 +1093,14 @@ func handleStripPacket(a *App, e *g.Intercept) {
 
 	rawData := append([]byte(nil), e.Packet.Data...)
 
-	var inv inventory.Inventory
-	e.Packet.Read(&inv)
-
 	stripScanMu.Lock()
 	active := stripScanActive
 	if !active {
 		stripScanActive = true
 		stripScanSessionID++
 		stripScanPageCount = 0
-		stripScanSeenPageFingerprints = map[string]struct{}{}
 		stripScanSeenItemIDs = map[int]struct{}{}
 		stripScanCounts = map[string]int{}
-		stripScanRawByName = map[string]string{}
-		stripScanFallbackCounts = map[string]int{}
-		stripScanFallbackRawByName = map[string]string{}
 		active = true
 		a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] packet-triggered scan init session=%d", stripScanSessionID))
 		log.Printf("[STRIP_DEBUG] packet-triggered scan init session=%d", stripScanSessionID)
@@ -1126,21 +1108,27 @@ func handleStripPacket(a *App, e *g.Intercept) {
 	scanID := stripScanSessionID
 	stripScanPageCount++
 	currentPage := stripScanPageCount
-	pageFingerprint := fingerprintStripPage(inv.Items)
+
+	firstMainID, pageRecords, classQtys := parseStripInfoPageRaw(rawData)
+
 	pageRepeated := false
-	if _, seen := stripScanSeenPageFingerprints[pageFingerprint]; seen {
+	if firstMainID != 0 {
+		if _, seen := stripScanSeenItemIDs[firstMainID]; seen {
 		pageRepeated = true
 	} else {
-		stripScanSeenPageFingerprints[pageFingerprint] = struct{}{}
+			stripScanSeenItemIDs[firstMainID] = struct{}{}
+		}
 	}
-	wrapped := accumulateStripScan(inv.Items)
+
 	if !pageRepeated {
-		accumulateRawStripItems(parseStripItemsPacketRaw(rawData))
+		for className, qty := range classQtys {
+			stripScanCounts[className] += qty
+		}
 	}
-	pageCount := len(inv.Items)
+
 	pageLimitReached := stripScanPageCount >= 25
-	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] session=%d page=%d items=%d wrapped=%t repeated=%t pageLimit=%t", scanID, currentPage, pageCount, wrapped, pageRepeated, pageLimitReached))
-	log.Printf("[STRIP_DEBUG] session=%d page=%d items=%d wrapped=%t repeated=%t pageLimit=%t", scanID, currentPage, pageCount, wrapped, pageRepeated, pageLimitReached)
+	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] session=%d page=%d items=%d repeated=%t pageLimit=%t", scanID, currentPage, pageRecords, pageRepeated, pageLimitReached))
+	log.Printf("[STRIP_DEBUG] session=%d page=%d items=%d repeated=%t pageLimit=%t", scanID, currentPage, pageRecords, pageRepeated, pageLimitReached)
 
 	stripScanMu.Unlock()
 
@@ -1160,8 +1148,8 @@ func handleStripPacket(a *App, e *g.Intercept) {
 		sendGetStripRaw(a, stripGetNextPayload)
 	}()
 
-	a.AddLogMsg(fmt.Sprintf("[STRIP] continuing scan: page %d had %d item(s), requesting next after %s", currentPage, pageCount, stripNextDelay))
-	log.Printf("[STRIP] continuing scan: page %d had %d item(s), requesting next after %s", currentPage, pageCount, stripNextDelay)
+	a.AddLogMsg(fmt.Sprintf("[STRIP] continuing scan: page %d had %d item(s), requesting next after %s", currentPage, pageRecords, stripNextDelay))
+	log.Printf("[STRIP] continuing scan: page %d had %d item(s), requesting next after %s", currentPage, pageRecords, stripNextDelay)
 	return
 }
 
@@ -1175,21 +1163,11 @@ func (a *App) finalizeStripScan(sessionID int, reason string) {
 	}
 
 	items := buildStripScanItems()
-	fallbackItems := buildStripFallbackItems()
 	pagesScanned := stripScanPageCount
 	stripScanActive = false
 	stripScanMu.Unlock()
 	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] finalize session=%d reason=%s pages=%d", sessionID, reason, pagesScanned))
 	log.Printf("[STRIP_DEBUG] finalize session=%d reason=%s pages=%d", sessionID, reason, pagesScanned)
-
-	if len(items) == 0 && len(fallbackItems) > 0 {
-		items = fallbackItems
-		a.AddLogMsg("[STRIP] scan decode had no matches; accumulated raw fallback recovered hand items")
-		log.Printf("[STRIP] scan decode had no matches; accumulated raw fallback recovered hand items")
-	} else if len(items) > 0 && len(fallbackItems) > 0 && hasSuspiciousStripItems(items) {
-		items = fallbackItems
-		a.AddLogMsg("[STRIP] structured decode looked noisy; switched to accumulated raw fallback items")
-	}
 
 	handItemsMu.Lock()
 	currentHandItems = items
@@ -1220,68 +1198,6 @@ func sendGetStripRaw(a *App, payload string) {
 	log.Printf("[STRIP_DEBUG] raw GETSTRIP send payload=%q", trimmed)
 }
 
-func fingerprintStripPage(invItems []inventory.Item) string {
-	if len(invItems) == 0 {
-		return "empty"
-	}
-
-	parts := make([]string, 0, len(invItems))
-	for _, invItem := range invItems {
-		parts = append(parts, fmt.Sprintf("%d:%s", invItem.ItemId, strings.TrimSpace(strings.ToLower(invItem.Class))))
-	}
-	return strings.Join(parts, "|")
-}
-
-func accumulateStripScan(invItems []inventory.Item) (wrapped bool) {
-	if len(invItems) == 0 {
-		return false
-	}
-
-	// A real wrap means the next page starts at an item id we've already scanned.
-	firstID := invItems[0].ItemId
-	if _, exists := stripScanSeenItemIDs[firstID]; exists {
-		wrapped = true
-	}
-
-	pageSeenIDs := map[int]struct{}{}
-	for _, invItem := range invItems {
-		// Ignore duplicate ids inside the same page; they should not end the scan.
-		if _, exists := pageSeenIDs[invItem.ItemId]; exists {
-			continue
-		}
-		pageSeenIDs[invItem.ItemId] = struct{}{}
-		stripScanSeenItemIDs[invItem.ItemId] = struct{}{}
-
-		if strings.TrimSpace(invItem.Class) == "" {
-			continue
-		}
-
-		itemName, qty, ok := normalizeCatalogClassWithQuantity(invItem.Class)
-		if !ok {
-			continue
-		}
-
-		stripScanCounts[itemName] += qty
-		if _, exists := stripScanRawByName[itemName]; !exists {
-			stripScanRawByName[itemName] = invItem.String()
-		}
-	}
-
-	return wrapped
-}
-
-func accumulateRawStripItems(items []TradeItem) {
-	for _, item := range items {
-		if item.Quantity <= 0 || strings.TrimSpace(item.Name) == "" {
-			continue
-		}
-		stripScanFallbackCounts[item.Name] += item.Quantity
-		if _, exists := stripScanFallbackRawByName[item.Name]; !exists {
-			stripScanFallbackRawByName[item.Name] = item.RawData
-		}
-	}
-}
-
 func buildStripScanItems() []TradeItem {
 	if len(stripScanCounts) == 0 {
 		return []TradeItem{}
@@ -1298,82 +1214,6 @@ func buildStripScanItems() []TradeItem {
 		items = append(items, TradeItem{
 			Name:     name,
 			Quantity: stripScanCounts[name],
-			RawData:  stripScanRawByName[name],
-		})
-	}
-
-	return items
-}
-
-func buildStripFallbackItems() []TradeItem {
-	if len(stripScanFallbackCounts) == 0 {
-		return []TradeItem{}
-	}
-
-	names := make([]string, 0, len(stripScanFallbackCounts))
-	for name := range stripScanFallbackCounts {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	items := make([]TradeItem, 0, len(names))
-	for _, name := range names {
-		items = append(items, TradeItem{
-			Name:     name,
-			Quantity: stripScanFallbackCounts[name],
-			RawData:  stripScanFallbackRawByName[name],
-		})
-	}
-
-	return items
-}
-
-// parseStripItemsPacketRaw is a fallback parser for STRIPINFO_2 payloads that extracts
-// class names from raw fields and counts occurrences.
-func parseStripItemsPacketRaw(data []byte) []TradeItem {
-	counts := map[string]int{}
-	rawByName := map[string]string{}
-
-	fields := bytes.Split(data, []byte{0x02})
-	for i, field := range fields {
-		if len(field) == 0 {
-			continue
-		}
-
-		fieldStr := string(field)
-		itemName, qty, ok := extractStripItemAndQuantity(fieldStr)
-		if !ok {
-			continue
-		}
-
-		if qty <= 1 && i > 0 {
-			if inferred, ok := inferStackCountFromMetaField(string(fields[i-1])); ok {
-				qty = inferred
-			}
-		}
-
-		counts[itemName] += qty
-		if _, exists := rawByName[itemName]; !exists {
-			rawByName[itemName] = fieldStr
-		}
-	}
-
-	if len(counts) == 0 {
-		return []TradeItem{}
-	}
-
-	names := make([]string, 0, len(counts))
-	for name := range counts {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	items := make([]TradeItem, 0, len(names))
-	for _, name := range names {
-		items = append(items, TradeItem{
-			Name:     name,
-			Quantity: counts[name],
-			RawData:  rawByName[name],
 		})
 	}
 
@@ -1381,6 +1221,139 @@ func parseStripItemsPacketRaw(data []byte) []TradeItem {
 }
 
 // diffItems returns the items in `all` that exceed the quantities in `subtract`.
+
+// parseStripInfoPageRaw decodes a STRIPINFO_2 packet body (e.Packet.Data) using
+// the real Shockwave grouped format.
+// Each record groups all physical items of the same class:
+//   Field 1 (until \x02): [mainItemId VL64][extraCount VL64]([extraItemId VL64]×N)[Pos VL64][S|I]
+//   Field 2 (until \x02): [templateId VL64][VL64][VL64][className string]
+//   Field 3 (until \x02): for "S": [DimX VL64][DimY VL64][Colors string]
+//                          for "I": [Props string]
+// Quantity per record = 1 + extraCount.
+// Returns: firstMainID (for wrap detection), record count, className→quantity map.
+func parseStripInfoPageRaw(data []byte) (firstMainID int, pageRecords int, classQtys map[string]int) {
+	classQtys = map[string]int{}
+	pos := 0
+
+	readVL64 := func() (int, bool) {
+		if pos >= len(data) {
+			return 0, false
+		}
+		n := gencoding.VL64DecodeLen(data[pos])
+		if n <= 0 || pos+n > len(data) {
+			return 0, false
+		}
+		v := gencoding.VL64Decode(data[pos : pos+n])
+		pos += n
+		return v, true
+	}
+
+	skipUntilDelim := func() {
+		for pos < len(data) && data[pos] != 0x02 {
+			pos++
+		}
+		if pos < len(data) {
+			pos++ // skip \x02
+		}
+	}
+
+	// record count
+	count, ok := readVL64()
+	if !ok {
+		return
+	}
+	pageRecords = count
+
+	for i := 0; i < count; i++ {
+		if pos >= len(data) {
+			break
+		}
+
+		// --- Field 1 ---
+		mainID, ok := readVL64()
+		if !ok {
+			break
+		}
+		if i == 0 {
+			firstMainID = mainID
+		}
+
+		extraCount, ok := readVL64()
+		if !ok {
+			break
+		}
+		for j := 0; j < extraCount; j++ {
+			if _, ok := readVL64(); !ok {
+				break
+			}
+		}
+
+		if _, ok := readVL64(); !ok { // Pos
+			break
+		}
+
+		if pos >= len(data) {
+			break
+		}
+		typeChar := data[pos]
+		pos++
+		skipUntilDelim() // eat remainder of field 1
+
+		// --- Field 2 ---
+		if _, ok := readVL64(); !ok { // templateId
+			break
+		}
+		if _, ok := readVL64(); !ok { // extra field 0
+			break
+		}
+		if _, ok := readVL64(); !ok { // extra field 1
+			break
+		}
+
+		classStart := pos
+		for pos < len(data) && data[pos] != 0x02 {
+			pos++
+		}
+		classRaw := strings.ToLower(string(data[classStart:pos]))
+		if pos < len(data) {
+			pos++ // skip \x02
+		}
+
+		if star := strings.LastIndex(classRaw, "*"); star > 0 {
+			classRaw = classRaw[:star]
+		}
+
+		// --- Field 3 ---
+		switch typeChar {
+		case 'S':
+			readVL64() // DimX
+			readVL64() // DimY
+			skipUntilDelim() // Colors
+		case 'I':
+			skipUntilDelim() // Props
+		default:
+			skipUntilDelim()
+		}
+
+		// validate class name
+		if classRaw == "" || classRaw == "null" {
+			continue
+		}
+		valid := true
+		for _, r := range classRaw {
+			if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_') {
+				valid = false
+				break
+			}
+		}
+		if !valid {
+			continue
+		}
+
+		classQtys[classRaw] += 1 + extraCount
+	}
+	return
+}
 // Used to compute one trader's items from the combined TRADE_ITEMS packet.
 func diffItems(all []TradeItem, subtract []TradeItem) []TradeItem {
 	subtractQty := make(map[string]int, len(subtract))
@@ -1652,22 +1625,6 @@ func formatTradeItemName(name string) string {
 		parts[i] = strings.ToUpper(part[:1]) + part[1:]
 	}
 	return strings.Join(parts, " ")
-}
-
-func hasSuspiciousStripItems(items []TradeItem) bool {
-	if len(items) == 0 {
-		return false
-	}
-
-	suspicious := 0
-	for _, item := range items {
-		name := strings.TrimSpace(strings.ToLower(item.Name))
-		if name == "" || name == "inull" || strings.HasPrefix(name, "hh") || strings.HasPrefix(name, "hi") {
-			suspicious++
-		}
-	}
-
-	return suspicious*2 >= len(items)
 }
 
 type user28Entry struct {

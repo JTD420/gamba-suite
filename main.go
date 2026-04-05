@@ -112,6 +112,9 @@ var (
 	fakeDiceTestingMode bool
 	dealerOpenHeartbeatID int
 	dealerOpenHeartbeatActive bool
+	lastOutgoingTradeOpenID int
+	lastOutgoingTradeOpenAt time.Time
+	tradeOpenStateMu sync.Mutex
 )
 
 type TradeItem struct {
@@ -367,6 +370,18 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		}
 	}
 
+	// TRADE_OPEN outgoing 71 - remember recent target so matching incoming 104 isn't blocked by dealer guard.
+	if e.Packet.Header.Dir == g.Out && e.Packet.Header.Value == 71 {
+		if targetID, ok := decodeLeadingVL64(e.Packet.Data); ok {
+			rememberOutgoingTradeOpenTarget(targetID)
+			a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #71] remembered outgoing target id %d", targetID))
+			log.Printf("[TRADE_OPEN #71] remembered outgoing target id %d", targetID)
+		} else {
+			a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #71] outgoing payload decode failed: %q", string(e.Packet.Data)))
+			log.Printf("[TRADE_OPEN #71] outgoing payload decode failed: %q", string(e.Packet.Data))
+		}
+	}
+
 	// TRADE_ADDITEM outgoing 72 - we are adding an item; flag next TRADE_ITEMS as ours
 	if e.Packet.Header.Dir == g.Out && e.Packet.Header.Value == 72 {
 		addItemMu.Lock()
@@ -450,6 +465,12 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		lastTradeCoverageNotice = ""
 		lastTradeBlockNotice = ""
 
+		incomingTraderID := 0
+		if id, ok := decodeLeadingVL64(e.Packet.Data); ok {
+			incomingTraderID = id
+		}
+		recentTargetID, matchedRecentOutgoing := matchesRecentOutgoingTradeOpen(e.Packet.Data, incomingTraderID)
+
 		// During payout mode, someone else opened a trade with us — close it and let the payout loop retry
 		isPayoutTradeOpen := false
 		if pokerPayoutMode {
@@ -477,7 +498,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			}
 		}
 
-		if !isPayoutTradeOpen && !dealerReadyForNewTrade() {
+		if !isPayoutTradeOpen && !dealerReadyForNewTrade() && !matchedRecentOutgoing {
 			reason := "dealer not open"
 			if dealerGameActive() {
 				reason = "dealer busy in active game"
@@ -493,6 +514,11 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			e.Block()
 			ext.Send(out.TRADE_CLOSE)
 			return
+		}
+
+		if matchedRecentOutgoing {
+			a.AddLogMsg(fmt.Sprintf("[TRADE_GUARD] allowing incoming trade open because it matches recent outgoing target %d", recentTargetID))
+			log.Printf("[TRADE_GUARD] allowing incoming trade open because it matches recent outgoing target %d", recentTargetID)
 		}
 
 		awaitingGameChoice = false
@@ -744,7 +770,17 @@ func startPokerPayout(a *App, targetID int, targetName string) {
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT] opening trade with %s (%d), attempt %d/5", targetName, targetID, attempt))
 			log.Printf("[PAYOUT] opening trade with %s (%d), attempt %d/5", targetName, targetID, attempt)
 			pokerPayoutTradeSent = true
+			rememberOutgoingTradeOpenTarget(targetID)
+			outPreview := string(ext.NewPacket(out.TRADE_OPEN, targetID).Data)
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT] outgoing[71] payload=%q", outPreview))
+			log.Printf("[PAYOUT] outgoing[71] payload=%q", outPreview)
 			ext.Send(out.TRADE_OPEN, targetID)
+
+			// Fallback: send the raw VL64 payload form as well. Some sessions are picky about payload composition.
+			rawPayload := encodeVL64(targetID)
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT] outgoing[71] raw payload fallback=%q", rawPayload))
+			log.Printf("[PAYOUT] outgoing[71] raw payload fallback=%q", rawPayload)
+			ext.Send(g.Out.Id("TRADE_OPEN"), []byte(rawPayload))
 
 			if attempt > 1 {
 				msg := fmt.Sprintf("Tried to open trade %d times", attempt)
@@ -1366,6 +1402,7 @@ func (a *App) OpenLastTrade() {
 	}
 
 	ext.Send(out.TRADE_OPEN, lastTradePartnerID)
+	rememberOutgoingTradeOpenTarget(lastTradePartnerID)
 	outPreview := string(ext.NewPacket(out.TRADE_OPEN, lastTradePartnerID).Data)
 	a.AddLogMsg(fmt.Sprintf("Open Last Trade sent -> %s (%d), Outgoing[71] %q", lastTradePartnerName, lastTradePartnerID, outPreview))
 }
@@ -2103,6 +2140,20 @@ func extractUsers28Entries(raw string) []user28Entry {
 			continue
 		}
 
+		nextFieldStart := nameEnd + 1
+		nextFieldEnd := nextFieldStart
+		for nextFieldEnd < len(b) && b[nextFieldEnd] != 0x02 {
+			nextFieldEnd++
+		}
+		if nextFieldEnd <= nextFieldStart {
+			continue
+		}
+
+		figureField := string(b[nextFieldStart:nextFieldEnd])
+		if !isLikelyFigureField(figureField) {
+			continue
+		}
+
 		name := strings.TrimSpace(string(b[nameStart:nameEnd]))
 		if name == "" {
 			continue
@@ -2185,6 +2236,23 @@ func parseUsers28Head(part string) (name string, token string, roomIndex int, ok
 
 func isLikelyNameChar(b byte) bool {
 	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_' || b == '-'
+}
+
+func isLikelyFigureField(field string) bool {
+	f := strings.ToLower(strings.TrimSpace(field))
+	if len(f) < 12 {
+		return false
+	}
+
+	if !(strings.HasPrefix(f, "hr-") || strings.HasPrefix(f, "hd-")) {
+		return false
+	}
+
+	if !strings.Contains(f, "hd-") || !strings.Contains(f, "ch-") || !strings.Contains(f, "lg-") || !strings.Contains(f, "sh-") {
+		return false
+	}
+
+	return true
 }
 
 func isLikelyToken(s string) bool {
@@ -2404,6 +2472,74 @@ func encodeB64(value int, length int) string {
 	buf := make([]byte, length)
 	gencoding.B64Encode(buf, value)
 	return string(buf)
+}
+
+func decodeLeadingVL64(data []byte) (int, bool) {
+	if len(data) == 0 {
+		return 0, false
+	}
+	vlen := gencoding.VL64DecodeLen(data[0])
+	if vlen <= 0 || vlen > 6 || vlen > len(data) {
+		return 0, false
+	}
+	v := gencoding.VL64Decode(data[:vlen])
+	if v <= 0 {
+		return 0, false
+	}
+	return v, true
+}
+
+func packetContainsVL64Value(data []byte, value int) bool {
+	if value <= 0 || len(data) == 0 {
+		return false
+	}
+
+	for i := 0; i < len(data); i++ {
+		vlen := gencoding.VL64DecodeLen(data[i])
+		if vlen <= 0 || vlen > 6 || i+vlen > len(data) {
+			continue
+		}
+		if gencoding.VL64Decode(data[i:i+vlen]) == value {
+			return true
+		}
+	}
+
+	return false
+}
+
+func rememberOutgoingTradeOpenTarget(targetID int) {
+	if targetID <= 0 {
+		return
+	}
+	tradeOpenStateMu.Lock()
+	lastOutgoingTradeOpenID = targetID
+	lastOutgoingTradeOpenAt = time.Now()
+	tradeOpenStateMu.Unlock()
+}
+
+func matchesRecentOutgoingTradeOpen(data []byte, leadingIncomingID int) (int, bool) {
+	tradeOpenStateMu.Lock()
+	targetID := lastOutgoingTradeOpenID
+	at := lastOutgoingTradeOpenAt
+	tradeOpenStateMu.Unlock()
+
+	if targetID <= 0 {
+		return 0, false
+	}
+
+	if time.Since(at) > 8*time.Second {
+		return targetID, false
+	}
+
+	if leadingIncomingID > 0 && leadingIncomingID == targetID {
+		return targetID, true
+	}
+
+	if packetContainsVL64Value(data, targetID) {
+		return targetID, true
+	}
+
+	return targetID, false
 }
 
 func tryReadInt(pkt *g.Packet) (value int, pos int, ok bool) {

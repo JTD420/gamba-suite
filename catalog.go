@@ -91,3 +91,17 @@ func (a *App) GetCatalogItemValue(name string) (int, bool) {
 	}
 	return 0, false
 }
+
+// GetCatalogNameSet returns a lowercase set of catalog item names for fast membership checks.
+func (a *App) GetCatalogNameSet() map[string]struct{} {
+	items := a.LoadCatalog()
+	set := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		name := strings.TrimSpace(strings.ToLower(item.Name))
+		if name == "" {
+			continue
+		}
+		set[name] = struct{}{}
+	}
+	return set
+}

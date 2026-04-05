@@ -10,6 +10,8 @@ export function ClearTradeItems():Promise<void>;
 
 export function GetCatalogItemValue(arg1:string):Promise<number|boolean>;
 
+export function GetCatalogNameSet():Promise<Record<string, any>>;
+
 export function GetCurrentTradeItems():Promise<Array<main.TradeItem>>;
 
 export function GetCurrentVersion():Promise<string>;

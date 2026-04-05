@@ -4,7 +4,7 @@
     <!-- Tab bar -->
     <div class="tab-bar">
       <button
-        v-for="tab in ['Config', 'Catalog', 'Logs']"
+        v-for="tab in ['Config', 'Catalog', 'Trade/Bet', 'Logs']"
         :key="tab"
         :class="['tab-btn', { active: activeTab === tab }]"
         @click="activeTab = tab"
@@ -59,6 +59,67 @@
       <button @click="saveCatalog" class="save-button">Save Catalog</button>
     </div>
 
+    <!-- Trade/Bet tab -->
+    <div v-if="activeTab === 'Trade/Bet'">
+
+      <!-- Your Hand -->
+      <h2 class="section-title">Your Hand</h2>
+      <div v-if="handItems.length === 0" class="trade-empty">
+        No hand data yet.
+        <span style="font-size:12px;color:#666;">Refreshes every 30s and when a trade opens.</span>
+      </div>
+      <table v-else class="catalog-table">
+        <thead><tr><th>Item</th><th>Qty</th><th>Unit Value</th><th>Line Total</th></tr></thead>
+        <tbody>
+          <tr v-for="(item, index) in handItemsWithValues" :key="`hand-${index}`">
+            <td><span class="catalog-label">{{ item.displayName }}</span></td>
+            <td><span class="catalog-label">{{ item.Quantity }}</span></td>
+            <td><span class="catalog-label" :class="{ 'unlisted-value': item.unitValue === null }">{{ item.unitValue !== null ? item.unitValue : '?' }}</span></td>
+            <td><span class="catalog-label" :class="{ 'unlisted-value': item.lineTotal === null }">{{ item.lineTotal !== null ? item.lineTotal : '?' }}</span></td>
+          </tr>
+        </tbody>
+        <tfoot>
+          <tr>
+            <td colspan="3" class="trade-total-label">Hand Total</td>
+            <td class="trade-total-value">{{ handTotal }}</td>
+          </tr>
+        </tfoot>
+      </table>
+      <p class="trade-hint" v-if="handItems.some(i => !catalog.find(c => c.name === i.Name))">
+        Items marked <span class="unlisted-value">?</span> are not in the catalog.
+      </p>
+
+      <hr class="trade-divider" />
+
+      <!-- Partner's Offer -->
+      <h2 class="section-title">Partner's Offer</h2>
+      <div v-if="tradeItems.length === 0" class="trade-empty">
+        No active trade items detected.<br />
+        <span style="font-size:12px;color:#666">Items appear here when the partner places furniture in the trade.</span>
+      </div>
+      <table v-else class="catalog-table">
+        <thead><tr><th>Item</th><th>Qty</th><th>Unit Value</th><th>Line Total</th></tr></thead>
+        <tbody>
+          <tr v-for="(item, index) in tradeItemsWithValues" :key="`trade-${index}`">
+            <td><span class="catalog-label">{{ item.displayName }}</span></td>
+            <td><span class="catalog-label">{{ item.Quantity }}</span></td>
+            <td><span class="catalog-label" :class="{ 'unlisted-value': item.unitValue === null }">{{ item.unitValue !== null ? item.unitValue : '?' }}</span></td>
+            <td><span class="catalog-label" :class="{ 'unlisted-value': item.lineTotal === null }">{{ item.lineTotal !== null ? item.lineTotal : '?' }}</span></td>
+          </tr>
+        </tbody>
+        <tfoot>
+          <tr>
+            <td colspan="3" class="trade-total-label">Offer Total</td>
+            <td class="trade-total-value">{{ tradeTotal }}</td>
+          </tr>
+        </tfoot>
+      </table>
+      <p class="trade-hint" v-if="tradeItems.some(i => !catalog.find(c => c.name === i.Name))">
+        Items marked <span class="unlisted-value">?</span> are not in the catalog &mdash; set their value there first.
+      </p>
+
+    </div>
+
     <!-- Logs tab -->
     <div v-if="activeTab === 'Logs'">
       <div class="log-grid">
@@ -97,6 +158,8 @@ export default {
         nothing: '',
       },
       catalog: [],
+      tradeItems: [],
+      handItems: [],
       log: [],
       chatLog: [],
       isOutdated: false,
@@ -104,6 +167,36 @@ export default {
       lastTradePartnerName: 'None',
       tradeNamePollTimer: null,
     };
+  },
+  computed: {
+    tradeItemsWithValues() {
+      return this.tradeItems.map(item => {
+        const entry = this.catalog.find(c => c.name === item.Name);
+        const unitValue = entry ? entry.value : null;
+        const lineTotal = unitValue !== null ? unitValue * item.Quantity : null;
+        const displayName = entry ? entry.display_name : item.Name;
+        return { ...item, displayName, unitValue, lineTotal };
+      });
+    },
+    tradeTotal() {
+      return this.tradeItemsWithValues
+        .filter(i => i.lineTotal !== null)
+        .reduce((sum, i) => sum + i.lineTotal, 0);
+    },
+    handItemsWithValues() {
+      return this.handItems.map(item => {
+        const entry = this.catalog.find(c => c.name === item.Name);
+        const unitValue = entry ? entry.value : null;
+        const lineTotal = unitValue !== null ? unitValue * item.Quantity : null;
+        const displayName = entry ? entry.display_name : item.Name;
+        return { ...item, displayName, unitValue, lineTotal };
+      });
+    },
+    handTotal() {
+      return this.handItemsWithValues
+        .filter(i => i.lineTotal !== null)
+        .reduce((sum, i) => sum + i.lineTotal, 0);
+    },
   },
   methods: {
      async handleShowCommands() {
@@ -238,6 +331,22 @@ export default {
     window.runtime.EventsOn("chatLogUpdate", (message) => {
       this.chatLog = message.split('\n');
       this.scrollBox('chatlogbox');
+    });
+
+    window.runtime.EventsOn("tradeItemsUpdate", (jsonStr) => {
+      try {
+        this.tradeItems = JSON.parse(jsonStr) || [];
+      } catch (_) {
+        this.tradeItems = [];
+      }
+    });
+
+    window.runtime.EventsOn("handItemsUpdate", (jsonStr) => {
+      try {
+        this.handItems = JSON.parse(jsonStr) || [];
+      } catch (_) {
+        this.handItems = [];
+      }
     });
 
     this.tradeNamePollTimer = setInterval(() => {
@@ -420,5 +529,43 @@ input[type="text"]::placeholder {
   padding: 5px 6px;
   color: #aaa;
   font-size: 13px;
+}
+
+.trade-divider {
+  border: none;
+  border-top: 1px solid #333;
+  margin: 18px 0;
+}
+
+.trade-empty {
+  text-align: center;
+  color: #888;
+  padding: 24px 12px;
+  font-size: 14px;
+  line-height: 1.8;
+}
+.trade-total-label {
+  text-align: right;
+  padding: 8px 8px;
+  color: #e0e0e0;
+  font-weight: bold;
+  font-size: 14px;
+  border-top: 1px solid #444;
+}
+.trade-total-value {
+  padding: 8px 8px;
+  color: #ffd700;
+  font-weight: bold;
+  font-size: 14px;
+  border-top: 1px solid #444;
+}
+.unlisted-value {
+  color: #ff8888;
+}
+.trade-hint {
+  font-size: 12px;
+  color: #888;
+  margin-top: 10px;
+  text-align: center;
 }
 </style>

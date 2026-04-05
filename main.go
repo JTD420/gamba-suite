@@ -60,6 +60,7 @@ var (
 	resultsWaitGroup sync.WaitGroup
 	rollDelay        = 550 * time.Millisecond
 	tradeUserPattern = regexp.MustCompile(`\[(\d+)\]`)
+	stripItemNameRe   = regexp.MustCompile(`(?:CF_\d+_[a-z][a-z_]*|[a-z][a-z0-9_]*_[a-z0-9_]+)(?:\*\d+)?`)
 	roomEntities     = map[int]room.Entity{}
 	roomMu           sync.Mutex
 	users28ByToken   = map[string]string{}
@@ -69,6 +70,8 @@ var (
 	headerSniffMu    sync.Mutex
 	currentTradeItems []TradeItem
 	tradeItemsMu     sync.Mutex
+	currentHandItems  []TradeItem
+	handItemsMu       sync.Mutex
 	knownDiceIDs     = map[int]struct{}{}
 	fakeDiceTestingMode bool
 	dealerOpenHeartbeatID int
@@ -115,6 +118,13 @@ func (a *App) startup(ctx context.Context) {
 	a.setupExt()
 	go func() {
 		a.runExt()
+	}()
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			a.requestPlayerStrip()
+		}
 	}()
 }
 
@@ -191,6 +201,7 @@ func (a *App) setupExt() {
 		handleTradePacket(a, e)
 		handleUsers28Packet(a, e)
 		handleIncomingHeaderSniff(a, e)
+		handleStripPacket(a, e)
 	})
 }
 
@@ -291,7 +302,8 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] item[%d] name=%q quantity=%d raw=%q", i, item.Name, item.Quantity, item.RawData))
 			log.Printf("[TRADE_ITEMS #108] item[%d] name=%q quantity=%d raw=%q", i, item.Name, item.Quantity, item.RawData)
 		}
-		
+
+		a.emitTradeItemsUpdate()
 		return
 	}
 	
@@ -305,6 +317,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		
 		// Send the trade items summary to chat
 		a.sendTradeCompletionMessage()
+		go a.requestPlayerStrip()
 		return
 	}
 	
@@ -382,6 +395,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] shouting: %q", openMsg))
 		log.Printf("[TRADE_OPEN] shouting: %q", openMsg)
 		ext.Send(out.SHOUT, openMsg)
+		go a.requestPlayerStrip()
 		return
 	}
 
@@ -850,10 +864,155 @@ func (a *App) GetTradeItemsJSON() string {
 // ClearTradeItems removes all current trade items
 func (a *App) ClearTradeItems() {
 	tradeItemsMu.Lock()
-	defer tradeItemsMu.Unlock()
 	currentTradeItems = []TradeItem{}
+	tradeItemsMu.Unlock()
 	a.AddLogMsg("[TRADE_ITEMS] cleared current trade items")
 	log.Printf("[TRADE_ITEMS] cleared current trade items")
+	a.emitTradeItemsUpdate()
+}
+
+// emitTradeItemsUpdate pushes the current trade items to the frontend via an event
+func (a *App) emitTradeItemsUpdate() {
+	tradeItemsMu.Lock()
+	items := make([]TradeItem, len(currentTradeItems))
+	copy(items, currentTradeItems)
+	tradeItemsMu.Unlock()
+
+	jsonData, err := json.Marshal(items)
+	if err != nil {
+		return
+	}
+	runtime.EventsEmit(a.ctx, "tradeItemsUpdate", string(jsonData))
+}
+
+// requestPlayerStrip sends GETSTRIP[65] to refresh the player's hand inventory.
+func (a *App) requestPlayerStrip() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[STRIP] GETSTRIP request panicked: %v", r)
+		}
+	}()
+	a.ext.Send(out.GETSTRIP, "new")
+	a.AddLogMsg("[STRIP] requested player hand (GETSTRIP)")
+	log.Printf("[STRIP] requested player hand (GETSTRIP)")
+}
+
+// handleStripPacket parses STRIPINFO_2 [140] to track items in the player's hand.
+func handleStripPacket(a *App, e *g.Intercept) {
+	if e.Packet.Header.Dir != g.In || e.Packet.Header.Value != 140 {
+		return
+	}
+
+	catalogNames := a.GetCatalogNameSet()
+	items := parseStripItemsPacket(e.Packet.Data, catalogNames)
+
+	handItemsMu.Lock()
+	currentHandItems = items
+	handItemsMu.Unlock()
+
+	a.AddLogMsg(fmt.Sprintf("[STRIP] parsed %d hand items", len(items)))
+	log.Printf("[STRIP] parsed %d hand items", len(items))
+	for i, item := range items {
+		a.AddLogMsg(fmt.Sprintf("[STRIP] hand[%d] name=%q qty=%d", i, item.Name, item.Quantity))
+		log.Printf("[STRIP] hand[%d] name=%q qty=%d", i, item.Name, item.Quantity)
+	}
+	a.emitHandItemsUpdate()
+}
+
+// parseStripItemsPacket extracts item names/counts from STRIPINFO_2 packet data.
+func parseStripItemsPacket(data []byte, catalogNames map[string]struct{}) []TradeItem {
+	counts := map[string]int{}
+	rawByName := map[string]string{}
+
+	fields := bytes.Split(data, []byte{0x02})
+	for _, field := range fields {
+		if len(field) == 0 {
+			continue
+		}
+		fieldStr := string(field)
+		itemName, ok := extractStripItemName(fieldStr)
+		if !ok {
+			continue
+		}
+		if _, allowed := catalogNames[itemName]; !allowed {
+			continue
+		}
+		counts[itemName]++
+		if _, exists := rawByName[itemName]; !exists {
+			rawByName[itemName] = fieldStr
+		}
+	}
+
+	if len(counts) == 0 {
+		return []TradeItem{}
+	}
+
+	names := make([]string, 0, len(counts))
+	for name := range counts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	items := make([]TradeItem, 0, len(names))
+	for _, name := range names {
+		items = append(items, TradeItem{
+			Name:     name,
+			Quantity: counts[name],
+			RawData:  rawByName[name],
+		})
+	}
+	return items
+}
+
+// extractStripItemName extracts the furniture class name from a STRIPINFO_2 field.
+// It handles three formats:
+//  1. Legacy trade: "itkoHP|club_sofa"
+//  2. Modern trade: "irbUAXb{chair_plasty*109"
+//  3. Strip/inventory: binary prefix + class name (e.g. "jxbUAHHchair_plasty*109",
+//     "iM]OHHICF_1_coin_bronze")
+func extractStripItemName(field string) (string, bool) {
+	// Try existing trade formats first (handles | and { delimiters)
+	if name, ok := extractTradeItemName(field); ok {
+		return name, ok
+	}
+
+	// Strip format: scan for item name patterns embedded in binary-prefixed fields.
+	// Patterns matched (case-sensitive for CF_ coins, lowercase for furniture):
+	//   CF_<digits>_<lowercase>  e.g. CF_1_coin_bronze
+	//   <lower><lower/digit/under>+_<lower/digit/under>+ e.g. chair_plasty, club_sofa
+	matches := stripItemNameRe.FindAllString(field, -1)
+	if len(matches) == 0 {
+		return "", false
+	}
+
+	// Take longest match — most likely to be the complete class name.
+	best := ""
+	for _, m := range matches {
+		if len(m) > len(best) {
+			best = m
+		}
+	}
+
+	// Strip *N suffix (e.g. *109) if present.
+	if star := strings.LastIndex(best, "*"); star > 0 {
+		best = best[:star]
+	}
+
+	return normalizeTradeItemName(best)
+}
+
+// emitHandItemsUpdate pushes the player's current hand items to the frontend.
+func (a *App) emitHandItemsUpdate() {
+	handItemsMu.Lock()
+	items := make([]TradeItem, len(currentHandItems))
+	copy(items, currentHandItems)
+	handItemsMu.Unlock()
+
+	jsonData, err := json.Marshal(items)
+	if err != nil {
+		return
+	}
+	runtime.EventsEmit(a.ctx, "handItemsUpdate", string(jsonData))
 }
 
 // sendTradeCompletionMessage builds and sends a chat message with the items from the completed trade

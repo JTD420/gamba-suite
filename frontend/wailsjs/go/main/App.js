@@ -18,6 +18,10 @@ export function GetCatalogItemValue(arg1) {
   return window['go']['main']['App']['GetCatalogItemValue'](arg1);
 }
 
+export function GetCatalogNameSet() {
+  return window['go']['main']['App']['GetCatalogNameSet']();
+}
+
 export function GetCurrentTradeItems() {
   return window['go']['main']['App']['GetCurrentTradeItems']();
 }

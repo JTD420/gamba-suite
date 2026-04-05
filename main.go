@@ -450,12 +450,30 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		tradeCompleted = true
 		tradeAutoConfirmed = true
 		tradeAutoConfirmPending = false
-		a.AddLogMsg("[TRADE_COMPLETED #112] trade completed, sending trade summary")
-		log.Printf("[TRADE_COMPLETED #112] trade completed, sending trade summary")
-		
-		// Send the trade items summary to chat
-		a.sendTradeCompletionMessage()
-		go a.requestPlayerStrip()
+		if pokerPayoutTradeActive {
+			partnerName := strings.TrimSpace(lastTradePartnerName)
+			if partnerName == "" || partnerName == "Unknown" {
+				partnerName = strings.TrimSpace(pokerPayoutTargetName)
+			}
+			if partnerName == "" {
+				partnerName = "Unknown"
+			}
+
+			a.AddLogMsg("[TRADE_COMPLETED #112] payout trade completed")
+			log.Printf("[TRADE_COMPLETED #112] payout trade completed")
+
+			completeMsg := fmt.Sprintf("Trade Completed: \"%s\"", partnerName)
+			a.AddLogMsg(fmt.Sprintf("[TRADE_COMPLETED] shouting: %q", completeMsg))
+			log.Printf("[TRADE_COMPLETED] shouting: %q", completeMsg)
+			ext.Send(out.SHOUT, completeMsg)
+		} else {
+			a.AddLogMsg("[TRADE_COMPLETED #112] trade completed, sending trade summary")
+			log.Printf("[TRADE_COMPLETED #112] trade completed, sending trade summary")
+
+			// Send the trade items summary to chat
+			a.sendTradeCompletionMessage()
+			go a.requestPlayerStrip()
+		}
 		return
 	}
 	
@@ -698,6 +716,20 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			pokerPayoutTradeActive = false
 			a.AddLogMsg("[PAYOUT] payout trade completed successfully")
 			log.Printf("[PAYOUT] payout trade completed successfully")
+
+			// Resume dealer-open cycle after payout is fully closed.
+			awaitingTradeOpen = true
+			if canAnnounceDealerOpen() {
+				dealerTradeWindowOpen = true
+				openMsg := a.dealerOpenMessage()
+				a.AddLogMsg(fmt.Sprintf("[TRADE_REOPEN] shouting: %q", openMsg))
+				log.Printf("[TRADE_REOPEN] shouting: %q", openMsg)
+				go sendMessageWithDelay(openMsg)
+			} else {
+				dealerTradeWindowOpen = false
+				log.Printf("User is muted. Dealer open announcement skipped; incoming trades will be blocked.")
+			}
+			startDealerOpenHeartbeat(a)
 		}
 
 		partnerID := lastTradePartnerID
@@ -829,10 +861,6 @@ func startPokerPayout(a *App, targetID int, targetName string) {
 func (a *App) autoAddPayoutItems() {
 	time.Sleep(600 * time.Millisecond) // settle time after trade opens
 
-	handItemsMu.Lock()
-	handItemIDs := currentHandItemIDs
-	handItemsMu.Unlock()
-
 	betItems := pokerGameBetItems
 	if len(betItems) == 0 {
 		a.AddLogMsg("[PAYOUT] no bet items recorded, skipping auto-add")
@@ -845,18 +873,61 @@ func (a *App) autoAddPayoutItems() {
 		a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] bet[%d] name=%q qty=%d payoutTarget=%d", i, betItem.Name, betItem.Quantity, betItem.Quantity*2))
 	}
 
+	required := payoutRequirementsFromBetItems(betItems)
+	selectedByName := map[string][]int{}
+	usedIDs := map[int]struct{}{}
+
+	// Try current hand first, then rescan hand pages if we are still short.
+	for attempt := 1; attempt <= 3; attempt++ {
+		handSnapshot := snapshotHandItemIDs()
+		for name, needQty := range required {
+			if needQty <= 0 {
+				continue
+			}
+
+			already := len(selectedByName[name])
+			if already >= needQty {
+				continue
+			}
+
+			candidates := uniqueInts(handSnapshot[name])
+			for _, id := range candidates {
+				if _, seen := usedIDs[id]; seen {
+					continue
+				}
+				selectedByName[name] = append(selectedByName[name], id)
+				usedIDs[id] = struct{}{}
+				if len(selectedByName[name]) >= needQty {
+					break
+				}
+			}
+		}
+
+		missing := payoutMissingCounts(required, selectedByName)
+		if len(missing) == 0 {
+			break
+		}
+
+		if attempt < 3 {
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] payout still short after hand scan attempt %d, requesting next hand scan: %s", attempt, formatMissingCounts(missing)))
+			log.Printf("[PAYOUT_DEBUG] payout still short after hand scan attempt %d, requesting next hand scan: %s", attempt, formatMissingCounts(missing))
+			go a.requestPlayerStrip()
+			time.Sleep(8 * time.Second)
+		} else {
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] payout still short after final hand scan attempt: %s", formatMissingCounts(missing)))
+			log.Printf("[PAYOUT_DEBUG] payout still short after final hand scan attempt: %s", formatMissingCounts(missing))
+		}
+	}
+
 	total := 0
 	plannedIDs := make([]int, 0)
 	for _, betItem := range betItems {
-		needed := betItem.Quantity * 2
-		toAdd := handItemIDs[betItem.Name]
-		a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] source ids for %s: available=%d needed=%d", betItem.Name, len(toAdd), needed))
-		if len(toAdd) > needed {
-			toAdd = toAdd[:needed]
-		}
+		needed := required[betItem.Name]
+		toAdd := selectedByName[betItem.Name]
+		a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] selected ids for %s: selected=%d needed=%d", betItem.Name, len(toAdd), needed))
 		if len(toAdd) < needed {
-			a.AddLogMsg(fmt.Sprintf("[PAYOUT] warning: need %d of %s but only have %d", needed, betItem.Name, len(toAdd)))
-			log.Printf("[PAYOUT] warning: need %d of %s but only have %d", needed, betItem.Name, len(toAdd))
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT] warning: need %d of %s but only found %d unique item ids", needed, betItem.Name, len(toAdd)))
+			log.Printf("[PAYOUT] warning: need %d of %s but only found %d unique item ids", needed, betItem.Name, len(toAdd))
 		}
 		for _, itemID := range toAdd {
 			if !pokerPayoutTradeActive {
@@ -875,7 +946,82 @@ func (a *App) autoAddPayoutItems() {
 	a.AddLogMsg(fmt.Sprintf("[PAYOUT] auto-add complete: %d item(s) offered", total))
 	log.Printf("[PAYOUT] auto-add complete: %d item(s) offered", total)
 
+	// Accept first for payout direction.
+	// In some sessions TRADE_ITEMS attribution (own vs partner) is delayed/ambiguous,
+	// so waiting for strict own-offer verification can stall the payout trade.
+	if pokerPayoutTradeActive && !tradeAutoAccepted {
+		time.Sleep(450 * time.Millisecond)
+		ext.Send(out.TRADE_ACCEPT)
+		tradeAutoAccepted = true
+		tradeAutoAcceptPending = false
+		a.AddLogMsg("[PAYOUT] auto-accept sent after payout items were added (accept-first mode)")
+		log.Printf("[PAYOUT] auto-accept sent after payout items were added (accept-first mode)")
+	}
+
 	go a.verifyAndRetryPayoutAdds(plannedIDs)
+}
+
+func snapshotHandItemIDs() map[string][]int {
+	handItemsMu.Lock()
+	defer handItemsMu.Unlock()
+
+	snapshot := make(map[string][]int, len(currentHandItemIDs))
+	for name, ids := range currentHandItemIDs {
+		copyIDs := make([]int, len(ids))
+		copy(copyIDs, ids)
+		snapshot[name] = copyIDs
+	}
+	return snapshot
+}
+
+func uniqueInts(ids []int) []int {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := map[int]struct{}{}
+	unique := make([]int, 0, len(ids))
+	for _, id := range ids {
+		if id == 0 {
+			continue
+		}
+		key := absInt(id)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, id)
+	}
+	return unique
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func payoutMissingCounts(required map[string]int, selected map[string][]int) map[string]int {
+	missing := map[string]int{}
+	for name, need := range required {
+		have := len(selected[name])
+		if have < need {
+			missing[name] = need - have
+		}
+	}
+	return missing
+}
+
+func formatMissingCounts(missing map[string]int) string {
+	if len(missing) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(missing))
+	for name, qty := range missing {
+		parts = append(parts, fmt.Sprintf("%s:%d", name, qty))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ", ")
 }
 
 func ownTradeOfferTotal() int {
@@ -888,8 +1034,67 @@ func ownTradeOfferTotal() int {
 	return total
 }
 
+func payoutRequirementsFromBetItems(betItems []TradeItem) map[string]int {
+	required := map[string]int{}
+	for _, item := range betItems {
+		if item.Quantity <= 0 {
+			continue
+		}
+		required[item.Name] += item.Quantity * 2
+	}
+	return required
+}
+
+func ownTradeOfferCounts() map[string]int {
+	tradeItemsMu.Lock()
+	defer tradeItemsMu.Unlock()
+	counts := map[string]int{}
+	for _, item := range currentOwnTradeItems {
+		counts[item.Name] += item.Quantity
+	}
+	return counts
+}
+
+func (a *App) ownTradeHasRequiredPayoutOffer(required map[string]int) (bool, string) {
+	have := ownTradeOfferCounts()
+	for name, qty := range required {
+		if have[name] < qty {
+			return false, fmt.Sprintf("%s have=%d need=%d", name, have[name], qty)
+		}
+	}
+	return true, ""
+}
+
+func (a *App) tryAcceptPayoutTrade(required map[string]int, source string) bool {
+	if !pokerPayoutTradeActive {
+		return false
+	}
+	if tradeAutoAccepted {
+		return true
+	}
+	ok, detail := a.ownTradeHasRequiredPayoutOffer(required)
+	if !ok {
+		a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] not accepting yet (%s): %s", source, detail))
+		log.Printf("[PAYOUT_DEBUG] not accepting yet (%s): %s", source, detail)
+		return false
+	}
+
+	ext.Send(out.TRADE_ACCEPT)
+	tradeAutoAccepted = true
+	tradeAutoAcceptPending = false
+	a.AddLogMsg(fmt.Sprintf("[PAYOUT] auto-accept sent after verifying payout items (%s)", source))
+	log.Printf("[PAYOUT] auto-accept sent after verifying payout items (%s)", source)
+	return true
+}
+
 func (a *App) verifyAndRetryPayoutAdds(plannedIDs []int) {
 	if len(plannedIDs) == 0 {
+		return
+	}
+
+	required := payoutRequirementsFromBetItems(pokerGameBetItems)
+	if len(required) == 0 {
+		a.AddLogMsg("[PAYOUT_DEBUG] no payout requirements found while verifying add")
 		return
 	}
 
@@ -902,7 +1107,7 @@ func (a *App) verifyAndRetryPayoutAdds(plannedIDs []int) {
 	ownTotal := ownTradeOfferTotal()
 	a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] post-add own offer total=%d planned=%d", ownTotal, len(plannedIDs)))
 	log.Printf("[PAYOUT_DEBUG] post-add own offer total=%d planned=%d", ownTotal, len(plannedIDs))
-	if ownTotal > 0 {
+	if a.tryAcceptPayoutTrade(required, "after-negative-add") {
 		return
 	}
 
@@ -919,6 +1124,15 @@ func (a *App) verifyAndRetryPayoutAdds(plannedIDs []int) {
 		a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] retry add item +%d payload=%q", itemID, payload))
 		log.Printf("[PAYOUT_DEBUG] retry add item +%d payload=%q", itemID, payload)
 	}
+
+	// Wait again for trade echo, then only accept if exact payout offer is present.
+	time.Sleep(2200 * time.Millisecond)
+	if a.tryAcceptPayoutTrade(required, "after-positive-retry") {
+		return
+	}
+
+	a.AddLogMsg("[PAYOUT_DEBUG] payout items still not fully reflected in own trade offer; waiting for manual intervention")
+	log.Printf("[PAYOUT_DEBUG] payout items still not fully reflected in own trade offer; waiting for manual intervention")
 }
 
 func stopUnderfundedTradeMonitor() {

@@ -63,6 +63,8 @@ var (
 	pokerPayoutAttempts    int
 	pokerPayoutSessionID   int
 	pokerPayoutTradeSent   bool
+	payoutExpectedAddCount int
+	payoutActualAddCount   int
 	underfundedTradeMonitorID int
 	underfundedTradeMonitorNotice string
 	lastTradeOpenData string
@@ -354,7 +356,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		}
 	}()
 
-	if e.Packet.Header.Dir == g.Out && (e.Packet.Header.Value == 69 || e.Packet.Header.Value == 402) {
+	if e.Packet.Header.Dir == g.Out && (e.Packet.Header.Value == 69 || e.Packet.Header.Value == 402) && !pokerPayoutTradeActive {
 		shortages := a.getTradeCoverageShortages()
 		if len(shortages) > 0 {
 			notice := formatTradeShortages(shortages)
@@ -387,6 +389,11 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		addItemMu.Lock()
 		lastAddItemWasOurs = true
 		addItemMu.Unlock()
+		if pokerPayoutTradeActive {
+			payoutActualAddCount++
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] observed outgoing TRADE_ADDITEM count %d/%d", payoutActualAddCount, payoutExpectedAddCount))
+			log.Printf("[PAYOUT_DEBUG] observed outgoing TRADE_ADDITEM count %d/%d", payoutActualAddCount, payoutExpectedAddCount)
+		}
 		a.AddLogMsg("[TRADE_ADDITEM #72] outgoing: next TRADE_ITEMS belongs to us")
 		log.Printf("[TRADE_ADDITEM #72] outgoing: next TRADE_ITEMS belongs to us")
 		return
@@ -441,7 +448,12 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		}
 
 		a.emitTradeItemsUpdate(side)
-		a.notifyTradeQuantityCoverage()
+		if pokerPayoutTradeActive {
+			a.AddLogMsg("[TRADE_COVERAGE] skipped shortage enforcement during payout trade")
+			log.Printf("[TRADE_COVERAGE] skipped shortage enforcement during payout trade")
+		} else {
+			a.notifyTradeQuantityCoverage()
+		}
 		return
 	}
 	
@@ -769,6 +781,8 @@ func stopPokerPayout() {
 	pokerPayoutAttempts = 0
 	pokerPayoutSessionID++
 	pokerPayoutTradeSent = false
+	payoutExpectedAddCount = 0
+	payoutActualAddCount = 0
 }
 
 func startPokerPayout(a *App, targetID int, targetName string) {
@@ -936,26 +950,45 @@ func (a *App) autoAddPayoutItems() {
 			}
 			time.Sleep(550 * time.Millisecond)
 			ext.Send(out.TRADE_ADDITEM, -itemID)
+			if pokerPayoutTradeActive {
+				payoutActualAddCount++
+			}
 			plannedIDs = append(plannedIDs, itemID)
 			total++
 			payload := string(ext.NewPacket(out.TRADE_ADDITEM, -itemID).Data)
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT] added item %d (%s) %d/%d payload=%q", itemID, betItem.Name, total, needed, payload))
 			log.Printf("[PAYOUT] added item %d (%s) %d/%d payload=%q", itemID, betItem.Name, total, needed, payload)
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] sent count now %d/%d", payoutActualAddCount, payoutExpectedAddCount))
+			log.Printf("[PAYOUT_DEBUG] sent count now %d/%d", payoutActualAddCount, payoutExpectedAddCount)
 		}
 	}
 	a.AddLogMsg(fmt.Sprintf("[PAYOUT] auto-add complete: %d item(s) offered", total))
 	log.Printf("[PAYOUT] auto-add complete: %d item(s) offered", total)
 
-	// Accept first for payout direction.
-	// In some sessions TRADE_ITEMS attribution (own vs partner) is delayed/ambiguous,
-	// so waiting for strict own-offer verification can stall the payout trade.
+	// Accept only after full payout placement has been queued.
+	requiredTotal := 0
+	fullyPlanned := true
+	for name, need := range required {
+		requiredTotal += need
+		if len(selectedByName[name]) < need {
+			fullyPlanned = false
+		}
+	}
+	payoutExpectedAddCount = requiredTotal
+	payoutActualAddCount = 0
+
 	if pokerPayoutTradeActive && !tradeAutoAccepted {
-		time.Sleep(450 * time.Millisecond)
-		ext.Send(out.TRADE_ACCEPT)
-		tradeAutoAccepted = true
-		tradeAutoAcceptPending = false
-		a.AddLogMsg("[PAYOUT] auto-accept sent after payout items were added (accept-first mode)")
-		log.Printf("[PAYOUT] auto-accept sent after payout items were added (accept-first mode)")
+		if fullyPlanned && total >= requiredTotal && payoutActualAddCount >= requiredTotal {
+			time.Sleep(450 * time.Millisecond)
+			ext.Send(out.TRADE_ACCEPT)
+			tradeAutoAccepted = true
+			tradeAutoAcceptPending = false
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT] auto-accept sent after full payout placement (%d/%d sent=%d)", total, requiredTotal, payoutActualAddCount))
+			log.Printf("[PAYOUT] auto-accept sent after full payout placement (%d/%d sent=%d)", total, requiredTotal, payoutActualAddCount)
+		} else {
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] accept deferred: planned=%d/%d sent=%d/%d", total, requiredTotal, payoutActualAddCount, requiredTotal))
+			log.Printf("[PAYOUT_DEBUG] accept deferred: planned=%d/%d sent=%d/%d", total, requiredTotal, payoutActualAddCount, requiredTotal)
+		}
 	}
 
 	go a.verifyAndRetryPayoutAdds(plannedIDs)
@@ -1097,6 +1130,10 @@ func (a *App) verifyAndRetryPayoutAdds(plannedIDs []int) {
 		a.AddLogMsg("[PAYOUT_DEBUG] no payout requirements found while verifying add")
 		return
 	}
+	requiredTotal := 0
+	for _, need := range required {
+		requiredTotal += need
+	}
 
 	// Give the server time to echo TRADE_ITEMS updates.
 	time.Sleep(2500 * time.Millisecond)
@@ -1120,14 +1157,30 @@ func (a *App) verifyAndRetryPayoutAdds(plannedIDs []int) {
 		}
 		time.Sleep(450 * time.Millisecond)
 		ext.Send(out.TRADE_ADDITEM, itemID)
+		if pokerPayoutTradeActive {
+			payoutActualAddCount++
+		}
 		payload := string(ext.NewPacket(out.TRADE_ADDITEM, itemID).Data)
 		a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] retry add item +%d payload=%q", itemID, payload))
 		log.Printf("[PAYOUT_DEBUG] retry add item +%d payload=%q", itemID, payload)
+		a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] sent count now %d/%d", payoutActualAddCount, payoutExpectedAddCount))
+		log.Printf("[PAYOUT_DEBUG] sent count now %d/%d", payoutActualAddCount, payoutExpectedAddCount)
 	}
 
 	// Wait again for trade echo, then only accept if exact payout offer is present.
 	time.Sleep(2200 * time.Millisecond)
 	if a.tryAcceptPayoutTrade(required, "after-positive-retry") {
+		return
+	}
+
+	if pokerPayoutTradeActive && !tradeAutoAccepted && len(plannedIDs) >= requiredTotal && payoutActualAddCount >= requiredTotal {
+		// Attribution can be unreliable in this direction; once full payout has been queued,
+		// accept without waiting for the player to accept first.
+		ext.Send(out.TRADE_ACCEPT)
+		tradeAutoAccepted = true
+		tradeAutoAcceptPending = false
+		a.AddLogMsg(fmt.Sprintf("[PAYOUT] auto-accept fallback after queued full payout (%d/%d sent=%d)", len(plannedIDs), requiredTotal, payoutActualAddCount))
+		log.Printf("[PAYOUT] auto-accept fallback after queued full payout (%d/%d sent=%d)", len(plannedIDs), requiredTotal, payoutActualAddCount)
 		return
 	}
 
@@ -1231,7 +1284,7 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 	if tradeAutoAccepted || tradeAutoAcceptPending {
 		return
 	}
-	if len(a.getTradeCoverageShortages()) > 0 {
+	if !pokerPayoutTradeActive && len(a.getTradeCoverageShortages()) > 0 {
 		a.AddLogMsg("[TRADE_ACCEPT] skipped auto-accept due to insufficient payout stock")
 		log.Printf("[TRADE_ACCEPT] skipped auto-accept due to insufficient payout stock")
 		return
@@ -1250,7 +1303,7 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 			return
 		}
 
-		if len(a.getTradeCoverageShortages()) > 0 {
+		if !pokerPayoutTradeActive && len(a.getTradeCoverageShortages()) > 0 {
 			tradeAutoAcceptPending = false
 			a.AddLogMsg("[TRADE_ACCEPT] canceled auto-accept due to insufficient payout stock")
 			log.Printf("[TRADE_ACCEPT] canceled auto-accept due to insufficient payout stock")
@@ -1269,7 +1322,7 @@ func scheduleAutoTradeConfirm(a *App, payload string) {
 	if tradeAutoConfirmed || tradeAutoConfirmPending {
 		return
 	}
-	if len(a.getTradeCoverageShortages()) > 0 {
+	if !pokerPayoutTradeActive && len(a.getTradeCoverageShortages()) > 0 {
 		a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] skipped auto-confirm due to insufficient payout stock")
 		log.Printf("[TRADE_CONFIRM_ACCEPT] skipped auto-confirm due to insufficient payout stock")
 		return
@@ -1297,7 +1350,7 @@ func scheduleAutoTradeConfirm(a *App, payload string) {
 				return
 			}
 
-			if len(a.getTradeCoverageShortages()) > 0 {
+			if !pokerPayoutTradeActive && len(a.getTradeCoverageShortages()) > 0 {
 				tradeAutoConfirmPending = false
 				a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] canceled auto-confirm due to insufficient payout stock")
 				log.Printf("[TRADE_CONFIRM_ACCEPT] canceled auto-confirm due to insufficient payout stock")
@@ -1634,20 +1687,17 @@ func (a *App) normalizeTradeFieldClass(raw string) (string, bool) {
 }
 
 func (a *App) normalizeTradeFieldClassWithQty(raw string) (string, int, bool) {
-	name, qty, ok := normalizeCatalogClassWithQuantity(raw)
+	normalized, ok := normalizeClassKeyWithVariant(raw)
 	if !ok {
 		return "", 0, false
 	}
 
-	if !isKnownTradeClassName(a, name) {
+	if !isKnownTradeClassName(a, normalized) {
 		return "", 0, false
 	}
 
-	if qty <= 0 {
-		qty = 1
-	}
-
-	return name, qty, true
+	// Trade quantity is represented by repeated item entries, not by the *n variant suffix.
+	return normalized, 1, true
 }
 
 func isKnownTradeClassName(a *App, name string) bool {
@@ -1683,6 +1733,33 @@ func normalizeTradeItemName(raw string) (string, bool) {
 	}
 
 	return name, true
+}
+
+func normalizeClassKeyWithVariant(raw string) (string, bool) {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	if raw == "" || raw == "null" {
+		return "", false
+	}
+
+	if star := strings.LastIndex(raw, "*"); star > 0 {
+		suffix := raw[star+1:]
+		if suffix == "" {
+			return "", false
+		}
+		for _, r := range suffix {
+			if r < '0' || r > '9' {
+				return "", false
+			}
+		}
+
+		base, ok := normalizeTradeItemName(raw[:star])
+		if !ok {
+			return "", false
+		}
+		return base + "*" + suffix, true
+	}
+
+	return normalizeTradeItemName(raw)
 }
 
 // isCoordinatePattern checks if a string looks like coordinates (e.g., "0,0,0")
@@ -2063,10 +2140,6 @@ func parseStripInfoPageRaw(data []byte) (firstMainID int, pageRecords int, class
 			pos++ // skip \x02
 		}
 
-		if star := strings.LastIndex(classRaw, "*"); star > 0 {
-			classRaw = classRaw[:star]
-		}
-
 		// --- Field 3 ---
 		switch typeChar {
 		case 'S':
@@ -2079,24 +2152,14 @@ func parseStripInfoPageRaw(data []byte) (firstMainID int, pageRecords int, class
 			skipUntilDelim()
 		}
 
-		// validate class name
-		if classRaw == "" || classRaw == "null" {
-			continue
-		}
-		valid := true
-		for _, r := range classRaw {
-			if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_') {
-				valid = false
-				break
-			}
-		}
-		if !valid {
+		normalizedClass, ok := normalizeClassKeyWithVariant(classRaw)
+		if !ok {
 			continue
 		}
 
-		classQtys[classRaw] += 1 + extraCount
-			classItemIDs[classRaw] = append(classItemIDs[classRaw], mainID)
-			classItemIDs[classRaw] = append(classItemIDs[classRaw], extraIDs...)
+		classQtys[normalizedClass] += 1 + extraCount
+		classItemIDs[normalizedClass] = append(classItemIDs[normalizedClass], mainID)
+		classItemIDs[normalizedClass] = append(classItemIDs[normalizedClass], extraIDs...)
 	}
 	return
 }

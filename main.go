@@ -954,6 +954,12 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 		resetTradeAutoFlow()
 
+		// Always start fresh — never let a previous round's partner name
+		// poison the fallback guard in the identification logic below.
+		lastTradePartnerName = ""
+		lastTradePartnerID = 0
+		lastTradePartnerToken = ""
+
 		for _, decodeLine := range decodeTradeOpenPacket(e.Packet) {
 			a.AddLogMsg("[TRADE_OPEN_DECODE] " + decodeLine)
 			log.Printf("[TRADE_OPEN_DECODE] %s", decodeLine)
@@ -2738,6 +2744,12 @@ func (a *App) resyncHandThenOpenDealer() {
 func (a *App) openDealerAfterRound() {
 	dealerResyncInProgress = true
 	requestRoomUsers(a)
+
+	// Clear stale partner identity from the previous round so the next trader
+	// is always freshly identified when their TRADE_OPEN arrives.
+	lastTradePartnerName = ""
+	lastTradePartnerID = 0
+	lastTradePartnerToken = ""
 
 	scanID := a.requestPlayerStrip()
 	if ok := waitForStripScanCompletion(scanID, 20*time.Second); ok {

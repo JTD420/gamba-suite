@@ -32,7 +32,6 @@ var (
 	mutedDuration                        int
 	isMuted                              bool
 	currentSum                           int
-	commandList                          string
 	awaitingTradeOpen                    bool
 	dealerTradeWindowOpen                bool
 	tradeOpenCount                       int
@@ -179,6 +178,8 @@ type tradeShortage struct {
 	Required    int
 	Have        int
 	PayoutTotal int
+	HaveHand    int
+	Incoming    int
 }
 
 type App struct {
@@ -1902,13 +1903,6 @@ func handleTradeConfirmTimeout(a *App) {
 	tradeAutoConfirmed = true
 }
 
-func isTradeItemsFromPartner(payload string) bool {
-	if strings.TrimSpace(lastTradePartnerToken) == "" {
-		return false
-	}
-	return strings.Contains(payload, lastTradePartnerToken)
-}
-
 func extractTradePartnerID(payload string) (int, bool) {
 	matches := tradeUserPattern.FindStringSubmatch(payload)
 	if len(matches) < 2 {
@@ -2453,16 +2447,6 @@ func (a *App) extractTradeItemAndQuantity(field string) (string, int, bool) {
 	}
 
 	return "", 0, false
-}
-
-func (a *App) extractTradeItemName(field string) (string, bool) {
-	name, _, ok := a.extractTradeItemAndQuantity(field)
-	return name, ok
-}
-
-func (a *App) normalizeTradeFieldClass(raw string) (string, bool) {
-	name, _, ok := a.normalizeTradeFieldClassWithQty(raw)
-	return name, ok
 }
 
 func (a *App) normalizeTradeFieldClassWithQty(raw string) (string, int, bool) {
@@ -3085,151 +3069,6 @@ func diffItems(all []TradeItem, subtract []TradeItem) []TradeItem {
 	return result
 }
 
-func mergePreferHigherQuantity(base []TradeItem, candidate []TradeItem) []TradeItem {
-	byName := make(map[string]TradeItem, len(base))
-	for _, item := range base {
-		byName[item.Name] = item
-	}
-
-	for _, item := range candidate {
-		existing, ok := byName[item.Name]
-		if !ok || item.Quantity > existing.Quantity {
-			byName[item.Name] = item
-		}
-	}
-
-	names := make([]string, 0, len(byName))
-	for name := range byName {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	merged := make([]TradeItem, 0, len(names))
-	for _, name := range names {
-		merged = append(merged, byName[name])
-	}
-
-	return merged
-}
-
-func inferStackCountFromMetaField(meta string) (int, bool) {
-	// In observed STRIPINFO_2 metadata, stacked furni count correlates with
-	// repeated "bUA" segments in the metadata field directly before class name.
-	// Example:
-	//   1x -> "nxbUAHJS"           (1 occurrence)
-	//   2x -> "nxbUAIntbUAJS"      (2 occurrences)
-	//   3x -> "nxbUAJntbUAmrbUAJS" (3 occurrences)
-	if strings.Contains(meta, "bUA") {
-		c := strings.Count(meta, "bUA")
-		if c >= 1 && c <= 50 {
-			return c, true
-		}
-	}
-
-	// Avoid VL64-based guessing for non-bUA metadata because it can overcount
-	// when unrelated items are present on the same page.
-	return 0, false
-}
-
-func extractTradeFieldNameRaw(field string) (string, bool) {
-	// Legacy format example: "itkoHP|club_sofa"
-	if strings.Contains(field, "|") {
-		parts := strings.Split(field, "|")
-		if len(parts) >= 2 {
-			if name, ok := normalizeTradeFieldClassRaw(parts[len(parts)-1]); ok {
-				return name, true
-			}
-		}
-	}
-
-	// Current format example: "irbUAXb{chair_plasty*109"
-	if strings.Contains(field, "{") {
-		parts := strings.SplitN(field, "{", 2)
-		if len(parts) == 2 {
-			if name, ok := normalizeTradeFieldClassRaw(parts[1]); ok {
-				return name, true
-			}
-		}
-	}
-
-	return "", false
-}
-
-func normalizeTradeFieldClassRaw(raw string) (string, bool) {
-	raw = strings.TrimSpace(strings.ToLower(raw))
-	if raw == "" {
-		return "", false
-	}
-
-	if star := strings.Index(raw, "*"); star >= 0 {
-		raw = raw[:star]
-	}
-
-	return normalizeTradeItemName(raw)
-}
-
-func normalizeCatalogClassWithQuantity(raw string) (name string, qty int, ok bool) {
-	raw = strings.TrimSpace(strings.ToLower(raw))
-	if raw == "" {
-		return "", 0, false
-	}
-
-	qty = 1
-	if star := strings.LastIndex(raw, "*"); star > 0 && star < len(raw)-1 {
-		suffix := raw[star+1:]
-		if n, err := strconv.Atoi(suffix); err == nil {
-			// In strip payloads a small suffix can represent a stack amount; larger values are typically ids.
-			if n >= 2 && n <= 50 {
-				qty = n
-			}
-			raw = raw[:star]
-		}
-	}
-
-	name, ok = normalizeTradeItemName(raw)
-	if !ok {
-		return "", 0, false
-	}
-
-	return name, qty, true
-}
-
-// extractStripItemName extracts the furniture class name from a STRIPINFO_2 field.
-func extractStripItemName(field string) (string, bool) {
-	name, _, ok := extractStripItemAndQuantity(field)
-	return name, ok
-}
-
-func extractStripItemAndQuantity(field string) (string, int, bool) {
-	// Try existing trade formats first (handles | and { delimiters).
-	if name, ok := extractTradeFieldNameRaw(field); ok {
-		return name, 1, true
-	}
-
-	matches := stripItemNameRe.FindAllString(field, -1)
-	if len(matches) == 0 {
-		return "", 0, false
-	}
-
-	best := ""
-	for _, m := range matches {
-		if len(m) > len(best) {
-			best = m
-		}
-	}
-
-	if star := strings.LastIndex(best, "*"); star > 0 {
-		// Keep suffix handling in one place.
-	}
-
-	name, qty, ok := normalizeCatalogClassWithQuantity(best)
-	if !ok {
-		return "", 0, false
-	}
-
-	return name, qty, true
-}
-
 // emitHandItemsUpdate pushes the player's current hand items to the frontend.
 func (a *App) emitHandItemsUpdate() {
 	handItemsMu.Lock()
@@ -3262,7 +3101,7 @@ func (a *App) notifyTradeQuantityCoverage() {
 	lastTradeCoverageNotice = notice
 
 	primary := shortages[0]
-	msg := fmt.Sprintf("Total \"%s\" available \"%d\" but payout needs \"%d\": please offer less.", formatTradeItemName(primary.Name), primary.Have, primary.PayoutTotal)
+	msg := fmt.Sprintf("Total \"%s\" available \"%d\" (hand %d, incoming %d) but payout needs \"%d\": please offer less.", formatTradeItemName(primary.Name), primary.HaveHand, primary.HaveHand, primary.Incoming, primary.PayoutTotal)
 	a.AddLogMsg("[TRADE_COVERAGE] " + msg)
 	log.Printf("[TRADE_COVERAGE] %s", msg)
 	ext.Send(out.SHOUT, msg)
@@ -3301,14 +3140,17 @@ func (a *App) getTradeCoverageShortages() []tradeShortage {
 	for _, item := range partnerItems {
 		required := item.Quantity
 		payoutTotal := item.Quantity * 2
-		// Payout happens after this trade completes, so include incoming bet items.
-		have := haveByName[item.Name] + incomingByName[item.Name]
-		if have < payoutTotal {
+		// Enforce coverage using dealer hand only (exclude partner incoming items).
+		haveHand := haveByName[item.Name]
+		incoming := incomingByName[item.Name]
+		if haveHand < payoutTotal {
 			shortages = append(shortages, tradeShortage{
 				Name:        item.Name,
 				Required:    required,
-				Have:        have,
+				Have:        haveHand,
 				PayoutTotal: payoutTotal,
+				HaveHand:    haveHand,
+				Incoming:    incoming,
 			})
 		}
 	}
@@ -3318,7 +3160,7 @@ func (a *App) getTradeCoverageShortages() []tradeShortage {
 func formatTradeShortages(shortages []tradeShortage) string {
 	parts := make([]string, 0, len(shortages))
 	for _, shortage := range shortages {
-		parts = append(parts, fmt.Sprintf("%s available %d need %d (payout %d)", formatTradeItemName(shortage.Name), shortage.Have, shortage.Required, shortage.PayoutTotal))
+		parts = append(parts, fmt.Sprintf("%s available %d (hand %d + incoming %d) need %d (payout %d)", formatTradeItemName(shortage.Name), shortage.HaveHand, shortage.HaveHand, shortage.Incoming, shortage.Required, shortage.PayoutTotal))
 	}
 	return strings.Join(parts, ", ")
 }
@@ -3488,80 +3330,8 @@ func extractUsers28Entries(raw string) []user28Entry {
 	return entries
 }
 
-func parseUsers28Head(part string) (name string, token string, roomIndex int, ok bool) {
-	if len(part) < 7 {
-		return "", "", 0, false
-	}
-
-	nameStart := len(part)
-	for nameStart > 0 && isLikelyNameChar(part[nameStart-1]) {
-		nameStart--
-	}
-
-	if nameStart < 5 || nameStart >= len(part) {
-		return "", "", 0, false
-	}
-
-	name = part[nameStart:]
-	if len(name) < 2 {
-		return "", "", 0, false
-	}
-
-	token = part[nameStart-4 : nameStart]
-	if !isLikelyToken(token) {
-		return "", "", 0, false
-	}
-
-	// Try to decode a VL64 room index from the bytes immediately before the token.
-	// In Shockwave USERS packets the entry layout is: [roomIndex VL64][name string] ...
-	// The 4-byte legacy token appears just before the name; the VL64 may start before it.
-	tokenOffset := nameStart - 4
-	for startOff := tokenOffset - 1; startOff >= 0 && startOff >= tokenOffset-6; startOff-- {
-		b := part[startOff]
-		vlen := gencoding.VL64DecodeLen(b)
-		if vlen > 0 && startOff+vlen == tokenOffset {
-			v := gencoding.VL64Decode([]byte(part[startOff : startOff+vlen]))
-			if v > 0 {
-				roomIndex = v
-			}
-			break
-		}
-	}
-
-	// Also try decoding the token itself as a VL64 room index (older format).
-	if roomIndex == 0 {
-		tb := []byte(token)
-		vlen := gencoding.VL64DecodeLen(tb[0])
-		if vlen > 0 && vlen <= 4 {
-			v := gencoding.VL64Decode(tb[:vlen])
-			if v > 0 {
-				roomIndex = v
-			}
-		}
-	}
-
-	return name, token, roomIndex, true
-}
-
 func isLikelyNameChar(b byte) bool {
 	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_' || b == '-'
-}
-
-func isLikelyFigureField(field string) bool {
-	f := strings.ToLower(strings.TrimSpace(field))
-	if len(f) < 12 {
-		return false
-	}
-
-	if !(strings.HasPrefix(f, "hr-") || strings.HasPrefix(f, "hd-")) {
-		return false
-	}
-
-	if !strings.Contains(f, "hd-") || !strings.Contains(f, "ch-") || !strings.Contains(f, "lg-") || !strings.Contains(f, "sh-") {
-		return false
-	}
-
-	return true
 }
 
 func isLikelyToken(s string) bool {

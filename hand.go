@@ -155,9 +155,6 @@ func (a *App) evaluateBlackjackHand() {
 		}
 
 		if blackjackPlayerTotal < 17 {
-			if !ChatIsDisabled && !isMuted {
-				sendMessageWithDelay(fmt.Sprintf("%s total %d", playerLabel, blackjackPlayerTotal))
-			}
 			a.AddLogMsg(fmt.Sprintf("[BJ] player total %d < 17; auto-hit", blackjackPlayerTotal))
 			log.Printf("[BJ] player total %d < 17; auto-hit", blackjackPlayerTotal)
 			if blackjackHitInFlight {

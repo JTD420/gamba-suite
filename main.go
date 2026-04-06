@@ -4519,17 +4519,6 @@ func (a *App) rollBjDice() {
 		log.Printf("[BJ_DEBUG] initial 3 complete total=%d (fake mode)", currentSum)
 		mutex.Unlock()
 
-		if !ChatIsDisabled && !isMuted {
-			actor := blackjackPlayerName
-			if actor == "" {
-				actor = "Player"
-			}
-			if !blackjackPlayerTurn {
-				actor = "Dealer"
-				sendMessageWithDelay(fmt.Sprintf("%s total %d", actor, currentSum))
-			}
-		}
-
 		a.evaluateBlackjackHand()
 		isBJRolling = false
 		return
@@ -4571,17 +4560,6 @@ func (a *App) rollBjDice() {
 	a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] initial 3 complete values=%v total=%d", values, currentSum))
 	log.Printf("[BJ_DEBUG] initial 3 complete values=%v total=%d", values, currentSum)
 	mutex.Unlock()
-
-	if !ChatIsDisabled && !isMuted {
-		actor := blackjackPlayerName
-		if actor == "" {
-			actor = "Player"
-		}
-		if !blackjackPlayerTurn {
-			actor = "Dealer"
-			sendMessageWithDelay(fmt.Sprintf("%s total %d", actor, currentSum))
-		}
-	}
 
 	a.evaluateBlackjackHand()
 	isBJRolling = false
@@ -4625,16 +4603,6 @@ func (a *App) hitBjDice() {
 		mutex.Unlock()
 
 		blackjackHitInFlight = false
-		if !ChatIsDisabled && !isMuted {
-			actor := blackjackPlayerName
-			if actor == "" {
-				actor = "Player"
-			}
-			if !blackjackPlayerTurn {
-				actor = "Dealer"
-				sendMessageWithDelay(fmt.Sprintf("%s total %d", actor, currentSum))
-			}
-		}
 		a.evaluateBlackjackHand()
 		isHitting = false
 		isBJRolling = false
@@ -4678,13 +4646,6 @@ func (a *App) hitBjDice() {
 	// Log the value of the dice rolled
 	a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] hit resolved actor=%s slot=%d diceID=%d value=%d newTotal=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], slot, diceID, newValue, newTotal))
 	log.Printf("[BJ_DEBUG] hit resolved actor=%s slot=%d diceID=%d value=%d newTotal=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], slot, diceID, newValue, newTotal)
-	if !ChatIsDisabled && !blackjackPlayerTurn && !isMuted {
-		actor := "Dealer"
-		// Spread dealer-total announcements to stay under Habbo's flood control.
-		time.Sleep(1200 * time.Millisecond)
-		sendMessageWithDelay(fmt.Sprintf("%s total %d", actor, newTotal))
-	}
-
 	// Re-evaluate the hand with the updated sum
 	blackjackHitInFlight = false
 	a.evaluateBlackjackHand()

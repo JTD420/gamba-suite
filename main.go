@@ -1467,6 +1467,14 @@ func (a *App) autoAddPayoutItems() {
 	}
 
 	required := payoutRequirementsFromBetItems(betItems)
+	// Compute total required items up-front so outgoing intercept can
+	// track progress against this expected count while we send adds.
+	requiredTotal := 0
+	for _, need := range required {
+		requiredTotal += need
+	}
+	payoutExpectedAddCount = requiredTotal
+	payoutActualAddCount = 0
 	selectedByName := map[string][]int{}
 	usedIDs := map[int]struct{}{}
 
@@ -1529,32 +1537,25 @@ func (a *App) autoAddPayoutItems() {
 			}
 			time.Sleep(550 * time.Millisecond)
 			ext.Send(out.TRADE_ADDITEM, -itemID)
-			if payoutTradeActive {
-				payoutActualAddCount++
-			}
 			plannedIDs = append(plannedIDs, itemID)
 			total++
 			payload := string(ext.NewPacket(out.TRADE_ADDITEM, -itemID).Data)
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT] added item %d (%s) %d/%d payload=%q", itemID, betItem.Name, total, needed, payload))
 			log.Printf("[PAYOUT] added item %d (%s) %d/%d payload=%q", itemID, betItem.Name, total, needed, payload)
-			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] sent count now %d/%d", payoutActualAddCount, payoutExpectedAddCount))
-			log.Printf("[PAYOUT_DEBUG] sent count now %d/%d", payoutActualAddCount, payoutExpectedAddCount)
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] added id %d (planned so far %d/%d)", itemID, len(plannedIDs), payoutExpectedAddCount))
+			log.Printf("[PAYOUT_DEBUG] added id %d (planned so far %d/%d)", itemID, len(plannedIDs), payoutExpectedAddCount)
 		}
 	}
 	a.AddLogMsg(fmt.Sprintf("[PAYOUT] auto-add complete: %d item(s) offered", total))
 	log.Printf("[PAYOUT] auto-add complete: %d item(s) offered", total)
 
 	// Accept only after full payout placement has been queued.
-	requiredTotal := 0
 	fullyPlanned := true
 	for name, need := range required {
-		requiredTotal += need
 		if len(selectedByName[name]) < need {
 			fullyPlanned = false
 		}
 	}
-	payoutExpectedAddCount = requiredTotal
-	payoutActualAddCount = 0
 
 	if payoutTradeActive && !tradeAutoAccepted {
 		if fullyPlanned && total >= requiredTotal && payoutActualAddCount >= requiredTotal {
@@ -1950,10 +1951,15 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 	if tradeAutoAccepted || tradeAutoAcceptPending {
 		return
 	}
-	if !payoutTradeActive && len(a.getTradeCoverageShortages()) > 0 {
-		a.AddLogMsg("[TRADE_ACCEPT] skipped auto-accept due to insufficient payout stock")
-		log.Printf("[TRADE_ACCEPT] skipped auto-accept due to insufficient payout stock")
-		return
+	if !payoutTradeActive {
+		if s := a.getTradeCoverageShortages(); s != nil && len(s) > 0 {
+			a.AddLogMsg("[TRADE_ACCEPT] skipped auto-accept due to insufficient payout stock")
+			log.Printf("[TRADE_ACCEPT] skipped auto-accept due to insufficient payout stock")
+			return
+		}
+		// If snapshot not ready (getTradeCoverageShortages returns nil) we
+		// cannot reliably auto-accept immediately — fall through and let the
+		// deferred goroutine wait briefly for a snapshot before sending.
 	}
 
 	tradeAutoAcceptPending = true
@@ -1969,11 +1975,36 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 			return
 		}
 
-		if !payoutTradeActive && len(a.getTradeCoverageShortages()) > 0 {
-			tradeAutoAcceptPending = false
-			a.AddLogMsg("[TRADE_ACCEPT] canceled auto-accept due to insufficient payout stock")
-			log.Printf("[TRADE_ACCEPT] canceled auto-accept due to insufficient payout stock")
-			return
+		// If not in payout mode, ensure we have a recent hand snapshot and
+		// that there are no coverage shortages before accepting. Treat a
+		// nil result from getTradeCoverageShortages() as "snapshot not
+		// ready" and wait briefly for it to become available.
+		if !payoutTradeActive {
+			deadline := time.Now().Add(1 * time.Second)
+			for {
+				if flow != tradeAutoFlowID || strings.TrimSpace(lastTradePartnerToken) == "" {
+					tradeAutoAcceptPending = false
+					return
+				}
+				s := a.getTradeCoverageShortages()
+				if s == nil {
+					if time.Now().After(deadline) {
+						tradeAutoAcceptPending = false
+						a.AddLogMsg("[TRADE_ACCEPT] canceled auto-accept: hand snapshot unavailable")
+						log.Printf("[TRADE_ACCEPT] canceled auto-accept: hand snapshot unavailable")
+						return
+					}
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+				if len(s) > 0 {
+					tradeAutoAcceptPending = false
+					a.AddLogMsg("[TRADE_ACCEPT] canceled auto-accept due to insufficient payout stock")
+					log.Printf("[TRADE_ACCEPT] canceled auto-accept due to insufficient payout stock")
+					return
+				}
+				break
+			}
 		}
 
 		ext.Send(out.TRADE_ACCEPT)
@@ -1988,10 +2019,14 @@ func scheduleAutoTradeConfirm(a *App, payload string) {
 	if tradeAutoConfirmed || tradeAutoConfirmPending {
 		return
 	}
-	if !payoutTradeActive && len(a.getTradeCoverageShortages()) > 0 {
-		a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] skipped auto-confirm due to insufficient payout stock")
-		log.Printf("[TRADE_CONFIRM_ACCEPT] skipped auto-confirm due to insufficient payout stock")
-		return
+	if !payoutTradeActive {
+		if s := a.getTradeCoverageShortages(); s != nil && len(s) > 0 {
+			a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] skipped auto-confirm due to insufficient payout stock")
+			log.Printf("[TRADE_CONFIRM_ACCEPT] skipped auto-confirm due to insufficient payout stock")
+			return
+		}
+		// If snapshot not ready (s == nil) allow scheduling and perform a
+		// short wait inside the confirm loop before sending each confirm.
 	}
 
 	tradeAutoConfirmPending = true
@@ -2016,11 +2051,34 @@ func scheduleAutoTradeConfirm(a *App, payload string) {
 				return
 			}
 
-			if !payoutTradeActive && len(a.getTradeCoverageShortages()) > 0 {
-				tradeAutoConfirmPending = false
-				a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] canceled auto-confirm due to insufficient payout stock")
-				log.Printf("[TRADE_CONFIRM_ACCEPT] canceled auto-confirm due to insufficient payout stock")
-				return
+			if !payoutTradeActive {
+				// Wait briefly for a valid hand snapshot (up to 1s). If still
+				// unavailable or shortages exist, cancel auto-confirm.
+				deadline := time.Now().Add(1 * time.Second)
+				for {
+					if flow != tradeAutoFlowID || tradeAutoConfirmed {
+						tradeAutoConfirmPending = false
+						return
+					}
+					s := a.getTradeCoverageShortages()
+					if s == nil {
+						if time.Now().After(deadline) {
+							tradeAutoConfirmPending = false
+							a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] canceled auto-confirm: hand snapshot unavailable")
+							log.Printf("[TRADE_CONFIRM_ACCEPT] canceled auto-confirm: hand snapshot unavailable")
+							return
+						}
+						time.Sleep(100 * time.Millisecond)
+						continue
+					}
+					if len(s) > 0 {
+						tradeAutoConfirmPending = false
+						a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] canceled auto-confirm due to insufficient payout stock")
+						log.Printf("[TRADE_CONFIRM_ACCEPT] canceled auto-confirm due to insufficient payout stock")
+						return
+					}
+					break
+				}
 			}
 
 			ext.Send(g.Out.Id("TRADE_CONFIRM_ACCEPT"))
@@ -2602,6 +2660,17 @@ func (a *App) extractTradeItemAndQuantity(field string) (string, int, bool) {
 			if name, qty, ok := a.normalizeTradeFieldClassWithQty(parts[1]); ok {
 				return name, qty, true
 			}
+		}
+	}
+
+	// Fallback: try to locate a class-name-like substring anywhere in the
+	// field (some server payloads embed the class without a '{' or '|'
+	// wrapper). Use the strict stripItemNameRe to find a candidate.
+	if match := stripItemNameRe.FindString(field); match != "" {
+		if name, qty, ok := a.normalizeTradeFieldClassWithQty(match); ok {
+			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS_PARSE_FALLBACK] matched %q inside %q", match, field))
+			log.Printf("[TRADE_ITEMS_PARSE_FALLBACK] matched %q inside %q", match, field)
+			return name, qty, true
 		}
 	}
 
@@ -3304,28 +3373,35 @@ func (a *App) notifyTradeQuantityCoverage() {
 		stopShortageMonitor()
 		return
 	}
-	// Build a concise message listing how many we have of each short item,
-	// shout it, then close the trade so the booth becomes available again.
+	// During an active payout flow we skip force-closing here; caller
+	// (payout logic) handles shortages differently.
+	if payoutTradeActive {
+		a.AddLogMsg("[TRADE_COVERAGE] shortages detected but skipping enforcement during payout trade")
+		log.Printf("[TRADE_COVERAGE] shortages detected but skipping enforcement during payout trade")
+		return
+	}
+	// Build a concise message listing raw class*count for each short item
+	// (explicitly showing 0 when the dealer has none) and shout it.
 	parts := make([]string, 0, len(shortages))
 	for _, s := range shortages {
-		parts = append(parts, fmt.Sprintf("%s %d", formatTradeItemName(s.Name), s.HaveHand))
+		parts = append(parts, fmt.Sprintf("%s*%d", s.Name, s.HaveHand))
 	}
-	msg := fmt.Sprintf("I don't have that many; I only have %s", strings.Join(parts, ", "))
+	msg := fmt.Sprintf("I only have \"%s\"", strings.Join(parts, ","))
 	lastTradeCoverageNotice = msg
 	lastTradeBlockNotice = msg
 
 	a.AddLogMsg(fmt.Sprintf("[TRADE_COVERAGE] %s", msg))
 	log.Printf("[TRADE_COVERAGE] %s", msg)
 
+	// Announce shortages and then force-close the trade so the booth frees.
 	go func() {
-		// small delay so the shout isn't rate-limited/clobbered
 		time.Sleep(450 * time.Millisecond)
 		ext.Send(out.SHOUT, msg)
 		time.Sleep(300 * time.Millisecond)
 		ext.Send(out.TRADE_CLOSE)
 	}()
 
-	// ensure any active shortage monitor is stopped since we're force-closing
+	// Ensure any active shortage monitor is stopped since we're forcing close.
 	stopShortageMonitor()
 }
 

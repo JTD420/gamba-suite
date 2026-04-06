@@ -5394,11 +5394,11 @@ func (a *App) ShowCommands() {
 			"Closes any of your open dice. \n" +
 			"------------------------------------\n" +
 			":21 \n" +
-			"Plays like Blackjack: auto-hit below 17, prompt between 17-20,\n" +
+			"Plays like Blackjack: auto-hit below 18, prompt between 18-20,\n" +
 			"auto-stay at 21; announces result in chat. \n" +
 			"------------------------------------\n" +
 			":13 \n" +
-			"Plays like Blackjack-to-13: auto-hit below 7, prompt between 7-12,\n" +
+			"Plays like Blackjack-to-13: auto-hit below 8, prompt between 8-12,\n" +
 			"auto-stay at 13; announces result in chat. \n" +
 			"------------------------------------\n" +
 			":tri \n" +

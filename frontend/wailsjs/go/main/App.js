@@ -58,6 +58,14 @@ export function OpenLastTrade() {
   return window['go']['main']['App']['OpenLastTrade']();
 }
 
+export function PauseCasinoSetup() {
+  return window['go']['main']['App']['PauseCasinoSetup']();
+}
+
+export function ResumeCasinoSetup() {
+  return window['go']['main']['App']['ResumeCasinoSetup']();
+}
+
 export function SaveCatalog(arg1) {
   return window['go']['main']['App']['SaveCatalog'](arg1);
 }
@@ -76,4 +84,12 @@ export function ShowWindow() {
 
 export function SkipDiceSetupForTesting() {
   return window['go']['main']['App']['SkipDiceSetupForTesting']();
+}
+
+export function StartCasinoSetup() {
+  return window['go']['main']['App']['StartCasinoSetup']();
+}
+
+export function StopCasinoSetup() {
+  return window['go']['main']['App']['StopCasinoSetup']();
 }

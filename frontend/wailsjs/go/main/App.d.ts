@@ -30,6 +30,10 @@ export function LoadConfig():Promise<main.PokerDisplayConfig>;
 
 export function OpenLastTrade():Promise<void>;
 
+export function PauseCasinoSetup():Promise<void>;
+
+export function ResumeCasinoSetup():Promise<void>;
+
 export function SaveCatalog(arg1:Array<main.CatalogItem>):Promise<void>;
 
 export function SaveConfig(arg1:main.PokerDisplayConfig):Promise<void>;
@@ -39,3 +43,7 @@ export function ShowCommands():Promise<void>;
 export function ShowWindow():Promise<void>;
 
 export function SkipDiceSetupForTesting():Promise<void>;
+
+export function StartCasinoSetup():Promise<void>;
+
+export function StopCasinoSetup():Promise<void>;

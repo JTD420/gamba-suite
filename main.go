@@ -157,20 +157,28 @@ var (
 	// lastAllTradeItems stores the last full TRADE_ITEMS (all items) packet
 	// so we can compute deltas between successive full-state packets. This
 	// helps reliably attribute the first added item to the correct side.
-	lastAllTradeItems           []TradeItem
-	gameBetItems                []TradeItem
-	stripScanMu                 sync.Mutex
-	stripScanActive             bool
-	stripScanSessionID          = 0
-	stripScanPageCount          = 0
-	stripScanSeenItemIDs        = map[int]struct{}{}
-	stripScanCounts             = map[string]int{}
-	stripScanItemIDs            = map[string][]int{}
-	knownDiceIDs                = map[int]struct{}{}
-	fakeDiceTestingMode         bool
-	dealerOpenHeartbeatID       int
-	dealerOpenHeartbeatActive   bool
-	dealerResyncInProgress      bool
+	lastAllTradeItems         []TradeItem
+	gameBetItems              []TradeItem
+	stripScanMu               sync.Mutex
+	stripScanActive           bool
+	stripScanSessionID        = 0
+	stripScanPageCount        = 0
+	stripScanSeenItemIDs      = map[int]struct{}{}
+	stripScanCounts           = map[string]int{}
+	stripScanItemIDs          = map[string][]int{}
+	knownDiceIDs              = map[int]struct{}{}
+	fakeDiceTestingMode       bool
+	dealerOpenHeartbeatID     int
+	dealerOpenHeartbeatActive bool
+	dealerResyncInProgress    bool
+	// When true, the UI has enabled dice setup mode and incoming dice IDs
+	// should be recorded for the bot setup. Must be enabled by the Start Casino
+	// button in the frontend.
+	diceSetupActive bool
+	// When true the casino frontend has started — kept for UI state only.
+	casinoActive bool
+	// When true the casino has a valid completed dice setup and the bot can run.
+	casinoReady                 bool
 	lastOutgoingTradeOpenID     int
 	lastOutgoingTradeOpenAt     time.Time
 	tradeOpenStateMu            sync.Mutex
@@ -754,6 +762,11 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			log.Printf("[TRADE] recovered while handling header %d: %v", e.Packet.Header.Value, r)
 		}
 	}()
+
+	// Only process trade-related logic when casino setup is complete.
+	if !casinoReady {
+		return
+	}
 
 	// NOTE: payout coverage guard removed — proceed with outgoing accept/confirm.
 
@@ -4726,6 +4739,7 @@ func resetDiceState() {
 	defer mutex.Unlock()
 	resultsWaitGroup.Wait() // Ensure all dice roll results are processed
 	diceList = []*Dice{}
+	casinoReady = false
 	awaitingTradeOpen = false
 	dealerTradeWindowOpen = false
 	stopTradeWindowTimeoutMonitor()
@@ -4733,6 +4747,105 @@ func resetDiceState() {
 	resetBlackjackSequence()
 	fakeDiceTestingMode = false
 	isPokerRolling, isTriRolling, isBJRolling, is13Rolling, isHitting, is13Hitting, isClosing = false, false, false, false, false, false, false
+}
+
+// StartCasinoSetup enables dice setup recording. This must be called from the frontend
+// when the user clicks the "Start Casino" button. It resets any existing dice and
+// enables recording of incoming dice IDs.
+func (a *App) StartCasinoSetup() {
+	// Reset state first (this will lock/unlock internally)
+	resetDiceState()
+
+	mutex.Lock()
+	diceSetupActive = true
+	casinoActive = true
+	casinoReady = false
+	mutex.Unlock()
+
+	a.AddLogMsg("[DICE_SETUP] Dice setup mode enabled - roll all 5 dice now")
+	a.emitDiceSetupUpdate()
+}
+
+// PauseCasinoSetup temporarily disables dice setup recording without clearing
+// currently recorded dice.
+func (a *App) PauseCasinoSetup() {
+	mutex.Lock()
+	diceSetupActive = false
+	mutex.Unlock()
+
+	a.AddLogMsg("[DICE_SETUP] Dice setup paused via UI")
+	a.emitDiceSetupUpdate()
+}
+
+// ResumeCasinoSetup re-enables dice setup recording without resetting state.
+func (a *App) ResumeCasinoSetup() {
+	mutex.Lock()
+	diceSetupActive = true
+	mutex.Unlock()
+
+	a.AddLogMsg("[DICE_SETUP] Dice setup resumed via UI")
+	a.emitDiceSetupUpdate()
+}
+
+// StopCasinoSetup turns off dice setup and clears any recorded dice.
+func (a *App) StopCasinoSetup() {
+	// Reset full dice/game state to initial-like values
+	resetDiceState()
+
+	mutex.Lock()
+	// Ensure setup flag is disabled, casino inactive and known dice cleared
+	diceSetupActive = false
+	casinoActive = false
+	knownDiceIDs = map[int]struct{}{}
+
+	// Clear any awaiting game choice and last partner info so app behaves like fresh start
+	awaitingGameChoice = false
+	awaitingGameChoicePartnerID = 0
+	awaitingGameChoicePartnerName = ""
+	lastTradePartnerID = 0
+	lastTradePartnerName = ""
+	lastTradePartnerToken = ""
+	mutex.Unlock()
+
+	// Ensure any active trade state is fully cleared so the addon is inert.
+	a.ClearTradeItems()
+	stopTradeWindowTimeoutMonitor()
+	stopUnderfundedTradeMonitor()
+	stopDealerOpenHeartbeat()
+	stopPayout()
+
+	a.AddLogMsg("[DICE_SETUP] Dice setup stopped and application state cleared via UI")
+	a.emitDiceSetupUpdate()
+}
+
+// emitDiceSetupUpdate sends the current dice setup state to the frontend.
+func (a *App) emitDiceSetupUpdate() {
+	mutex.Lock()
+	// make a copy of dice values to avoid races
+	diceCopy := make([]Dice, len(diceList))
+	for i, d := range diceList {
+		if d == nil {
+			continue
+		}
+		diceCopy[i] = *d
+	}
+	complete := len(diceList) >= 5
+	ready := casinoReady
+	mutex.Unlock()
+
+	payload := struct {
+		Dice     []Dice `json:"dice"`
+		Complete bool   `json:"complete"`
+		Ready    bool   `json:"ready"`
+	}{
+		Dice:     diceCopy,
+		Complete: complete,
+		Ready:    ready,
+	}
+	b, _ := json.Marshal(payload)
+	if a.ctx != nil {
+		runtime.EventsEmit(a.ctx, "diceSetupUpdate", string(b))
+	}
 }
 
 func rememberDiceID(diceID int) {
@@ -4751,6 +4864,7 @@ func (a *App) SkipDiceSetupForTesting() {
 		diceList = append(diceList, &Dice{ID: 100000 + i, Value: rand.Intn(6) + 1, IsRolling: false, IsClosed: false})
 	}
 	fakeDiceTestingMode = true
+	casinoReady = true
 	awaitingTradeOpen = true
 	if canAnnounceDealerOpenLocked() {
 		dealerTradeWindowOpen = true
@@ -4775,11 +4889,9 @@ func (a *App) handleThrowDice(e *g.Intercept) {
 		return
 	}
 	rememberDiceID(diceID)
-
+	// Search for a dice with the given ID in the list. Only record new dice
+	// when the frontend has explicitly enabled dice setup mode.
 	mutex.Lock()
-	defer mutex.Unlock()
-
-	// Search for a dice with the given ID in the list
 	var existingDice *Dice
 	for _, dice := range diceList {
 		if dice != nil && dice.ID == diceID {
@@ -4788,11 +4900,20 @@ func (a *App) handleThrowDice(e *g.Intercept) {
 		}
 	}
 
+	needEmit := false
+
 	// If not found and the list has fewer than 5 dice, create and add a new one
 	if existingDice == nil && len(diceList) < 5 {
+		if !diceSetupActive {
+			// Not in setup mode - ignore new dice for setup purposes
+			mutex.Unlock()
+			return
+		}
+
 		newDice := &Dice{ID: diceID, IsRolling: true, IsClosed: false}
 		diceList = append(diceList, newDice)
 		log.Printf("Dice %d added\n", diceID)
+		needEmit = true
 
 		if len(diceList) == 5 {
 			message := "Dice setup sucessful! Run :roll to confirm"
@@ -4806,7 +4927,14 @@ func (a *App) handleThrowDice(e *g.Intercept) {
 				dealerTradeWindowOpen = false
 				log.Printf("User is muted. Skipping dealer open prompt message.")
 			}
+			// Turn off setup mode once complete
+			diceSetupActive = false
 		}
+	}
+	mutex.Unlock()
+
+	if needEmit {
+		a.emitDiceSetupUpdate()
 	}
 }
 
@@ -4824,11 +4952,8 @@ func (a *App) handleDiceOff(e *g.Intercept) {
 		return
 	}
 	rememberDiceID(diceID)
-
+	// Only record new dice IDs when in setup mode
 	mutex.Lock()
-	defer mutex.Unlock()
-
-	// Search for a dice with the given ID in the list
 	var existingDice *Dice
 	for _, dice := range diceList {
 		if dice != nil && dice.ID == diceID {
@@ -4837,11 +4962,21 @@ func (a *App) handleDiceOff(e *g.Intercept) {
 		}
 	}
 
-	// If not found and the list has fewer than 5 dice, create and add a new one
+	needEmit := false
 	if existingDice == nil && len(diceList) < 5 {
+		if !diceSetupActive {
+			mutex.Unlock()
+			return
+		}
 		newDice := &Dice{ID: diceID, IsRolling: false, IsClosed: true}
 		diceList = append(diceList, newDice)
 		log.Printf("Dice %d added\n", diceID)
+		needEmit = true
+	}
+	mutex.Unlock()
+
+	if needEmit {
+		a.emitDiceSetupUpdate()
 	}
 }
 
@@ -4872,6 +5007,7 @@ func (a *App) handleDiceResult(e *g.Intercept) {
 	}
 	adjustedDiceValue := diceValue - (diceID * 38)
 
+	needEmit := false
 	mutex.Lock()
 	for i, dice := range diceList {
 		if dice.ID == diceID {
@@ -4895,10 +5031,33 @@ func (a *App) handleDiceResult(e *g.Intercept) {
 				logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceID, adjustedDiceValue)
 				a.AddLogMsg(logRollResult)
 			}
+			needEmit = true
 			break
 		}
 	}
 	mutex.Unlock()
+
+	if needEmit {
+		a.emitDiceSetupUpdate()
+
+		// Update readiness: when we have 5 recorded dice with non-zero values
+		mutex.Lock()
+		ready := len(diceList) >= 5
+		if ready {
+			for _, d := range diceList {
+				if d == nil || d.Value <= 0 {
+					ready = false
+					break
+				}
+			}
+		}
+		casinoReady = ready
+		mutex.Unlock()
+
+		if casinoReady {
+			a.AddLogMsg("[DICE_SETUP] dice setup complete — casinoReady=true")
+		}
+	}
 }
 
 // Close the dice and send the packets to the game server

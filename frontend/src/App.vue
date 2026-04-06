@@ -13,7 +13,7 @@
 
     <div v-if="activeTab === 'Home'">
       <h2 class="section-title">Home</h2>
-      <p class="config-intro">Quick access to game guides and utilities.</p>
+      <p class="config-intro">Home Page!</p>
       <div class="game-card-grid">
         <button v-for="game in gameGuides" :key="game.key" class="game-card" @click="openGameGuide(game)">
           <div class="game-card-title">{{ game.title }}</div>
@@ -21,7 +21,38 @@
           <span class="game-card-action">Click for details</span>
         </button>
       </div>
+
+      <div class="casino-panel">
+        <div class="casino-panel-inner">
+          <div class="casino-info">
+            <div class="casino-status-label">Casino Status</div>
+            <div :class="['casino-status', casinoStatusKey]">{{ casinoStatus }}</div>
+          </div>
+          <div class="casino-actions">
+            <button v-if="casinoStatusKey === 'stopped'" type="button" class="copy-btn start-casino-btn" @click="startCasino">Start Casino</button>
+            <button v-if="casinoStatusKey !== 'stopped'" type="button" class="copy-btn history-danger-btn" @click="stopCasino">Stop</button>
+          </div>
+        </div>
+      </div>
+
     </div>
+
+      <div class="dice-setup-modal-backdrop" v-if="showDiceSetupModal" @click="showDiceSetupModal = false">
+        <div class="dice-setup-modal" @click.stop>
+          <div class="game-guide-header">
+            <h3 class="section-title game-guide-title">Roll all 5 dice</h3>
+            <button type="button" class="copy-btn" @click="showDiceSetupModal = false">Close</button>
+          </div>
+          <p class="game-guide-text">Please roll all 5 dice in the game. Circles will turn green as each dice is recorded.</p>
+          <div class="dice-circles">
+            <div v-for="(slot, idx) in 5" :key="idx" :class="['dice-circle', { rolled: diceSetup[idx] && diceSetup[idx].rolled }]">{{ idx + 1 }}</div>
+          </div>
+          <div class="game-guide-block">
+            <div class="game-guide-label">Status</div>
+            <div class="game-guide-text">{{ (diceSetup.filter(d => d.rolled).length) || 0 }} / 5 rolled</div>
+          </div>
+        </div>
+      </div>
 
       <div class="game-guide-modal-backdrop" v-if="activeGameGuide" @click="closeGameGuide">
         <div class="game-guide-modal" @click.stop>
@@ -385,6 +416,10 @@ export default {
       historySearch: '',
       selectedHistory: null,
       showClearHistoryConfirm: false,
+      showDiceSetupModal: false,
+      diceSetup: [],
+      casinoStatus: 'Stopped',
+      casinoStatusKey: 'stopped',
       roomIdentity: [],
       log: [],
       debugLog: [],
@@ -494,6 +529,39 @@ export default {
     closeGameGuide() {
       this.activeGameGuide = null;
     },
+      async startCasino() {
+        try {
+          if (this.casinoStatusKey === 'stopped') {
+            await window.go.main.App.StartCasinoSetup();
+            this.diceSetup = Array.from({ length: 5 }).map(() => ({ rolled: false, id: 0, value: 0 }));
+            this.showDiceSetupModal = true;
+            this.casinoStatus = 'Awaiting dice rolls';
+            this.casinoStatusKey = 'awaiting';
+            this.addLogMsg('[UI] Dice setup started; roll all 5 dice');
+          } else {
+            this.addLogMsg('[UI] Casino already started');
+          }
+        } catch (err) {
+          this.addLogMsg('[UI] Failed to start dice setup');
+          console.error(err);
+        }
+      },
+
+      // pause/resume removed — simplified start/stop control
+
+      async stopCasino() {
+        try {
+          await window.go.main.App.StopCasinoSetup();
+          this.casinoStatus = 'Stopped';
+          this.casinoStatusKey = 'stopped';
+          this.showDiceSetupModal = false;
+          this.diceSetup = [];
+          this.addLogMsg('[UI] Casino stopped');
+        } catch (err) {
+          this.addLogMsg('[UI] Failed to stop casino');
+          console.error(err);
+        }
+      },
     openHistoryEntry(entry) {
       this.selectedHistory = entry;
     },
@@ -748,6 +816,36 @@ export default {
         this.gameHistory = [];
       }
     });
+
+    // Dice setup updates from backend
+    window.runtime.EventsOn("diceSetupUpdate", (jsonStr) => {
+      try {
+        const payload = JSON.parse(jsonStr || '{}');
+        const dice = (payload.dice || []).map(d => ({ id: d.ID, value: d.Value, rolled: d.Value && d.Value > 0 }));
+        // ensure five slots
+        this.diceSetup = Array.from({ length: 5 }).map((_, i) => dice[i] || { id: 0, value: 0, rolled: false });
+        if (payload.complete) {
+          // small delay so user sees final green
+          setTimeout(() => {
+            this.showDiceSetupModal = false;
+            this.addLogMsg('[UI] Dice setup complete');
+          }, 700);
+          // only flip to running if not stopped
+          if (this.casinoStatusKey !== 'stopped') {
+            this.casinoStatus = 'Running';
+            this.casinoStatusKey = 'running';
+          }
+        } else {
+          // update awaiting status if we're in awaiting mode
+          if (this.casinoStatusKey === 'awaiting') {
+            this.casinoStatus = 'Awaiting dice rolls';
+            this.casinoStatusKey = 'awaiting';
+          }
+        }
+      } catch (e) {
+        console.error('diceSetupUpdate parse', e);
+      }
+    });
   },
   beforeUnmount() {}
 };
@@ -887,6 +985,90 @@ input[type="text"]::placeholder {
   border: 1px solid #444;
   border-radius: 10px;
   padding: 18px;
+}
+
+.dice-setup-modal {
+  width: min(420px, 100%);
+  background: #141414;
+  border: 1px solid #444;
+  border-radius: 10px;
+  padding: 18px;
+  text-align: center;
+}
+
+.dice-circles {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  margin-top: 12px;
+}
+
+.dice-circle {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  background: #3a3a3a;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-weight: 700;
+}
+
+.dice-circle.rolled {
+  background: #2ecc71;
+}
+
+.casino-panel {
+  margin: 18px 0;
+  padding: 12px;
+  background: #141414;
+  border: 1px solid #2f2f2f;
+  border-radius: 8px;
+}
+
+.casino-panel-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.casino-info {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.casino-status-label {
+  color: #cfcfcf;
+  font-weight: 700;
+}
+
+.casino-status {
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-weight: 700;
+}
+
+.casino-status.stopped {
+  background: #e74c3c;
+  color: #fff;
+}
+
+.casino-status.paused {
+  background: #f39c12;
+  color: #111;
+}
+
+.casino-status.running {
+  background: #2ecc71;
+  color: #081007;
+}
+
+.casino-status.awaiting {
+  background: #f1c40f;
+  color: #111;
 }
 
 .game-guide-header {

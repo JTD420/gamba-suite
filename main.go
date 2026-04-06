@@ -127,7 +127,12 @@ var (
 	currentHandItemIDs     map[string][]int
 	tradeHandSnapshot      []TradeItem
 	tradeHandSnapshotReady bool
-	handItemsMu            sync.Mutex
+	// When true, the dealer will only refresh the frozen trade-hand
+	// snapshot at controlled points: once before announcing Dealer Open
+	// and after a game completes. Mid-trade strip scans will not update
+	// the frozen snapshot while this policy is active.
+	strictTradeSnapshotLifecycle bool = true
+	handItemsMu                  sync.Mutex
 	// lastAllTradeItems stores the last full TRADE_ITEMS (all items) packet
 	// so we can compute deltas between successive full-state packets. This
 	// helps reliably attribute the first added item to the correct side.
@@ -248,7 +253,20 @@ func (a *App) startup(ctx context.Context) {
 	}()
 	go func() {
 		time.Sleep(1500 * time.Millisecond)
-		a.requestPlayerStrip()
+		scanID := a.requestPlayerStrip()
+		if ok := waitForStripScanCompletion(scanID, 20*time.Second); ok {
+			a.AddLogMsg(fmt.Sprintf("[STRIP] initial hand sync complete (session=%d)", scanID))
+			log.Printf("[STRIP] initial hand sync complete (session=%d)", scanID)
+			if !strictTradeSnapshotLifecycle || !tradeHandSnapshotReady {
+				a.captureTradeHandSnapshot()
+			} else {
+				a.AddLogMsg("[STRIP] strict snapshot lifecycle active and snapshot already ready; skipping initial capture")
+				log.Printf("[STRIP] strict snapshot lifecycle active and snapshot already ready; skipping initial capture")
+			}
+		} else {
+			a.AddLogMsg(fmt.Sprintf("[STRIP] initial hand sync timeout (session=%d)", scanID))
+			log.Printf("[STRIP] initial hand sync timeout (session=%d)", scanID)
+		}
 
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -937,7 +955,17 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 			// Send the trade items summary to chat
 			a.sendTradeCompletionMessage()
-			go a.requestPlayerStrip()
+			go func() {
+				scanID := a.requestPlayerStrip()
+				if ok := waitForStripScanCompletion(scanID, 20*time.Second); ok {
+					a.AddLogMsg(fmt.Sprintf("[TRADE_COMPLETED] hand sync complete (session=%d) - updating trade snapshot", scanID))
+					log.Printf("[TRADE_COMPLETED] hand sync complete (session=%d) - updating trade snapshot", scanID)
+					a.captureTradeHandSnapshot()
+				} else {
+					a.AddLogMsg(fmt.Sprintf("[TRADE_COMPLETED] hand sync timeout (session=%d)", scanID))
+					log.Printf("[TRADE_COMPLETED] hand sync timeout (session=%d)", scanID)
+				}
+			}()
 		}
 		return
 	}
@@ -1168,8 +1196,13 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		ext.Send(out.SHOUT, openMsg)
 
 		handItemsMu.Lock()
-		tradeHandSnapshot = []TradeItem{}
-		tradeHandSnapshotReady = false
+		// Under strict lifecycle we keep the snapshot taken before Dealer Open
+		// so it remains stable for the whole round. Only clear when not
+		// enforcing the strict lifecycle.
+		if !strictTradeSnapshotLifecycle {
+			tradeHandSnapshot = []TradeItem{}
+			tradeHandSnapshotReady = false
+		}
 		handItemsMu.Unlock()
 
 		// Mark trade as open so background hand rescans are skipped while
@@ -1196,7 +1229,14 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		go func() {
 			scanID := a.requestPlayerStrip()
 			if ok := waitForStripScanCompletion(scanID, 20*time.Second); ok {
-				a.captureTradeHandSnapshot()
+				// Under strict lifecycle, only capture if we don't already
+				// have a frozen snapshot for the current round.
+				if !strictTradeSnapshotLifecycle || !tradeHandSnapshotReady {
+					a.captureTradeHandSnapshot()
+				} else {
+					a.AddLogMsg("[TRADE_HAND_SNAPSHOT] strict lifecycle active and snapshot already ready; skipping capture")
+					log.Printf("[TRADE_HAND_SNAPSHOT] strict lifecycle active and snapshot already ready; skipping capture")
+				}
 				a.notifyTradeQuantityCoverage()
 			} else {
 				a.AddLogMsg(fmt.Sprintf("[TRADE_HAND_SNAPSHOT] hand scan timeout (session=%d)", scanID))
@@ -2833,8 +2873,14 @@ func (a *App) ClearTradeItems() {
 	tradeItemsMu.Unlock()
 
 	handItemsMu.Lock()
-	tradeHandSnapshot = []TradeItem{}
-	tradeHandSnapshotReady = false
+	// Only clear the frozen trade-hand snapshot when strict lifecycle is
+	// disabled. Under the strict policy the snapshot should remain valid
+	// for the dealer-open period and only be refreshed after a completed
+	// game.
+	if !strictTradeSnapshotLifecycle {
+		tradeHandSnapshot = []TradeItem{}
+		tradeHandSnapshotReady = false
+	}
 	// Mark trade as closed so periodic/rescans may resume normally.
 	tradeOpen = false
 	handItemsMu.Unlock()
@@ -2953,6 +2999,11 @@ func (a *App) resyncHandThenOpenDealer() {
 	if ok := waitForStripScanCompletion(scanID, 20*time.Second); ok {
 		a.AddLogMsg(fmt.Sprintf("[TRADE_REOPEN] hand sync complete (session=%d)", scanID))
 		log.Printf("[TRADE_REOPEN] hand sync complete (session=%d)", scanID)
+		// Capture a fresh frozen snapshot for the upcoming dealer-open round.
+		if !strictTradeSnapshotLifecycle || !tradeHandSnapshotReady {
+			a.captureTradeHandSnapshot()
+			log.Printf("[TRADE_REOPEN] captured trade hand snapshot (session=%d)", scanID)
+		}
 	} else {
 		a.AddLogMsg(fmt.Sprintf("[TRADE_REOPEN] hand sync timeout (session=%d), reopening anyway", scanID))
 		log.Printf("[TRADE_REOPEN] hand sync timeout (session=%d), reopening anyway", scanID)
@@ -2992,6 +3043,11 @@ func (a *App) openDealerAfterRound() {
 	if ok := waitForStripScanCompletion(scanID, 20*time.Second); ok {
 		a.AddLogMsg(fmt.Sprintf("[DEALER_REOPEN] hand sync complete (session=%d)", scanID))
 		log.Printf("[DEALER_REOPEN] hand sync complete (session=%d)", scanID)
+		// Capture a frozen snapshot to be used for the upcoming dealer-open period.
+		if !strictTradeSnapshotLifecycle || !tradeHandSnapshotReady {
+			a.captureTradeHandSnapshot()
+			log.Printf("[DEALER_REOPEN] captured trade hand snapshot (session=%d)", scanID)
+		}
 	} else {
 		a.AddLogMsg(fmt.Sprintf("[DEALER_REOPEN] hand sync timeout (session=%d), reopening anyway", scanID))
 		log.Printf("[DEALER_REOPEN] hand sync timeout (session=%d), reopening anyway", scanID)
@@ -3115,14 +3171,21 @@ func (a *App) finalizeStripScan(sessionID int, reason string) {
 	// If a trade is open, refresh the frozen hand snapshot so coverage
 	// checks reflect recent hand removals/additions, then re-run coverage.
 	if tradeOpen {
-		// captureTradeHandSnapshot will copy currentHandItems into tradeHandSnapshot
-		// and mark the snapshot ready for coverage comparisons.
-		go func() {
-			a.captureTradeHandSnapshot()
-			// small delay to ensure snapshot processed before coverage check
-			time.Sleep(50 * time.Millisecond)
-			a.notifyTradeQuantityCoverage()
-		}()
+		// Under the strict lifecycle policy, avoid updating the frozen
+		// snapshot mid-trade — only update when no snapshot exists.
+		if !strictTradeSnapshotLifecycle || !tradeHandSnapshotReady {
+			// captureTradeHandSnapshot will copy currentHandItems into tradeHandSnapshot
+			// and mark the snapshot ready for coverage comparisons.
+			go func() {
+				a.captureTradeHandSnapshot()
+				// small delay to ensure snapshot processed before coverage check
+				time.Sleep(50 * time.Millisecond)
+				a.notifyTradeQuantityCoverage()
+			}()
+		} else {
+			a.AddLogMsg("[STRIP_DEBUG] trade open and strict snapshot lifecycle active; skipping snapshot refresh")
+			log.Printf("[STRIP_DEBUG] trade open and strict snapshot lifecycle active; skipping snapshot refresh")
+		}
 	}
 }
 

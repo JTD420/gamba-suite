@@ -3304,21 +3304,29 @@ func (a *App) notifyTradeQuantityCoverage() {
 		stopShortageMonitor()
 		return
 	}
-	// Build the minimal message: raw item class with '*' and quantity, quoted.
+	// Build a concise message listing how many we have of each short item,
+	// shout it, then close the trade so the booth becomes available again.
 	parts := make([]string, 0, len(shortages))
 	for _, s := range shortages {
-		parts = append(parts, fmt.Sprintf("%s*%d", s.Name, s.HaveHand))
+		parts = append(parts, fmt.Sprintf("%s %d", formatTradeItemName(s.Name), s.HaveHand))
 	}
-	msg := fmt.Sprintf("I only have \"%s\"", strings.Join(parts, ", "))
+	msg := fmt.Sprintf("I don't have that many; I only have %s", strings.Join(parts, ", "))
 	lastTradeCoverageNotice = msg
+	lastTradeBlockNotice = msg
 
 	a.AddLogMsg(fmt.Sprintf("[TRADE_COVERAGE] %s", msg))
 	log.Printf("[TRADE_COVERAGE] %s", msg)
 
 	go func() {
+		// small delay so the shout isn't rate-limited/clobbered
 		time.Sleep(450 * time.Millisecond)
 		ext.Send(out.SHOUT, msg)
+		time.Sleep(300 * time.Millisecond)
+		ext.Send(out.TRADE_CLOSE)
 	}()
+
+	// ensure any active shortage monitor is stopped since we're force-closing
+	stopShortageMonitor()
 }
 
 func (a *App) getTradeCoverageShortages() []tradeShortage {

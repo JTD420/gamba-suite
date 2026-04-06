@@ -954,11 +954,13 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 		resetTradeAutoFlow()
 
-		// Always start fresh — never let a previous round's partner name
-		// poison the fallback guard in the identification logic below.
-		lastTradePartnerName = ""
-		lastTradePartnerID = 0
-		lastTradePartnerToken = ""
+		// Only clear lastTradePartnerName/ID/Token if not a payout trade.
+		// This preserves the winner's name for the payout trade open message.
+		if !isPayoutTradeOpen {
+			lastTradePartnerName = ""
+			lastTradePartnerID = 0
+			lastTradePartnerToken = ""
+		}
 
 		for _, decodeLine := range decodeTradeOpenPacket(e.Packet) {
 			a.AddLogMsg("[TRADE_OPEN_DECODE] " + decodeLine)

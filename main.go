@@ -28,108 +28,118 @@ import (
 
 // Global variables for dice management, rolling state, mutex, and wait group
 var (
-	diceList                           []*Dice
-	mutedDuration                      int
-	isMuted                            bool
-	currentSum                         int
-	commandList                        string
-	awaitingTradeOpen                  bool
-	dealerTradeWindowOpen              bool
-	tradeOpenCount                     int
-	tradeCloseCount                    int
-	lastTradePartnerID                 int
-	lastTradePartnerName               string
-	lastTradePartnerToken              string
-	tradeAutoFlowID                    int
-	tradeAutoAccepted                  bool
-	tradeAutoConfirmed                 bool
-	tradeAutoAcceptPending             bool
-	tradeAutoConfirmPending            bool
-	tradeCompleted                     bool
-	tradeCloseAnnounced                bool
-	suppressNextTradeCloseAnnouncement bool
-	ignoreNextGuardCloseRecovery       bool
-	hiddenBlockedTradeCleanupPending   bool
-	lastTradeCoverageNotice            string
-	lastTradeBlockNotice               string
-	awaitingGameChoice                 bool
-	awaitingGameChoicePartnerID        int
-	awaitingGameChoicePartnerName      string
-	pokerSequenceStage                 int
-	pokerSequencePlayerName            string
-	pokerSequencePlayerResult          PokerHandResult
-	pokerSequencePlayerHand            string
-	pokerPayoutMode                    bool
-	pokerPayoutTradeActive             bool
-	pokerPayoutTargetID                int
-	pokerPayoutTargetName              string
-	pokerPayoutAttempts                int
-	pokerPayoutSessionID               int
-	pokerPayoutTradeSent               bool
-	payoutExpectedAddCount             int
-	payoutActualAddCount               int
-	underfundedTradeMonitorID          int
-	underfundedTradeMonitorNotice      string
-	lastTradeOpenData                  string
-	lastTradeOpen                      string
-	isPokerRolling                     bool
-	isTriRolling                       bool
-	isBJRolling                        bool
-	is13Rolling                        bool
-	is13Hitting                        bool
-	isHitting                          bool
-	isClosing                          bool
-	ChatIsDisabled                     bool
-	mutex                              sync.Mutex
-	resultsWaitGroup                   sync.WaitGroup
-	rollDelay                          = 550 * time.Millisecond
-	stripNextDelay                     = 2250 * time.Millisecond
-	stripGetNewPayload                 = "new"
-	stripGetNextPayload                = "next"
-	tradeUserPattern                   = regexp.MustCompile(`\[(\d+)\]`)
-	stripItemNameRe                    = regexp.MustCompile(`(?:CF_\d+_[a-z][a-z_]*|[a-z][a-z0-9_]*_[a-z0-9_]+)(?:\*\d+)?`)
-	gameChoiceCleanupRe                = regexp.MustCompile(`[^a-z0-9]+`)
-	roomEntities                       = map[int]room.Entity{}
-	roomMu                             sync.Mutex
-	lastRoomUsersRequestAt             time.Time
-	roomUsersReqMu                     sync.Mutex
-	users28ByToken                     = map[string]string{}
-	users28ByIndex                     = map[int]string{} // roomIndex -> name
-	users28ByShortToken                = map[string]string{}
-	roomIdentityByShortToken           = map[string]RoomIdentityEntry{}
-	users28Mu                          sync.Mutex
-	headerSniffUntil                   time.Time
-	headerSniffSeen                    = map[uint16]bool{}
-	headerSniffMu                      sync.Mutex
-	currentTradeItems                  []TradeItem
-	currentOwnTradeItems               []TradeItem
-	tradeItemsMu                       sync.Mutex
-	lastAddItemWasOurs                 bool
-	addItemMu                          sync.Mutex
-	currentHandItems                   []TradeItem
-	currentHandItemIDs                 map[string][]int
-	handItemsMu                        sync.Mutex
-	pokerGameBetItems                  []TradeItem
-	stripScanMu                        sync.Mutex
-	stripScanActive                    bool
-	stripScanSessionID                 = 0
-	stripScanPageCount                 = 0
-	stripScanSeenItemIDs               = map[int]struct{}{}
-	stripScanCounts                    = map[string]int{}
-	stripScanItemIDs                   = map[string][]int{}
-	knownDiceIDs                       = map[int]struct{}{}
-	fakeDiceTestingMode                bool
-	dealerOpenHeartbeatID              int
-	dealerOpenHeartbeatActive          bool
-	dealerResyncInProgress             bool
-	lastOutgoingTradeOpenID            int
-	lastOutgoingTradeOpenAt            time.Time
-	tradeOpenStateMu                   sync.Mutex
-	tradeWindowTimeoutMonitorID        int
-	tradeWindowOpenedAt                time.Time
-	tradeWindowDeadline                time.Time
-	tradeWindowTimeoutActive           bool
-	blockAllTrades                     = true
+	diceList                             []*Dice
+	mutedDuration                        int
+	isMuted                              bool
+	currentSum                           int
+	commandList                          string
+	awaitingTradeOpen                    bool
+	dealerTradeWindowOpen                bool
+	tradeOpenCount                       int
+	tradeCloseCount                      int
+	lastTradePartnerID                   int
+	lastTradePartnerName                 string
+	lastTradePartnerToken                string
+	tradeAutoFlowID                      int
+	tradeAutoAccepted                    bool
+	tradeAutoConfirmed                   bool
+	tradeAutoAcceptPending               bool
+	tradeAutoConfirmPending              bool
+	tradeCompleted                       bool
+	tradeCloseAnnounced                  bool
+	suppressNextTradeCloseAnnouncement   bool
+	ignoreNextGuardCloseRecovery         bool
+	hiddenBlockedTradeCleanupPending     bool
+	lastTradeCoverageNotice              string
+	lastTradeBlockNotice                 string
+	awaitingGameChoice                   bool
+	awaitingGameChoicePartnerID          int
+	awaitingGameChoicePartnerName        string
+	awaitingBlackjackDecision            bool
+	awaitingBlackjackDecisionPartnerID   int
+	awaitingBlackjackDecisionPartnerName string
+	blackjackRoundActive                 bool
+	blackjackPlayerTurn                  bool
+	blackjackPlayerTotal                 int
+	blackjackDealerTotal                 int
+	blackjackPlayerName                  string
+	pokerSequenceStage                   int
+	blackjackHitInFlight                 bool
+	blackjackNextHitIndex                int
+	pokerSequencePlayerName              string
+	pokerSequencePlayerResult            PokerHandResult
+	pokerSequencePlayerHand              string
+	pokerPayoutMode                      bool
+	pokerPayoutTradeActive               bool
+	pokerPayoutTargetID                  int
+	pokerPayoutTargetName                string
+	pokerPayoutAttempts                  int
+	pokerPayoutSessionID                 int
+	pokerPayoutTradeSent                 bool
+	payoutExpectedAddCount               int
+	payoutActualAddCount                 int
+	underfundedTradeMonitorID            int
+	underfundedTradeMonitorNotice        string
+	lastTradeOpenData                    string
+	lastTradeOpen                        string
+	isPokerRolling                       bool
+	isTriRolling                         bool
+	isBJRolling                          bool
+	is13Rolling                          bool
+	is13Hitting                          bool
+	isHitting                            bool
+	isClosing                            bool
+	ChatIsDisabled                       bool
+	mutex                                sync.Mutex
+	resultsWaitGroup                     sync.WaitGroup
+	rollDelay                            = 550 * time.Millisecond
+	stripNextDelay                       = 2250 * time.Millisecond
+	stripGetNewPayload                   = "new"
+	stripGetNextPayload                  = "next"
+	tradeUserPattern                     = regexp.MustCompile(`\[(\d+)\]`)
+	stripItemNameRe                      = regexp.MustCompile(`(?:CF_\d+_[a-z][a-z_]*|[a-z][a-z0-9_]*_[a-z0-9_]+)(?:\*\d+)?`)
+	gameChoiceCleanupRe                  = regexp.MustCompile(`[^a-z0-9]+`)
+	roomEntities                         = map[int]room.Entity{}
+	roomMu                               sync.Mutex
+	lastRoomUsersRequestAt               time.Time
+	roomUsersReqMu                       sync.Mutex
+	users28ByToken                       = map[string]string{}
+	users28ByIndex                       = map[int]string{} // roomIndex -> name
+	users28ByShortToken                  = map[string]string{}
+	roomIdentityByShortToken             = map[string]RoomIdentityEntry{}
+	users28Mu                            sync.Mutex
+	headerSniffUntil                     time.Time
+	headerSniffSeen                      = map[uint16]bool{}
+	headerSniffMu                        sync.Mutex
+	currentTradeItems                    []TradeItem
+	currentOwnTradeItems                 []TradeItem
+	tradeItemsMu                         sync.Mutex
+	lastAddItemWasOurs                   bool
+	addItemMu                            sync.Mutex
+	currentHandItems                     []TradeItem
+	currentHandItemIDs                   map[string][]int
+	handItemsMu                          sync.Mutex
+	pokerGameBetItems                    []TradeItem
+	stripScanMu                          sync.Mutex
+	stripScanActive                      bool
+	stripScanSessionID                   = 0
+	stripScanPageCount                   = 0
+	stripScanSeenItemIDs                 = map[int]struct{}{}
+	stripScanCounts                      = map[string]int{}
+	stripScanItemIDs                     = map[string][]int{}
+	knownDiceIDs                         = map[int]struct{}{}
+	fakeDiceTestingMode                  bool
+	dealerOpenHeartbeatID                int
+	dealerOpenHeartbeatActive            bool
+	dealerResyncInProgress               bool
+	lastOutgoingTradeOpenID              int
+	lastOutgoingTradeOpenAt              time.Time
+	tradeOpenStateMu                     sync.Mutex
+	tradeWindowTimeoutMonitorID          int
+	tradeWindowOpenedAt                  time.Time
+	tradeWindowDeadline                  time.Time
+	tradeWindowTimeoutActive             bool
+	blockAllTrades                       = true
 )
 
 type TradeItem struct {
@@ -286,7 +296,7 @@ func (a *App) dealerOpenMessage() string {
 }
 
 func dealerGameActive() bool {
-	return awaitingGameChoice || pokerSequenceStage > 0 || isPokerRolling || isTriRolling || isBJRolling || is13Rolling || isHitting || is13Hitting || isClosing
+	return awaitingGameChoice || awaitingBlackjackDecision || blackjackRoundActive || pokerSequenceStage > 0 || isPokerRolling || isTriRolling || isBJRolling || is13Rolling || isHitting || is13Hitting || isClosing
 }
 
 func dealerReadyForNewTrade() bool {
@@ -1133,6 +1143,19 @@ func resetPokerSequence() {
 	pokerSequencePlayerName = ""
 	pokerSequencePlayerResult = PokerHandResult{}
 	pokerSequencePlayerHand = ""
+}
+
+func resetBlackjackSequence() {
+	awaitingBlackjackDecision = false
+	awaitingBlackjackDecisionPartnerID = 0
+	awaitingBlackjackDecisionPartnerName = ""
+	blackjackRoundActive = false
+	blackjackPlayerTurn = false
+	blackjackPlayerTotal = 0
+	blackjackDealerTotal = 0
+	blackjackPlayerName = ""
+	blackjackHitInFlight = false
+	blackjackNextHitIndex = 3
 }
 
 func stopPokerPayout() {
@@ -2079,6 +2102,7 @@ func (a *App) resetDealerSessionState(reason string) {
 	stopDealerOpenHeartbeat()
 	resetTradeAutoFlow()
 	resetPokerSequence()
+	resetBlackjackSequence()
 	stopPokerPayout()
 	a.ClearTradeItems()
 
@@ -2142,8 +2166,16 @@ func lookupUsers28NameIndex(name string) (int, bool) {
 
 	users28Mu.Lock()
 	defer users28Mu.Unlock()
-	for idx, cachedName := range users28ByIndex {
-		if strings.ToLower(strings.TrimSpace(cachedName)) == needle {
+	for _, entry := range roomIdentityByShortToken {
+		if entry.ChatIndex > 0 && strings.ToLower(strings.TrimSpace(entry.Name)) == needle {
+			return entry.ChatIndex, true
+		}
+	}
+	for short, cachedName := range users28ByShortToken {
+		if strings.ToLower(strings.TrimSpace(cachedName)) != needle {
+			continue
+		}
+		if idx, ok := chatIndexFromShortToken(short); ok && idx > 0 {
 			return idx, true
 		}
 	}
@@ -2225,20 +2257,7 @@ func decodeShortChatToken(token string) (idx int, ok bool) {
 }
 
 func chatIndexFromShortToken(token string) (idx int, ok bool) {
-	if !isLikelyChatToken(token) {
-		return 0, false
-	}
-	defer func() {
-		if recover() != nil {
-			idx = 0
-			ok = false
-		}
-	}()
-	idx = gencoding.B64Decode([]byte(token[:1]))
-	if idx <= 0 {
-		return 0, false
-	}
-	return idx, true
+	return decodeShortChatToken(token)
 }
 
 func lookupRoomIdentityByChatIndex(index int) (string, bool) {
@@ -3981,6 +4000,13 @@ func (a *App) onChatMessage(e *g.Intercept) {
 			go a.closeAllDice()
 		case strings.HasSuffix(command, "21"):
 			e.Block()
+			resetBlackjackSequence()
+			blackjackRoundActive = true
+			blackjackPlayerTurn = true
+			blackjackPlayerName = strings.TrimSpace(lastTradePartnerName)
+			if blackjackPlayerName == "" {
+				blackjackPlayerName = "Player"
+			}
 			isBJRolling = true
 			logRollResult := fmt.Sprintf("21 Roll:\n")
 			a.AddLogMsg(logRollResult)
@@ -4078,6 +4104,38 @@ func (a *App) beginPokerSequence() {
 	}(second)
 }
 
+func (a *App) beginBlackjackSequence() {
+	playerName := strings.TrimSpace(lastTradePartnerName)
+	if playerName == "" {
+		playerName = "Player"
+	}
+
+	resetPokerSequence()
+	resetBlackjackSequence()
+	blackjackRoundActive = true
+	blackjackPlayerTurn = true
+	blackjackPlayerName = playerName
+
+	first := "Lets Play!"
+	second := fmt.Sprintf("%s Roll", playerName)
+
+	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", first))
+	log.Printf("[GAME_SELECT] shouting: %q", first)
+	ext.Send(out.SHOUT, first)
+
+	go func(msg string) {
+		time.Sleep(700 * time.Millisecond)
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", msg))
+		log.Printf("[GAME_SELECT] shouting: %q", msg)
+		ext.Send(out.SHOUT, msg)
+
+		time.Sleep(700 * time.Millisecond)
+		isBJRolling = true
+		a.AddLogMsg("21 Roll:\n")
+		go a.rollBjDice()
+	}(second)
+}
+
 // Reset all saved dice states
 func resetDiceState() {
 	mutex.Lock()
@@ -4088,6 +4146,7 @@ func resetDiceState() {
 	dealerTradeWindowOpen = false
 	stopTradeWindowTimeoutMonitor()
 	resetPokerSequence()
+	resetBlackjackSequence()
 	fakeDiceTestingMode = false
 	isPokerRolling, isTriRolling, isBJRolling, is13Rolling, isHitting, is13Hitting, isClosing = false, false, false, false, false, false, false
 }
@@ -4234,7 +4293,15 @@ func (a *App) handleDiceResult(e *g.Intercept) {
 		if dice.ID == diceID {
 			if dice.IsRolling && (isPokerRolling || isTriRolling || isBJRolling || is13Rolling || is13Hitting || isHitting) {
 				dice.IsRolling = false
-				resultsWaitGroup.Done()
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							a.AddLogMsg(fmt.Sprintf("[DICE_SYNC_GUARD] recovered from resultsWaitGroup.Done panic for dice %d: %v", diceID, r))
+							log.Printf("[DICE_SYNC_GUARD] recovered from resultsWaitGroup.Done panic for dice %d: %v", diceID, r)
+						}
+					}()
+					resultsWaitGroup.Done()
+				}()
 			}
 			diceList[i].Value = adjustedDiceValue
 			diceList[i].IsClosed = diceList[i].Value == 0
@@ -4384,22 +4451,39 @@ func (a *App) rollBjDice() {
 			isBJRolling = false
 			return
 		}
+		blackjackNextHitIndex = 3
 		currentSum = 0
+		a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] turn start actor=%s using initial slots [0 1 2], next hit slot=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], blackjackNextHitIndex))
+		log.Printf("[BJ_DEBUG] turn start actor=%s using initial slots [0 1 2], next hit slot=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], blackjackNextHitIndex)
 		for _, index := range []int{0, 1, 2} {
 			diceList[index].Value = rand.Intn(6) + 1
 			diceList[index].IsClosed = false
 			currentSum += diceList[index].Value
 			logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceList[index].ID, diceList[index].Value)
 			a.AddLogMsg(logRollResult)
+			a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] initial slot=%d diceID=%d value=%d runningSum=%d", index, diceList[index].ID, diceList[index].Value, currentSum))
+			log.Printf("[BJ_DEBUG] initial slot=%d diceID=%d value=%d runningSum=%d", index, diceList[index].ID, diceList[index].Value, currentSum)
 		}
+		a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] initial 3 complete total=%d (fake mode)", currentSum))
+		log.Printf("[BJ_DEBUG] initial 3 complete total=%d (fake mode)", currentSum)
 		mutex.Unlock()
+
+		if !ChatIsDisabled && !isMuted {
+			actor := blackjackPlayerName
+			if actor == "" {
+				actor = "Player"
+			}
+			if !blackjackPlayerTurn {
+				actor = "Dealer"
+				sendMessageWithDelay(fmt.Sprintf("%s total %d", actor, currentSum))
+			}
+		}
+
 		a.evaluateBlackjackHand()
 		isBJRolling = false
 		return
 	}
 
-	go a.closeAllDice()
-	time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
 	mutex.Lock()
 
 	if len(diceList) < 5 {
@@ -4409,7 +4493,10 @@ func (a *App) rollBjDice() {
 		return
 	}
 
+	blackjackNextHitIndex = 3
 	currentSum = 0 // Reset sum before starting
+	a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] turn start actor=%s using initial slots [0 1 2], next hit slot=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], blackjackNextHitIndex))
+	log.Printf("[BJ_DEBUG] turn start actor=%s using initial slots [0 1 2], next hit slot=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], blackjackNextHitIndex)
 	resultsWaitGroup.Add(3)
 	mutex.Unlock()
 
@@ -4420,19 +4507,47 @@ func (a *App) rollBjDice() {
 	}
 
 	time.Sleep(1000 * time.Millisecond)
-	resultsWaitGroup.Wait()
+	a.waitForBlackjackDiceResults([]int{0, 1, 2}, 6*time.Second, "initial-roll")
 
 	mutex.Lock()
+	values := make([]int, 0, 3)
 	for _, index := range []int{0, 1, 2} {
 		currentSum += diceList[index].Value
+		values = append(values, diceList[index].Value)
+		a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] initial resolved slot=%d diceID=%d value=%d runningSum=%d", index, diceList[index].ID, diceList[index].Value, currentSum))
+		log.Printf("[BJ_DEBUG] initial resolved slot=%d diceID=%d value=%d runningSum=%d", index, diceList[index].ID, diceList[index].Value, currentSum)
 	}
+	a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] initial 3 complete values=%v total=%d", values, currentSum))
+	log.Printf("[BJ_DEBUG] initial 3 complete values=%v total=%d", values, currentSum)
 	mutex.Unlock()
+
+	if !ChatIsDisabled && !isMuted {
+		actor := blackjackPlayerName
+		if actor == "" {
+			actor = "Player"
+		}
+		if !blackjackPlayerTurn {
+			actor = "Dealer"
+			sendMessageWithDelay(fmt.Sprintf("%s total %d", actor, currentSum))
+		}
+	}
 
 	a.evaluateBlackjackHand()
 	isBJRolling = false
 }
 
 func (a *App) hitBjDice() {
+	defer func() {
+		blackjackHitInFlight = false
+		if r := recover(); r != nil {
+			a.AddLogMsg(fmt.Sprintf("[BJ_CRASH_GUARD] recovered panic in hitBjDice: %v", r))
+			log.Printf("[BJ_CRASH_GUARD] recovered panic in hitBjDice: %v", r)
+			resetBlackjackSequence()
+			isBJRolling = false
+			isHitting = false
+		}
+	}()
+
 	if fakeDiceTestingMode {
 		mutex.Lock()
 		if len(diceList) < 5 {
@@ -4443,28 +4558,32 @@ func (a *App) hitBjDice() {
 			return
 		}
 
-		rolled := false
-		for i := 3; i < 5; i++ {
-			if diceList[i].Value == 0 {
-				diceList[i].Value = rand.Intn(6) + 1
-				diceList[i].IsClosed = false
-				currentSum += diceList[i].Value
-				rolled = true
-				logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceList[i].ID, diceList[i].Value)
-				a.AddLogMsg(logRollResult)
-				break
-			}
+		slot := blackjackNextHitIndex
+		if slot < 0 || slot >= len(diceList) {
+			slot = 0
 		}
+		blackjackNextHitIndex = (slot + 1) % len(diceList)
 
-		if !rolled {
-			diceList[4].Value = rand.Intn(6) + 1
-			diceList[4].IsClosed = false
-			currentSum += diceList[4].Value
-			logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceList[4].ID, diceList[4].Value)
-			a.AddLogMsg(logRollResult)
-		}
+		diceList[slot].Value = rand.Intn(6) + 1
+		diceList[slot].IsClosed = false
+		currentSum += diceList[slot].Value
+		logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceList[slot].ID, diceList[slot].Value)
+		a.AddLogMsg(logRollResult)
+		a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] hit actor=%s slot=%d diceID=%d value=%d newTotal=%d nextSlot=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], slot, diceList[slot].ID, diceList[slot].Value, currentSum, blackjackNextHitIndex))
+		log.Printf("[BJ_DEBUG] hit actor=%s slot=%d diceID=%d value=%d newTotal=%d nextSlot=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], slot, diceList[slot].ID, diceList[slot].Value, currentSum, blackjackNextHitIndex)
 		mutex.Unlock()
 
+		blackjackHitInFlight = false
+		if !ChatIsDisabled && !isMuted {
+			actor := blackjackPlayerName
+			if actor == "" {
+				actor = "Player"
+			}
+			if !blackjackPlayerTurn {
+				actor = "Dealer"
+				sendMessageWithDelay(fmt.Sprintf("%s total %d", actor, currentSum))
+			}
+		}
 		a.evaluateBlackjackHand()
 		isHitting = false
 		isBJRolling = false
@@ -4481,50 +4600,108 @@ func (a *App) hitBjDice() {
 		return
 	}
 
+	slot := blackjackNextHitIndex
+	if slot < 0 || slot >= len(diceList) {
+		slot = 0
+	}
+	nextSlot := (slot + 1) % len(diceList)
+	blackjackNextHitIndex = nextSlot
+	diceID := diceList[slot].ID
+	a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] hit queued actor=%s slot=%d diceID=%d nextSlot=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], slot, diceID, nextSlot))
+	log.Printf("[BJ_DEBUG] hit queued actor=%s slot=%d diceID=%d nextSlot=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], slot, diceID, nextSlot)
+
 	resultsWaitGroup.Add(1)
 	mutex.Unlock()
 
-	for i := 3; i < 5; i++ { // Start from index 3 to roll the next available dice
-		if diceList[i].Value == 0 {
-			diceList[i].Roll()
-			time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
-			resultsWaitGroup.Wait()
-
-			mutex.Lock()
-			currentSum += diceList[i].Value // Add value to current sum
-			mutex.Unlock()
-
-			// Re-evaluate the hand after hitting
-			a.evaluateBlackjackHand()
-
-			isBJRolling = false
-			isHitting = false
-			return
-		}
-	}
-
-	// If all dice have been rolled, re-roll the last one
-	oldValue := diceList[4].Value
-	// sleep random between 1000 and 1500ms
-	time.Sleep(time.Duration(rand.Intn(1000)+500) * time.Millisecond)
-	diceList[4].Roll()
+	diceList[slot].Roll()
 
 	time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
-	resultsWaitGroup.Wait()
-	newValue := diceList[4].Value
+	a.waitForBlackjackDiceResults([]int{slot}, 5*time.Second, "hit-roll")
+	newValue := diceList[slot].Value
 
 	mutex.Lock()
 	currentSum = currentSum + newValue // Adjust current sum
+	newTotal := currentSum
 	mutex.Unlock()
 
 	// Log the value of the dice rolled
-	log.Printf("Hit: Re-rolled dice %d = %d (old value was %d)\n", diceList[4].ID, newValue, oldValue)
+	a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] hit resolved actor=%s slot=%d diceID=%d value=%d newTotal=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], slot, diceID, newValue, newTotal))
+	log.Printf("[BJ_DEBUG] hit resolved actor=%s slot=%d diceID=%d value=%d newTotal=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], slot, diceID, newValue, newTotal)
+	if !ChatIsDisabled && !isMuted {
+		actor := blackjackPlayerName
+		if actor == "" {
+			actor = "Player"
+		}
+		if !blackjackPlayerTurn {
+			actor = "Dealer"
+			sendMessageWithDelay(fmt.Sprintf("%s total %d", actor, newTotal))
+		}
+	}
 
 	// Re-evaluate the hand with the updated sum
+	blackjackHitInFlight = false
 	a.evaluateBlackjackHand()
 
 	isHitting = false
 	isBJRolling = false
+}
+
+func (a *App) waitForBlackjackDiceResults(slots []int, timeout time.Duration, reason string) {
+	deadline := time.Now().Add(timeout)
+
+	for {
+		pending := make([]int, 0, len(slots))
+
+		mutex.Lock()
+		for _, slot := range slots {
+			if slot < 0 || slot >= len(diceList) {
+				continue
+			}
+			if diceList[slot].IsRolling {
+				pending = append(pending, slot)
+			}
+		}
+		mutex.Unlock()
+
+		if len(pending) == 0 {
+			a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] wait complete reason=%s slots=%v", reason, slots))
+			log.Printf("[BJ_DEBUG] wait complete reason=%s slots=%v", reason, slots)
+			return
+		}
+
+		if time.Now().After(deadline) {
+			a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] wait timeout reason=%s pendingSlots=%v; forcing unstick", reason, pending))
+			log.Printf("[BJ_DEBUG] wait timeout reason=%s pendingSlots=%v; forcing unstick", reason, pending)
+
+			mutex.Lock()
+			for _, slot := range pending {
+				if slot < 0 || slot >= len(diceList) {
+					continue
+				}
+				if !diceList[slot].IsRolling {
+					continue
+				}
+				diceList[slot].IsRolling = false
+				diceID := diceList[slot].ID
+				diceValue := diceList[slot].Value
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] forced unstick Done panic diceID=%d slot=%d: %v", diceID, slot, r))
+							log.Printf("[BJ_DEBUG] forced unstick Done panic diceID=%d slot=%d: %v", diceID, slot, r)
+						}
+					}()
+					resultsWaitGroup.Done()
+				}()
+				a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] forced unstick slot=%d diceID=%d retainedValue=%d", slot, diceID, diceValue))
+				log.Printf("[BJ_DEBUG] forced unstick slot=%d diceID=%d retainedValue=%d", slot, diceID, diceValue)
+			}
+			mutex.Unlock()
+			return
+		}
+
+		time.Sleep(75 * time.Millisecond)
+	}
 }
 
 // Roll dice for blackjack-style game
@@ -4855,6 +5032,52 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 		a.AddChatLog(fmt.Sprintf("[IN %s] %d -> %s", chatType, index, msg))
 	}
 
+	if awaitingBlackjackDecision {
+		decision, ok := normalizeBlackjackDecision(msg)
+		if !ok {
+			a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] awaiting decision from %q(index=%d), ignored non-decision message=%q", awaitingBlackjackDecisionPartnerName, awaitingBlackjackDecisionPartnerID, msg))
+			log.Printf("[BJ_DEBUG] awaiting decision from %q(index=%d), ignored non-decision message=%q", awaitingBlackjackDecisionPartnerName, awaitingBlackjackDecisionPartnerID, msg)
+			return
+		}
+
+		indexMatch := awaitingBlackjackDecisionPartnerID > 0 && index == awaitingBlackjackDecisionPartnerID
+		nameMatch := awaitingBlackjackDecisionPartnerName != "" && strings.EqualFold(senderName, awaitingBlackjackDecisionPartnerName)
+		if !indexMatch && !nameMatch && awaitingBlackjackDecisionPartnerName != "" {
+			if expectedIdx, ok := lookupRoomEntityIndexByName(awaitingBlackjackDecisionPartnerName); ok && expectedIdx > 0 && expectedIdx == index {
+				indexMatch = true
+			}
+		}
+		if !indexMatch && !nameMatch && awaitingBlackjackDecisionPartnerName != "" {
+			if expectedIdx, ok := lookupUsers28RoomIndexByName(awaitingBlackjackDecisionPartnerName); ok && expectedIdx > 0 && expectedIdx == index {
+				indexMatch = true
+			}
+		}
+
+		if !indexMatch && !nameMatch {
+			a.AddLogMsg(fmt.Sprintf("[BJ] ignoring decision %q from %q (index %d); waiting for %q (index %d)", decision, senderName, index, awaitingBlackjackDecisionPartnerName, awaitingBlackjackDecisionPartnerID))
+			log.Printf("[BJ] ignoring decision %q from %q (index %d); waiting for %q (index %d)", decision, senderName, index, awaitingBlackjackDecisionPartnerName, awaitingBlackjackDecisionPartnerID)
+			return
+		}
+
+		e.Block()
+		awaitingBlackjackDecision = false
+		a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] accepted decision=%q from sender=%q index=%d (expectedName=%q expectedIndex=%d)", decision, senderName, index, awaitingBlackjackDecisionPartnerName, awaitingBlackjackDecisionPartnerID))
+		log.Printf("[BJ_DEBUG] accepted decision=%q from sender=%q index=%d (expectedName=%q expectedIndex=%d)", decision, senderName, index, awaitingBlackjackDecisionPartnerName, awaitingBlackjackDecisionPartnerID)
+
+		if decision == "hit" {
+			a.AddLogMsg("[BJ] player chose hit")
+			log.Printf("[BJ] player chose hit")
+			isHitting = true
+			isBJRolling = true
+			go a.hitBjDice()
+		} else {
+			a.AddLogMsg("[BJ] player chose stay")
+			log.Printf("[BJ] player chose stay")
+			a.startBlackjackDealerTurn("player stayed")
+		}
+		return
+	}
+
 	if !awaitingGameChoice {
 		return
 	}
@@ -4878,7 +5101,7 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 	}
 	// Fallback 2: look up the partner's chat index via the users28ByIndex cache.
 	if !indexMatch && !nameMatch && awaitingGameChoicePartnerName != "" {
-		if expectedIdx, ok := lookupUsers28NameIndex(awaitingGameChoicePartnerName); ok && expectedIdx > 0 && expectedIdx == index {
+		if expectedIdx, ok := lookupUsers28RoomIndexByName(awaitingGameChoicePartnerName); ok && expectedIdx > 0 && expectedIdx == index {
 			indexMatch = true
 		}
 	}
@@ -4948,17 +5171,16 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 
 	switch choice {
 	case "poker":
+		resetBlackjackSequence()
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected Poker; starting player/dealer poker sequence", index))
 		log.Printf("[GAME_SELECT] %d selected Poker; starting player/dealer poker sequence", index)
 		a.beginPokerSequence()
 	case "21":
-		resetPokerSequence()
-		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected 21; starting internal roll", index))
-		log.Printf("[GAME_SELECT] %d selected 21; starting internal roll", index)
-		isBJRolling = true
-		a.AddLogMsg("21 Roll:\n")
-		go a.rollBjDice()
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected 21; starting player/dealer 21 sequence", index))
+		log.Printf("[GAME_SELECT] %d selected 21; starting player/dealer 21 sequence", index)
+		a.beginBlackjackSequence()
 	case "13":
+		resetBlackjackSequence()
 		resetPokerSequence()
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected 13; starting internal roll", index))
 		log.Printf("[GAME_SELECT] %d selected 13; starting internal roll", index)
@@ -4978,6 +5200,19 @@ func normalizeIncomingGameChoice(msg string) (string, bool) {
 		return "21", true
 	case "13":
 		return "13", true
+	default:
+		return "", false
+	}
+}
+
+func normalizeBlackjackDecision(msg string) (string, bool) {
+	cleaned := strings.ToLower(strings.TrimSpace(msg))
+	cleaned = gameChoiceCleanupRe.ReplaceAllString(cleaned, "")
+	switch cleaned {
+	case "hit", "h":
+		return "hit", true
+	case "stay", "stand", "s":
+		return "stay", true
 	default:
 		return "", false
 	}

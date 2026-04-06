@@ -819,8 +819,8 @@ func handleTradePacket(a *App, e *g.Intercept) {
 	}
 
 	if e.Packet.Header.Value == 104 {
-		// Manual block-all-trades toggle
-		if blockAllTrades && !matchesRecentOutgoingFunc(e.Packet.Data) {
+		// Manual block-all-trades toggle — skip if we just sent our own payout trade open
+		if blockAllTrades && !pokerPayoutTradeSent && !matchesRecentOutgoingFunc(e.Packet.Data) {
 			activeRound := awaitingGameChoice || dealerGameActive() || pokerPayoutMode || pokerPayoutTradeActive
 			allowed := false
 

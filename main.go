@@ -76,6 +76,16 @@ var (
 	thirteenPlayerName            string
 	thirteenHitInFlight           bool
 	thirteenNextHitIndex          int
+	// Tri (High / Low) state
+	awaitingTriChoice             bool
+	awaitingTriChoicePartnerID    int
+	awaitingTriChoicePartnerName  string
+	triRoundActive                bool
+	triPlayerTurn                 bool
+	triMode                       string // "high" or "low"
+	triPlayerTotal                int
+	triDealerTotal                int
+	triPlayerName                 string
 	pokerSequencePlayerName       string
 	pokerSequencePlayerResult     PokerHandResult
 	pokerSequencePlayerHand       string
@@ -326,6 +336,7 @@ func (a *App) SaveConfig(config *PokerDisplayConfig) {
 		return
 	}
 	defer file.Close()
+	defer file.Close()
 
 	if err := json.NewEncoder(file).Encode(config); err != nil {
 		a.AddLogMsg("Error encoding config file: " + err.Error())
@@ -340,7 +351,21 @@ func (a *App) dealerOpenMessage() string {
 }
 
 func dealerGameActive() bool {
-	return awaitingGameChoice || awaitingBlackjackDecision || awaiting13Decision || blackjackRoundActive || thirteenRoundActive || pokerSequenceStage > 0 || isPokerRolling || isTriRolling || isBJRolling || is13Rolling || isHitting || is13Hitting || isClosing
+	return awaitingGameChoice ||
+		awaitingBlackjackDecision ||
+		awaiting13Decision ||
+		awaitingTriChoice ||
+		blackjackRoundActive ||
+		thirteenRoundActive ||
+		triRoundActive ||
+		pokerSequenceStage > 0 ||
+		isPokerRolling ||
+		isTriRolling ||
+		isBJRolling ||
+		is13Rolling ||
+		isHitting ||
+		is13Hitting ||
+		isClosing
 }
 
 func dealerReadyForNewTrade() bool {
@@ -1388,6 +1413,18 @@ func reset13Sequence() {
 	thirteenPlayerName = ""
 	thirteenHitInFlight = false
 	thirteenNextHitIndex = 2
+}
+
+func resetTriSequence() {
+	awaitingTriChoice = false
+	awaitingTriChoicePartnerID = 0
+	awaitingTriChoicePartnerName = ""
+	triRoundActive = false
+	triPlayerTurn = false
+	triMode = ""
+	triPlayerTotal = 0
+	triDealerTotal = 0
+	triPlayerName = ""
 }
 
 func stopPayout() {
@@ -3645,7 +3682,7 @@ func (a *App) sendTradeCompletionMessage() {
 	a.beginGameHistory(partnerName, gameBetItems)
 
 	first := fmt.Sprintf("%s what game do you want to play?", partnerName)
-	second := "Say Poker, 21, 13"
+	second := "Say Poker, 21, 13 or Tri"
 	awaitingGameChoice = true
 	awaitingGameChoicePartnerName = strings.TrimSpace(lastTradePartnerName)
 	// Prefer the live room entity index for chat sender matching.
@@ -4450,6 +4487,75 @@ func (a *App) begin13Sequence() {
 	}(second)
 }
 
+func (a *App) beginTriChoiceSequence() {
+	playerName := strings.TrimSpace(lastTradePartnerName)
+	if playerName == "" {
+		playerName = "Player"
+	}
+
+	resetPokerSequence()
+	resetBlackjackSequence()
+	reset13Sequence()
+	resetTriSequence()
+
+	awaitingTriChoice = true
+	awaitingTriChoicePartnerName = playerName
+
+	if chatIdx, ok := lookupRoomEntityIndexByName(playerName); ok && chatIdx > 0 {
+		awaitingTriChoicePartnerID = chatIdx
+	} else if chatIdx, ok := lookupUsers28RoomIndexByName(playerName); ok && chatIdx > 0 {
+		awaitingTriChoicePartnerID = chatIdx
+	} else {
+		awaitingTriChoicePartnerID = lastTradePartnerID
+	}
+
+	msg := "High or Low?"
+	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", msg))
+	log.Printf("[GAME_SELECT] shouting: %q", msg)
+	ext.Send(out.SHOUT, msg)
+}
+
+func (a *App) beginTriRound(mode string) {
+	playerName := strings.TrimSpace(lastTradePartnerName)
+	if playerName == "" {
+		playerName = "Player"
+	}
+
+	resetPokerSequence()
+	resetBlackjackSequence()
+	reset13Sequence()
+	resetTriSequence()
+
+	triRoundActive = true
+	triPlayerTurn = true
+	triMode = strings.ToLower(strings.TrimSpace(mode))
+	triPlayerName = playerName
+
+	gameLabel := "Tri High"
+	if triMode == "low" {
+		gameLabel = "Tri Low"
+	}
+	a.setCurrentGameHistoryGame(gameLabel)
+
+	first := "Lets Play!"
+	second := fmt.Sprintf("%s Roll", playerName)
+
+	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", first))
+	log.Printf("[GAME_SELECT] shouting: %q", first)
+	ext.Send(out.SHOUT, first)
+
+	go func(msg string) {
+		time.Sleep(700 * time.Millisecond)
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", msg))
+		log.Printf("[GAME_SELECT] shouting: %q", msg)
+		ext.Send(out.SHOUT, msg)
+
+		time.Sleep(700 * time.Millisecond)
+		isTriRolling = true
+		a.rollTriDice()
+	}(second)
+}
+
 func (a *App) start13DealerTurn(reason string) {
 	awaiting13Decision = false
 	thirteenPlayerTurn = false
@@ -4502,6 +4608,84 @@ func (a *App) finalize13Round(playerWins bool, reason string) {
 		a.noteCurrentGameHistory(winnerMsg)
 		a.AddLogMsg(fmt.Sprintf("[PAYOUT] 13 player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID))
 		log.Printf("[PAYOUT] 13 player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID)
+		startPayout(a, payoutTargetID, payoutTargetName)
+		return
+	}
+
+	a.setCurrentGameHistoryResults(playerHand, dealerHand, "Dealer", "Completed", true)
+	a.noteCurrentGameHistory(winnerMsg)
+	go a.openDealerAfterRound()
+}
+
+func (a *App) finalizeTriRound() {
+	playerName := strings.TrimSpace(triPlayerName)
+	if playerName == "" {
+		playerName = strings.TrimSpace(lastTradePartnerName)
+	}
+	if playerName == "" {
+		playerName = "Player"
+	}
+
+	playerHand := strconv.Itoa(triPlayerTotal)
+	dealerHand := strconv.Itoa(triDealerTotal)
+
+	playerWins := false
+	switch triMode {
+	case "high":
+		playerWins = triPlayerTotal > triDealerTotal
+	case "low":
+		playerWins = triPlayerTotal < triDealerTotal
+	default:
+		playerWins = false
+	}
+
+	winnerName := "Dealer"
+	if playerWins {
+		winnerName = playerName
+	}
+
+	gameLabel := "Tri High"
+	if triMode == "low" {
+		gameLabel = "Tri Low"
+	}
+
+	winnerMsg := fmt.Sprintf("%s Wins - %s: %s | Dealer: %s", winnerName, playerName, playerHand, dealerHand)
+
+	a.AddLogMsg(fmt.Sprintf(
+		"[TRI_RULES] mode=%s game=%s player=%d dealer=%d winner=%s",
+		triMode,
+		gameLabel,
+		triPlayerTotal,
+		triDealerTotal,
+		winnerName,
+	))
+	log.Printf(
+		"[TRI_RULES] mode=%s game=%s player=%d dealer=%d winner=%s",
+		triMode,
+		gameLabel,
+		triPlayerTotal,
+		triDealerTotal,
+		winnerName,
+	)
+
+	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", winnerMsg))
+	log.Printf("[GAME_SELECT] shouting: %q", winnerMsg)
+
+	if !ChatIsDisabled {
+		waitForUnmute(90 * time.Second)
+		time.Sleep(800 * time.Millisecond)
+		sendMessageWithDelay(winnerMsg)
+	}
+
+	payoutTargetID := lastTradePartnerID
+	payoutTargetName := playerName
+	resetTriSequence()
+
+	if playerWins && payoutTargetID > 0 {
+		a.setCurrentGameHistoryResults(playerHand, dealerHand, playerName, "Payout Pending", false)
+		a.noteCurrentGameHistory(winnerMsg)
+		a.AddLogMsg(fmt.Sprintf("[PAYOUT] tri player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID))
+		log.Printf("[PAYOUT] tri player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID)
 		startPayout(a, payoutTargetID, payoutTargetName)
 		return
 	}
@@ -4787,7 +4971,7 @@ func (a *App) rollTriDice() {
 			a.AddLogMsg(logRollResult)
 		}
 		mutex.Unlock()
-		a.evaluateTriHand()
+		a.evaluateTriRound()
 		isTriRolling = false
 		return
 	}
@@ -4812,7 +4996,7 @@ func (a *App) rollTriDice() {
 	time.Sleep(1000 * time.Millisecond)
 	resultsWaitGroup.Wait()
 
-	a.evaluateTriHand()
+	a.evaluateTriRound()
 	isTriRolling = false
 }
 
@@ -5458,6 +5642,47 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 		return
 	}
 
+	if awaitingTriChoice {
+		cleaned := strings.ToLower(strings.TrimSpace(msg))
+		cleaned = gameChoiceCleanupRe.ReplaceAllString(cleaned, "")
+		if cleaned != "high" && cleaned != "low" {
+			a.AddLogMsg(fmt.Sprintf("[TRI_DEBUG] awaiting tri choice from %q(index=%d), ignored non-choice message=%q", awaitingTriChoicePartnerName, awaitingTriChoicePartnerID, msg))
+			log.Printf("[TRI_DEBUG] awaiting tri choice from %q(index=%d), ignored non-choice message=%q", awaitingTriChoicePartnerName, awaitingTriChoicePartnerID, msg)
+			return
+		}
+
+		indexMatch := awaitingTriChoicePartnerID > 0 && index == awaitingTriChoicePartnerID
+		nameMatch := awaitingTriChoicePartnerName != "" && strings.EqualFold(senderName, awaitingTriChoicePartnerName)
+		if !indexMatch && !nameMatch && awaitingTriChoicePartnerName != "" {
+			if expectedIdx, ok := lookupRoomEntityIndexByName(awaitingTriChoicePartnerName); ok && expectedIdx > 0 && expectedIdx == index {
+				indexMatch = true
+			}
+		}
+		if !indexMatch && !nameMatch && awaitingTriChoicePartnerName != "" {
+			if expectedIdx, ok := lookupUsers28RoomIndexByName(awaitingTriChoicePartnerName); ok && expectedIdx > 0 && expectedIdx == index {
+				indexMatch = true
+			}
+		}
+
+		if !indexMatch && !nameMatch {
+			a.AddLogMsg(fmt.Sprintf("[TRI] ignoring choice %q from %q (index %d); waiting for %q (index %d)", cleaned, senderName, index, awaitingTriChoicePartnerName, awaitingTriChoicePartnerID))
+			log.Printf("[TRI] ignoring choice %q from %q (index %d); waiting for %q (index %d)", cleaned, senderName, index, awaitingTriChoicePartnerName, awaitingTriChoicePartnerID)
+			return
+		}
+
+		e.Block()
+		awaitingTriChoice = false
+		a.AddLogMsg(fmt.Sprintf("[TRI_DEBUG] accepted choice=%q from sender=%q index=%d (expectedName=%q expectedIndex=%d)", cleaned, senderName, index, awaitingTriChoicePartnerName, awaitingTriChoicePartnerID))
+		log.Printf("[TRI_DEBUG] accepted choice=%q from sender=%q index=%d (expectedName=%q expectedIndex=%d)", cleaned, senderName, index, awaitingTriChoicePartnerName, awaitingTriChoicePartnerID)
+
+		if cleaned == "high" {
+			a.beginTriRound("high")
+		} else {
+			a.beginTriRound("low")
+		}
+		return
+	}
+
 	if !awaitingGameChoice {
 		return
 	}
@@ -5543,11 +5768,17 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 	awaitingGameChoicePartnerID = 0
 	awaitingGameChoicePartnerName = ""
 
-	ack := fmt.Sprintf("%s! Lets Play!", gameChoiceDisplay(choice))
-	a.setCurrentGameHistoryGame(gameChoiceDisplay(choice))
-	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", ack))
-	log.Printf("[GAME_SELECT] shouting: %q", ack)
-	ext.Send(out.SHOUT, ack)
+	// For Tri (two-step selection) we must first ask High or Low
+	if choice != "tri" {
+		ack := fmt.Sprintf("%s! Lets Play!", gameChoiceDisplay(choice))
+		a.setCurrentGameHistoryGame(gameChoiceDisplay(choice))
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", ack))
+		log.Printf("[GAME_SELECT] shouting: %q", ack)
+		ext.Send(out.SHOUT, ack)
+	} else {
+		a.AddLogMsg("[GAME_SELECT] Tri selected; prompting for High/Low instead of immediate Lets Play")
+		log.Printf("[GAME_SELECT] Tri selected; prompting for High/Low instead of immediate Lets Play")
+	}
 
 	switch choice {
 	case "poker":
@@ -5564,6 +5795,21 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected 13; starting 13 sequence", index))
 		log.Printf("[GAME_SELECT] %d selected 13; starting 13 sequence", index)
 		a.begin13Sequence()
+	case "tri":
+		// Two-step Tri selection: prompt player for High or Low
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected Tri; prompting for High/Low", index))
+		log.Printf("[GAME_SELECT] %d selected Tri; prompting for High/Low", index)
+		a.beginTriChoiceSequence()
+	case "trihigh":
+		// Direct Tri High selection
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected Tri High; starting round", index))
+		log.Printf("[GAME_SELECT] %d selected Tri High; starting round", index)
+		a.beginTriRound("high")
+	case "trilow":
+		// Direct Tri Low selection
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected Tri Low; starting round", index))
+		log.Printf("[GAME_SELECT] %d selected Tri Low; starting round", index)
+		a.beginTriRound("low")
 	}
 }
 
@@ -5577,6 +5823,12 @@ func normalizeIncomingGameChoice(msg string) (string, bool) {
 		return "21", true
 	case "13":
 		return "13", true
+	case "tri":
+		return "tri", true
+	case "trihigh":
+		return "trihigh", true
+	case "trilow":
+		return "trilow", true
 	default:
 		return "", false
 	}
@@ -5603,6 +5855,12 @@ func gameChoiceDisplay(choice string) string {
 		return "21"
 	case "13":
 		return "13"
+	case "tri":
+		return "Tri"
+	case "trihigh":
+		return "Tri High"
+	case "trilow":
+		return "Tri Low"
 	default:
 		return choice
 	}

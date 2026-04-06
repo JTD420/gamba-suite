@@ -464,36 +464,63 @@ func (a *App) evaluate13Hand() {
 }
 
 // Wait for all dice results and evaluate the tri hand
-func (a *App) evaluateTriHand() {
-	if !ChatIsDisabled {
-		hand := sumHand([]int{
-			diceList[0].Value,
-			diceList[2].Value,
-			diceList[4].Value,
-		})
-		logRollResult := fmt.Sprintf("Tri Result: %s\n", hand)
-		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
-		a.AddLogMsg(logRollResult)
-
-		if !isMuted {
-			// If the user is not muted, send the message
-			sendMessageWithDelay(hand)
-		} else {
-			// If the user is muted, queue the message to send later
-			log.Printf("User is muted. Queuing message: %s", hand)
-			// ToDo:
-			// messageQueue = append(messageQueue, hand)
+func (a *App) evaluateTriRound() {
+	defer func() {
+		if r := recover(); r != nil {
+			a.AddLogMsg(fmt.Sprintf("[TRI_CRASH_GUARD] recovered panic in evaluateTriRound: %v", r))
+			log.Printf("[TRI_CRASH_GUARD] recovered panic in evaluateTriRound: %v", r)
+			resetTriSequence()
+			isTriRolling = false
 		}
-	} else {
-		hand := sumHand([]int{
-			diceList[0].Value,
-			diceList[2].Value,
-			diceList[4].Value,
-		})
-		logRollResult := fmt.Sprintf("Tri Result: %s\n", hand)
-		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
-		a.AddLogMsg(logRollResult)
+	}()
+
+	mutex.Lock()
+	mutex.Unlock()
+	if !triRoundActive {
+		isTriRolling = false
+		return
 	}
+
+	total := sumHandInt([]int{
+		diceList[0].Value,
+		diceList[2].Value,
+		diceList[4].Value,
+	})
+
+	totalText := strconv.Itoa(total)
+	a.AddLogMsg(fmt.Sprintf("[TRI] evaluating total=%d playerTurn=%t mode=%s", total, triPlayerTurn, triMode))
+	log.Printf("[TRI] evaluating total=%d playerTurn=%t mode=%s", total, triPlayerTurn, triMode)
+
+	if !ChatIsDisabled {
+		if !isMuted {
+			sendMessageWithDelay(totalText)
+		}
+	}
+
+	if triPlayerTurn {
+		triPlayerTotal = total
+		a.setCurrentGameHistoryResults(totalText, "", "", "In Progress", false)
+		a.noteCurrentGameHistory(fmt.Sprintf("Tri player total recorded (%s)", triMode))
+
+		triPlayerTurn = false
+
+		go func() {
+			time.Sleep(700 * time.Millisecond)
+			message := "Dealer Roll"
+			a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", message))
+			log.Printf("[GAME_SELECT] shouting: %q", message)
+			ext.Send(out.SHOUT, message)
+
+			time.Sleep(700 * time.Millisecond)
+			isTriRolling = true
+			a.rollTriDice()
+		}()
+
+		return
+	}
+
+	triDealerTotal = total
+	a.finalizeTriRound()
 	isTriRolling = false
 }
 

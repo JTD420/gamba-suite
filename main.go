@@ -1331,8 +1331,22 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		resetTradeAutoFlow()
 		lastTradePartnerToken = ""
 
-		// Clear trade items when trade closes
+		// Clear trade items when trade closes. Capture previous open state
+		// so we can ensure the client/server trade window is closed too.
+		wasTradeOpen := tradeOpen
 		a.ClearTradeItems()
+
+		// If a trade was open, ensure we push an outgoing TRADE_CLOSE to
+		// help clear any stuck client UI or server-side state. Send from a
+		// goroutine with a short delay to avoid racing packet handling.
+		if wasTradeOpen {
+			go func() {
+				time.Sleep(150 * time.Millisecond)
+				a.AddLogMsg("[TRADE_CLOSE] sending outgoing TRADE_CLOSE to ensure UI cleared")
+				log.Printf("[TRADE_CLOSE] sending outgoing TRADE_CLOSE to ensure UI cleared")
+				ext.Send(out.TRADE_CLOSE)
+			}()
+		}
 
 		if !wasCompleted {
 			if payoutTradeActive {

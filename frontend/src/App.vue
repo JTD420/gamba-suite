@@ -4,33 +4,24 @@
     <!-- Tab bar -->
     <div class="tab-bar">
       <button
-        v-for="tab in ['Config', 'Trade', 'Game History', 'Logs']"
+        v-for="tab in ['Home', 'Trade', 'Game History', 'Logs', 'Utility']"
         :key="tab"
         :class="['tab-btn', { active: activeTab === tab }]"
         @click="activeTab = tab"
       >{{ tab }}</button>
-    </div>
+      </div>
 
-    <!-- Config tab -->
-    <div v-if="activeTab === 'Config'">
-      <h2 class="section-title">Games</h2>
-      <p class="config-intro">
-        This page is now read-only. Game behaviour is controlled in code, so players only see what each game does and how the flow works.
-      </p>
-
+    <div v-if="activeTab === 'Home'">
+      <h2 class="section-title">Home</h2>
+      <p class="config-intro">Quick access to game guides and utilities.</p>
       <div class="game-card-grid">
-        <button
-          v-for="game in gameGuides"
-          :key="game.key"
-          type="button"
-          class="game-card"
-          @click="openGameGuide(game)"
-        >
-          <span class="game-card-title">{{ game.title }}</span>
+        <button v-for="game in gameGuides" :key="game.key" class="game-card" @click="openGameGuide(game)">
+          <div class="game-card-title">{{ game.title }}</div>
           <span class="game-card-summary">{{ game.summary }}</span>
           <span class="game-card-action">Click for details</span>
         </button>
       </div>
+    </div>
 
       <div class="game-guide-modal-backdrop" v-if="activeGameGuide" @click="closeGameGuide">
         <div class="game-guide-modal" @click.stop>
@@ -54,15 +45,9 @@
         </div>
       </div>
 
+    <div v-if="activeTab === 'Utility'">
       <h2 class="section-title">Utilities</h2>
-      <button @click="handleShowCommands" class="save-button">Show Commands</button>
-      <button @click="handleOpenLastTrade" class="save-button">
-        Open Last Trade: {{ lastTradePartnerName }}
-      </button>
-      <button @click="handleSkipDiceSetup" class="save-button">
-        Skip Dice Setup (Testing)
-      </button>
-
+      <p class="config-intro">Utility actions are disabled for now.</p>
     </div>
 
     <!-- Trade tab -->
@@ -351,7 +336,7 @@
 export default {
   data() {
     return {
-      activeTab: 'Config',
+      activeTab: 'Home',
       activeGameGuide: null,
       gameGuides: [
         {
@@ -390,15 +375,7 @@ export default {
           playerFlow: 'Use the Tri command when needed and let the app roll the three dice.',
           dealerFlow: 'The dealer/app handles the roll output and result logging automatically, but the house rules for who wins depend on how you are using the tri command.',
         },
-        {
-          key: 'roll',
-          title: 'Standard Roll',
-          summary: 'Basic five-dice roll and result output using commands.',
-          description: 'Standard Roll is the quick manual dice roll mode available from the command list.',
-          howItWorks: 'The app rolls the available dice, tracks the values, and outputs the result. This is a utility roll and does not decide a winner by itself.',
-          playerFlow: 'Use the roll command when you want a standard five-dice result outside the trade-selected games.',
-          dealerFlow: 'The dealer/app tracks the active dice, gathers the results, and logs the final roll for you to use however you want.',
-        },
+        
       ],
       tradeItems: [],
       activeGameBetItems: [],
@@ -412,8 +389,6 @@ export default {
       log: [],
       debugLog: [],
       chatLog: [],
-      lastTradePartnerName: 'None',
-      tradeNamePollTimer: null,
       showNameSuggestions: false,
       showFlaggedOnly: false,
     };
@@ -642,40 +617,7 @@ export default {
         console.error(error);
       }
     },
-     async handleShowCommands() {
-      try {
-        await window.go.main.App.ShowCommands();
-      } catch (error) {
-        this.addLogMsg('Error showing commands');
-        console.error(error);
-      }
-    },
-    async refreshLastTradePartnerName() {
-      try {
-        const name = await window.go.main.App.GetLastTradePartnerName();
-        this.lastTradePartnerName = name || 'None';
-      } catch (error) {
-        console.error(error);
-      }
-    },
-    async handleOpenLastTrade() {
-      try {
-        await window.go.main.App.OpenLastTrade();
-        this.addLogMsg(`Open Last Trade clicked (${this.lastTradePartnerName})`);
-        await this.refreshLastTradePartnerName();
-      } catch (error) {
-        this.addLogMsg('Error opening last trade');
-        console.error(error);
-      }
-    },
-    async handleSkipDiceSetup() {
-      try {
-        await window.go.main.App.SkipDiceSetupForTesting();
-      } catch (error) {
-        this.addLogMsg('Error skipping dice setup');
-        console.error(error);
-      }
-    },
+    
     addLogMsg(msg) {
       this.log.push(msg);
       this.scrollBox('logbox');
@@ -734,7 +676,6 @@ export default {
     },
   },
   async mounted() {
-    await this.refreshLastTradePartnerName();
     await this.refreshGameHistory();
     window.runtime.EventsOn("logUpdate", (message) => {
       this.log = message.split('\n');
@@ -807,17 +748,8 @@ export default {
         this.gameHistory = [];
       }
     });
-
-    this.tradeNamePollTimer = setInterval(() => {
-      this.refreshLastTradePartnerName();
-    }, 2000);
   },
-  beforeUnmount() {
-    if (this.tradeNamePollTimer) {
-      clearInterval(this.tradeNamePollTimer);
-      this.tradeNamePollTimer = null;
-    }
-  }
+  beforeUnmount() {}
 };
 </script>
 

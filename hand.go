@@ -72,8 +72,11 @@ func (a *App) evaluatePokerHand() {
 
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", winnerMsg))
 		log.Printf("[GAME_SELECT] shouting: %q", winnerMsg)
-		time.Sleep(800 * time.Millisecond)
-		sendMessageWithDelay(winnerMsg)
+		if !ChatIsDisabled {
+			waitForUnmute(90 * time.Second)
+			time.Sleep(800 * time.Millisecond)
+			sendMessageWithDelay(winnerMsg)
+		}
 
 		payoutTargetID := lastTradePartnerID
 		payoutTargetName := playerName
@@ -287,7 +290,8 @@ func (a *App) finalizeBlackjackRound(playerWins bool, reason string) {
 	log.Printf("[BJ_RULES] winner=%s reason=%s player=%d dealer=%d", winnerName, reason, blackjackPlayerTotal, blackjackDealerTotal)
 	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", winnerMsg))
 	log.Printf("[GAME_SELECT] shouting: %q", winnerMsg)
-	if !ChatIsDisabled && !isMuted {
+	if !ChatIsDisabled {
+		waitForUnmute(90 * time.Second)
 		time.Sleep(800 * time.Millisecond)
 		sendMessageWithDelay(winnerMsg)
 	}

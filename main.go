@@ -642,6 +642,24 @@ func handleMuteEnd() {
 	// messageQueue = []string{}
 }
 
+// waitForUnmute blocks until the mute clears or max duration elapses.
+// Use before any critical chat message (winner announce etc.) so it is not
+// silently swallowed by Habbo's flood-control mute.
+func waitForUnmute(max time.Duration) {
+	if !isMuted {
+		return
+	}
+	deadline := time.Now().Add(max)
+	for isMuted && time.Now().Before(deadline) {
+		time.Sleep(300 * time.Millisecond)
+	}
+	if isMuted {
+		log.Printf("[MUTE_GUARD] still muted after %s wait, sending anyway", max)
+	} else {
+		log.Printf("[MUTE_GUARD] mute cleared, proceeding with message")
+	}
+}
+
 // Mute detection logic (called within InterceptAll)
 func handleMutePacket(e *g.Intercept) {
 	// Check for the "first muted" packet with header 4069
@@ -4660,15 +4678,11 @@ func (a *App) hitBjDice() {
 	// Log the value of the dice rolled
 	a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] hit resolved actor=%s slot=%d diceID=%d value=%d newTotal=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], slot, diceID, newValue, newTotal))
 	log.Printf("[BJ_DEBUG] hit resolved actor=%s slot=%d diceID=%d value=%d newTotal=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], slot, diceID, newValue, newTotal)
-	if !ChatIsDisabled && !isMuted {
-		actor := blackjackPlayerName
-		if actor == "" {
-			actor = "Player"
-		}
-		if !blackjackPlayerTurn {
-			actor = "Dealer"
-			sendMessageWithDelay(fmt.Sprintf("%s total %d", actor, newTotal))
-		}
+	if !ChatIsDisabled && !blackjackPlayerTurn && !isMuted {
+		actor := "Dealer"
+		// Spread dealer-total announcements to stay under Habbo's flood control.
+		time.Sleep(1200 * time.Millisecond)
+		sendMessageWithDelay(fmt.Sprintf("%s total %d", actor, newTotal))
 	}
 
 	// Re-evaluate the hand with the updated sum

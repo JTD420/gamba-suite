@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"fmt"
@@ -85,17 +85,11 @@ func (a *App) evaluatePokerHand() {
 			a.noteCurrentGameHistory(winnerMsg)
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT] player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID))
 			log.Printf("[PAYOUT] player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID)
-			startPokerPayout(a, payoutTargetID, payoutTargetName)
+			startPayout(a, payoutTargetID, payoutTargetName)
 		} else {
 			a.setCurrentGameHistoryResults(playerHand, hand, "Dealer", "Completed", true)
 			a.noteCurrentGameHistory(winnerMsg)
-			// Dealer wins — resume normal dealer-open cycle
-			awaitingTradeOpen = true
-			if canAnnounceDealerOpen() {
-				dealerTradeWindowOpen = true
-				go sendMessageWithDelay(a.dealerOpenMessage())
-			}
-			startDealerOpenHeartbeat(a)
+			go a.openDealerAfterRound()
 		}
 	}
 
@@ -294,6 +288,7 @@ func (a *App) finalizeBlackjackRound(playerWins bool, reason string) {
 	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", winnerMsg))
 	log.Printf("[GAME_SELECT] shouting: %q", winnerMsg)
 	if !ChatIsDisabled && !isMuted {
+		time.Sleep(800 * time.Millisecond)
 		sendMessageWithDelay(winnerMsg)
 	}
 
@@ -306,18 +301,13 @@ func (a *App) finalizeBlackjackRound(playerWins bool, reason string) {
 		a.noteCurrentGameHistory(winnerMsg)
 		a.AddLogMsg(fmt.Sprintf("[PAYOUT] 21 player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID))
 		log.Printf("[PAYOUT] 21 player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID)
-		startPokerPayout(a, payoutTargetID, payoutTargetName)
+		startPayout(a, payoutTargetID, payoutTargetName)
 		return
 	}
 
 	a.setCurrentGameHistoryResults(playerHand, dealerHand, "Dealer", "Completed", true)
 	a.noteCurrentGameHistory(winnerMsg)
-	awaitingTradeOpen = true
-	if canAnnounceDealerOpen() {
-		dealerTradeWindowOpen = true
-		go sendMessageWithDelay(a.dealerOpenMessage())
-	}
-	startDealerOpenHeartbeat(a)
+	go a.openDealerAfterRound()
 }
 
 func (a *App) evaluate13Hand() {

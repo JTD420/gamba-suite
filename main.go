@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"bytes"
@@ -69,13 +69,13 @@ var (
 	pokerSequencePlayerName              string
 	pokerSequencePlayerResult            PokerHandResult
 	pokerSequencePlayerHand              string
-	pokerPayoutMode                      bool
-	pokerPayoutTradeActive               bool
-	pokerPayoutTargetID                  int
-	pokerPayoutTargetName                string
-	pokerPayoutAttempts                  int
-	pokerPayoutSessionID                 int
-	pokerPayoutTradeSent                 bool
+	payoutActive                         bool
+	payoutTradeActive                    bool
+	payoutTargetID                       int
+	payoutTargetName                     string
+	payoutAttempts                       int
+	payoutSessionID                      int
+	payoutTradeSent                      bool
 	payoutExpectedAddCount               int
 	payoutActualAddCount                 int
 	underfundedTradeMonitorID            int
@@ -119,7 +119,7 @@ var (
 	currentHandItems                     []TradeItem
 	currentHandItemIDs                   map[string][]int
 	handItemsMu                          sync.Mutex
-	pokerGameBetItems                    []TradeItem
+	gameBetItems                         []TradeItem
 	stripScanMu                          sync.Mutex
 	stripScanActive                      bool
 	stripScanSessionID                   = 0
@@ -668,7 +668,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		}
 	}()
 
-	if e.Packet.Header.Dir == g.Out && (e.Packet.Header.Value == 69 || e.Packet.Header.Value == 402) && !pokerPayoutTradeActive {
+	if e.Packet.Header.Dir == g.Out && (e.Packet.Header.Value == 69 || e.Packet.Header.Value == 402) && !payoutTradeActive {
 		shortages := a.getTradeCoverageShortages()
 		if len(shortages) > 0 {
 			notice := formatTradeShortages(shortages)
@@ -701,7 +701,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		addItemMu.Lock()
 		lastAddItemWasOurs = true
 		addItemMu.Unlock()
-		if pokerPayoutTradeActive {
+		if payoutTradeActive {
 			payoutActualAddCount++
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] observed outgoing TRADE_ADDITEM count %d/%d", payoutActualAddCount, payoutExpectedAddCount))
 			log.Printf("[PAYOUT_DEBUG] observed outgoing TRADE_ADDITEM count %d/%d", payoutActualAddCount, payoutExpectedAddCount)
@@ -773,7 +773,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		if side == "partner" && len(allItems) > 0 {
 			extendTradeWindowTimeoutForPartnerActivity(a)
 		}
-		if pokerPayoutTradeActive {
+		if payoutTradeActive {
 			a.AddLogMsg("[TRADE_COVERAGE] skipped shortage enforcement during payout trade")
 			log.Printf("[TRADE_COVERAGE] skipped shortage enforcement during payout trade")
 		} else {
@@ -787,13 +787,13 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		tradeCompleted = true
 		tradeAutoConfirmed = true
 		tradeAutoConfirmPending = false
-		if pokerPayoutTradeActive {
+		if payoutTradeActive {
 			tradeItemsMu.Lock()
 			payoutItems := cloneTradeItems(currentOwnTradeItems)
 			tradeItemsMu.Unlock()
 			partnerName := strings.TrimSpace(lastTradePartnerName)
 			if partnerName == "" || partnerName == "Unknown" {
-				partnerName = strings.TrimSpace(pokerPayoutTargetName)
+				partnerName = strings.TrimSpace(payoutTargetName)
 			}
 			if partnerName == "" {
 				partnerName = "Unknown"
@@ -820,8 +820,8 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 	if e.Packet.Header.Value == 104 {
 		// Manual block-all-trades toggle — skip if we just sent our own payout trade open
-		if blockAllTrades && !pokerPayoutTradeSent && !matchesRecentOutgoingFunc(e.Packet.Data) {
-			activeRound := awaitingGameChoice || dealerGameActive() || pokerPayoutMode || pokerPayoutTradeActive
+		if blockAllTrades && !payoutTradeSent && !matchesRecentOutgoingFunc(e.Packet.Data) {
+			activeRound := awaitingGameChoice || dealerGameActive() || payoutActive || payoutTradeActive
 			allowed := false
 
 			if activeRound {
@@ -866,19 +866,19 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 		// During payout mode, someone else opened a trade with us — close it and let the payout loop retry
 		isPayoutTradeOpen := false
-		if pokerPayoutMode {
+		if payoutActive {
 			incomingToken := extractTradeTokenFromPacket(e.Packet.Data)
-			expectedToken, _ := lookupTokenByName(pokerPayoutTargetName)
-			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] incoming trade-open while payout active: sent=%t target=%q targetID=%d expectedToken=%q incomingToken=%q matchedRecentOutgoing=%t", pokerPayoutTradeSent, pokerPayoutTargetName, pokerPayoutTargetID, expectedToken, incomingToken, matchedRecentOutgoing))
-			log.Printf("[PAYOUT_DEBUG] incoming trade-open while payout active: sent=%t target=%q targetID=%d expectedToken=%q incomingToken=%q matchedRecentOutgoing=%t", pokerPayoutTradeSent, pokerPayoutTargetName, pokerPayoutTargetID, expectedToken, incomingToken, matchedRecentOutgoing)
-			if pokerPayoutTradeSent {
+			expectedToken, _ := lookupTokenByName(payoutTargetName)
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] incoming trade-open while payout active: sent=%t target=%q targetID=%d expectedToken=%q incomingToken=%q matchedRecentOutgoing=%t", payoutTradeSent, payoutTargetName, payoutTargetID, expectedToken, incomingToken, matchedRecentOutgoing))
+			log.Printf("[PAYOUT_DEBUG] incoming trade-open while payout active: sent=%t target=%q targetID=%d expectedToken=%q incomingToken=%q matchedRecentOutgoing=%t", payoutTradeSent, payoutTargetName, payoutTargetID, expectedToken, incomingToken, matchedRecentOutgoing)
+			if payoutTradeSent {
 				// Our outgoing TRADE_OPEN was accepted — this is the payout trade opening successfully
-				savedPayoutTargetID := pokerPayoutTargetID
-				savedPayoutTargetName := pokerPayoutTargetName
-				stopPokerPayout() // kills retry goroutine
-				pokerPayoutTradeActive = true
-				pokerPayoutTargetID = savedPayoutTargetID
-				pokerPayoutTargetName = savedPayoutTargetName
+				savedPayoutTargetID := payoutTargetID
+				savedPayoutTargetName := payoutTargetName
+				stopPayout() // kills retry goroutine
+				payoutTradeActive = true
+				payoutTargetID = savedPayoutTargetID
+				payoutTargetName = savedPayoutTargetName
 				isPayoutTradeOpen = true
 				a.AddLogMsg(fmt.Sprintf("[PAYOUT] trade opened successfully with %s, proceeding", savedPayoutTargetName))
 				log.Printf("[PAYOUT] trade opened successfully with %s, proceeding", savedPayoutTargetName)
@@ -886,8 +886,8 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				go a.autoAddPayoutItems()
 			} else {
 				// Someone else opened a trade with us during payout — block it
-				a.AddLogMsg(fmt.Sprintf("[PAYOUT] incoming trade blocked during payout to %s, closing", pokerPayoutTargetName))
-				log.Printf("[PAYOUT] incoming trade blocked during payout to %s, closing", pokerPayoutTargetName)
+				a.AddLogMsg(fmt.Sprintf("[PAYOUT] incoming trade blocked during payout to %s, closing", payoutTargetName))
+				log.Printf("[PAYOUT] incoming trade blocked during payout to %s, closing", payoutTargetName)
 				hiddenBlockedTradeCleanupPending = true
 				ignoreNextGuardCloseRecovery = true
 				suppressNextTradeCloseAnnouncement = true
@@ -1091,23 +1091,23 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		a.ClearTradeItems()
 
 		if !wasCompleted {
-			if pokerPayoutTradeActive {
+			if payoutTradeActive {
 				// Payout trade was cancelled by player — retry the payout
-				retryTargetID := pokerPayoutTargetID
-				retryTargetName := pokerPayoutTargetName
-				pokerPayoutTradeActive = false
+				retryTargetID := payoutTargetID
+				retryTargetName := payoutTargetName
+				payoutTradeActive = false
 				a.AddLogMsg(fmt.Sprintf("[PAYOUT] payout trade cancelled by %s, retrying", retryTargetName))
 				log.Printf("[PAYOUT] payout trade cancelled by %s, retrying", retryTargetName)
 				a.noteCurrentGameHistory("Payout trade closed before completion; retrying payout")
-				startPokerPayout(a, retryTargetID, retryTargetName)
+				startPayout(a, retryTargetID, retryTargetName)
 			} else {
 				a.AddLogMsg("[TRADE_REOPEN] trade closed before completion, performing full dealer reset")
 				log.Printf("[TRADE_REOPEN] trade closed before completion, performing full dealer reset")
 				go a.resyncHandThenOpenDealer()
 			}
-		} else if pokerPayoutTradeActive {
+		} else if payoutTradeActive {
 			// Payout trade completed normally — clear active flag
-			pokerPayoutTradeActive = false
+			payoutTradeActive = false
 			a.AddLogMsg("[PAYOUT] payout trade completed successfully")
 			log.Printf("[PAYOUT] payout trade completed successfully")
 			a.noteCurrentGameHistory("Dealer payout flow finished successfully")
@@ -1158,14 +1158,14 @@ func resetBlackjackSequence() {
 	blackjackNextHitIndex = 3
 }
 
-func stopPokerPayout() {
-	pokerPayoutMode = false
-	pokerPayoutTradeActive = false
-	pokerPayoutTargetID = 0
-	pokerPayoutTargetName = ""
-	pokerPayoutAttempts = 0
-	pokerPayoutSessionID++
-	pokerPayoutTradeSent = false
+func stopPayout() {
+	payoutActive = false
+	payoutTradeActive = false
+	payoutTargetID = 0
+	payoutTargetName = ""
+	payoutAttempts = 0
+	payoutSessionID++
+	payoutTradeSent = false
 	payoutExpectedAddCount = 0
 	payoutActualAddCount = 0
 }
@@ -1181,13 +1181,13 @@ func waitForHiddenBlockedTradeCleanup(timeout time.Duration) bool {
 	return !hiddenBlockedTradeCleanupPending
 }
 
-func startPokerPayout(a *App, targetID int, targetName string) {
-	stopPokerPayout()
-	pokerPayoutMode = true
-	pokerPayoutTargetID = targetID
-	pokerPayoutTargetName = targetName
-	pokerPayoutSessionID++
-	sessionID := pokerPayoutSessionID
+func startPayout(a *App, targetID int, targetName string) {
+	stopPayout()
+	payoutActive = true
+	payoutTargetID = targetID
+	payoutTargetName = targetName
+	payoutSessionID++
+	sessionID := payoutSessionID
 	a.noteCurrentGameHistory(fmt.Sprintf("Payout started for %s", targetName))
 
 	go func() {
@@ -1195,10 +1195,10 @@ func startPokerPayout(a *App, targetID int, targetName string) {
 		time.Sleep(1200 * time.Millisecond)
 
 		for attempt := 1; attempt <= 5; attempt++ {
-			if sessionID != pokerPayoutSessionID {
+			if sessionID != payoutSessionID {
 				return
 			}
-			pokerPayoutAttempts = attempt
+			payoutAttempts = attempt
 
 			if hiddenBlockedTradeCleanupPending {
 				a.AddLogMsg("[PAYOUT_DEBUG] waiting for blocked-trade cleanup before opening payout trade")
@@ -1216,12 +1216,12 @@ func startPokerPayout(a *App, targetID int, targetName string) {
 					a.AddLogMsg(fmt.Sprintf("[PAYOUT] refreshed %s target from ROOM_USERS index %d -> %d", targetName, targetID, resolvedID))
 					log.Printf("[PAYOUT] refreshed %s target from ROOM_USERS index %d -> %d", targetName, targetID, resolvedID)
 					targetID = resolvedID
-					pokerPayoutTargetID = resolvedID
+					payoutTargetID = resolvedID
 				} else if resolvedID, ok := waitForUsers28RoomIndexByName(targetName, 700*time.Millisecond); ok && resolvedID > 0 && resolvedID != targetID {
 					a.AddLogMsg(fmt.Sprintf("[PAYOUT] refreshed %s target from USERS28 room index %d -> %d", targetName, targetID, resolvedID))
 					log.Printf("[PAYOUT] refreshed %s target from USERS28 room index %d -> %d", targetName, targetID, resolvedID)
 					targetID = resolvedID
-					pokerPayoutTargetID = resolvedID
+					payoutTargetID = resolvedID
 				} else if resolvedID, ok := waitForUsers28NameIndex(targetName, 700*time.Millisecond); ok {
 					a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] generic USERS28 name->index fallback produced %d for %s (current target %d)", resolvedID, targetName, targetID))
 					log.Printf("[PAYOUT_DEBUG] generic USERS28 name->index fallback produced %d for %s (current target %d)", resolvedID, targetName, targetID)
@@ -1230,7 +1230,7 @@ func startPokerPayout(a *App, targetID int, targetName string) {
 
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT] opening trade with %s (%d), attempt %d/5", targetName, targetID, attempt))
 			log.Printf("[PAYOUT] opening trade with %s (%d), attempt %d/5", targetName, targetID, attempt)
-			pokerPayoutTradeSent = true
+			payoutTradeSent = true
 			rememberOutgoingTradeOpenTarget(targetID)
 			outPreview := string(ext.NewPacket(out.TRADE_OPEN, targetID).Data)
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT] outgoing[71] payload=%q", outPreview))
@@ -1246,16 +1246,16 @@ func startPokerPayout(a *App, targetID int, targetName string) {
 			if attempt > 1 {
 				msg := fmt.Sprintf("Tried to open trade %d times", attempt)
 				time.Sleep(800 * time.Millisecond)
-				if sessionID != pokerPayoutSessionID {
+				if sessionID != payoutSessionID {
 					return
 				}
 				sendMessageWithDelay(msg)
 			}
 
-			// Wait up to 5 seconds for the trade to open (header 104 will call stopPokerPayout)
+			// Wait up to 5 seconds for the trade to open (header 104 will call stopPayout)
 			for i := 0; i < 50; i++ {
 				time.Sleep(100 * time.Millisecond)
-				if sessionID != pokerPayoutSessionID {
+				if sessionID != payoutSessionID {
 					// Trade opened (or externally cancelled) — done
 					return
 				}
@@ -1265,13 +1265,13 @@ func startPokerPayout(a *App, targetID int, targetName string) {
 		}
 
 		// All 5 attempts exhausted
-		if sessionID == pokerPayoutSessionID {
+		if sessionID == payoutSessionID {
 			msg := "Recorded game history and flagged"
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT] all attempts exhausted, shouting: %q", msg))
 			log.Printf("[PAYOUT] all attempts exhausted, shouting: %q", msg)
 			a.markCurrentGameHistoryIssue("Payout trade failed to open after all retry attempts", true)
 			sendMessageWithDelay(msg)
-			stopPokerPayout()
+			stopPayout()
 			// Resume normal dealer-open cycle
 			awaitingTradeOpen = true
 			if canAnnounceDealerOpen() {
@@ -1286,7 +1286,7 @@ func startPokerPayout(a *App, targetID int, targetName string) {
 func (a *App) autoAddPayoutItems() {
 	time.Sleep(600 * time.Millisecond) // settle time after trade opens
 
-	betItems := pokerGameBetItems
+	betItems := gameBetItems
 	if len(betItems) == 0 {
 		a.AddLogMsg("[PAYOUT] no bet items recorded, skipping auto-add")
 		log.Printf("[PAYOUT] no bet items recorded, skipping auto-add")
@@ -1355,13 +1355,13 @@ func (a *App) autoAddPayoutItems() {
 			log.Printf("[PAYOUT] warning: need %d of %s but only found %d unique item ids", needed, betItem.Name, len(toAdd))
 		}
 		for _, itemID := range toAdd {
-			if !pokerPayoutTradeActive {
+			if !payoutTradeActive {
 				a.AddLogMsg("[PAYOUT] trade closed mid-add, stopping")
 				return
 			}
 			time.Sleep(550 * time.Millisecond)
 			ext.Send(out.TRADE_ADDITEM, -itemID)
-			if pokerPayoutTradeActive {
+			if payoutTradeActive {
 				payoutActualAddCount++
 			}
 			plannedIDs = append(plannedIDs, itemID)
@@ -1388,7 +1388,7 @@ func (a *App) autoAddPayoutItems() {
 	payoutExpectedAddCount = requiredTotal
 	payoutActualAddCount = 0
 
-	if pokerPayoutTradeActive && !tradeAutoAccepted {
+	if payoutTradeActive && !tradeAutoAccepted {
 		if fullyPlanned && total >= requiredTotal && payoutActualAddCount >= requiredTotal {
 			time.Sleep(450 * time.Millisecond)
 			ext.Send(out.TRADE_ACCEPT)
@@ -1510,7 +1510,7 @@ func (a *App) ownTradeHasRequiredPayoutOffer(required map[string]int) (bool, str
 }
 
 func (a *App) tryAcceptPayoutTrade(required map[string]int, source string) bool {
-	if !pokerPayoutTradeActive {
+	if !payoutTradeActive {
 		return false
 	}
 	if tradeAutoAccepted {
@@ -1536,7 +1536,7 @@ func (a *App) verifyAndRetryPayoutAdds(plannedIDs []int) {
 		return
 	}
 
-	required := payoutRequirementsFromBetItems(pokerGameBetItems)
+	required := payoutRequirementsFromBetItems(gameBetItems)
 	if len(required) == 0 {
 		a.AddLogMsg("[PAYOUT_DEBUG] no payout requirements found while verifying add")
 		return
@@ -1548,7 +1548,7 @@ func (a *App) verifyAndRetryPayoutAdds(plannedIDs []int) {
 
 	// Give the server time to echo TRADE_ITEMS updates.
 	time.Sleep(2500 * time.Millisecond)
-	if !pokerPayoutTradeActive {
+	if !payoutTradeActive {
 		return
 	}
 
@@ -1563,12 +1563,12 @@ func (a *App) verifyAndRetryPayoutAdds(plannedIDs []int) {
 	a.AddLogMsg("[PAYOUT_DEBUG] own offer still empty after auto-add, retrying with positive item IDs")
 	log.Printf("[PAYOUT_DEBUG] own offer still empty after auto-add, retrying with positive item IDs")
 	for _, itemID := range plannedIDs {
-		if !pokerPayoutTradeActive {
+		if !payoutTradeActive {
 			return
 		}
 		time.Sleep(450 * time.Millisecond)
 		ext.Send(out.TRADE_ADDITEM, itemID)
-		if pokerPayoutTradeActive {
+		if payoutTradeActive {
 			payoutActualAddCount++
 		}
 		payload := string(ext.NewPacket(out.TRADE_ADDITEM, itemID).Data)
@@ -1584,7 +1584,7 @@ func (a *App) verifyAndRetryPayoutAdds(plannedIDs []int) {
 		return
 	}
 
-	if pokerPayoutTradeActive && !tradeAutoAccepted && len(plannedIDs) >= requiredTotal && payoutActualAddCount >= requiredTotal {
+	if payoutTradeActive && !tradeAutoAccepted && len(plannedIDs) >= requiredTotal && payoutActualAddCount >= requiredTotal {
 		// Attribution can be unreliable in this direction; once full payout has been queued,
 		// accept without waiting for the player to accept first.
 		ext.Send(out.TRADE_ACCEPT)
@@ -1764,7 +1764,7 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 	if tradeAutoAccepted || tradeAutoAcceptPending {
 		return
 	}
-	if !pokerPayoutTradeActive && len(a.getTradeCoverageShortages()) > 0 {
+	if !payoutTradeActive && len(a.getTradeCoverageShortages()) > 0 {
 		a.AddLogMsg("[TRADE_ACCEPT] skipped auto-accept due to insufficient payout stock")
 		log.Printf("[TRADE_ACCEPT] skipped auto-accept due to insufficient payout stock")
 		return
@@ -1783,7 +1783,7 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 			return
 		}
 
-		if !pokerPayoutTradeActive && len(a.getTradeCoverageShortages()) > 0 {
+		if !payoutTradeActive && len(a.getTradeCoverageShortages()) > 0 {
 			tradeAutoAcceptPending = false
 			a.AddLogMsg("[TRADE_ACCEPT] canceled auto-accept due to insufficient payout stock")
 			log.Printf("[TRADE_ACCEPT] canceled auto-accept due to insufficient payout stock")
@@ -1802,7 +1802,7 @@ func scheduleAutoTradeConfirm(a *App, payload string) {
 	if tradeAutoConfirmed || tradeAutoConfirmPending {
 		return
 	}
-	if !pokerPayoutTradeActive && len(a.getTradeCoverageShortages()) > 0 {
+	if !payoutTradeActive && len(a.getTradeCoverageShortages()) > 0 {
 		a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] skipped auto-confirm due to insufficient payout stock")
 		log.Printf("[TRADE_CONFIRM_ACCEPT] skipped auto-confirm due to insufficient payout stock")
 		return
@@ -1830,7 +1830,7 @@ func scheduleAutoTradeConfirm(a *App, payload string) {
 				return
 			}
 
-			if !pokerPayoutTradeActive && len(a.getTradeCoverageShortages()) > 0 {
+			if !payoutTradeActive && len(a.getTradeCoverageShortages()) > 0 {
 				tradeAutoConfirmPending = false
 				a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] canceled auto-confirm due to insufficient payout stock")
 				log.Printf("[TRADE_CONFIRM_ACCEPT] canceled auto-confirm due to insufficient payout stock")
@@ -2092,7 +2092,7 @@ func (a *App) resetDealerSessionState(reason string) {
 	lastTradePartnerID = 0
 	lastTradePartnerName = ""
 	lastTradePartnerToken = ""
-	pokerGameBetItems = nil
+	gameBetItems = nil
 	lastAddItemWasOurs = false
 	lastTradeCoverageNotice = ""
 	lastTradeBlockNotice = ""
@@ -2103,7 +2103,7 @@ func (a *App) resetDealerSessionState(reason string) {
 	resetTradeAutoFlow()
 	resetPokerSequence()
 	resetBlackjackSequence()
-	stopPokerPayout()
+	stopPayout()
 	a.ClearTradeItems()
 
 	handItemsMu.Lock()
@@ -2624,8 +2624,8 @@ func (a *App) emitTradeItemsUpdate(side string) {
 }
 
 func (a *App) emitActiveGameBetItemsUpdate() {
-	items := make([]TradeItem, len(pokerGameBetItems))
-	copy(items, pokerGameBetItems)
+	items := make([]TradeItem, len(gameBetItems))
+	copy(items, gameBetItems)
 
 	jsonData, err := json.Marshal(items)
 	if err != nil {
@@ -2711,6 +2711,39 @@ func (a *App) resyncHandThenOpenDealer() {
 	} else {
 		dealerTradeWindowOpen = false
 		log.Printf("User is muted. Dealer open announcement skipped; incoming trades will be blocked.")
+	}
+	startDealerOpenHeartbeat(a)
+}
+
+// openDealerAfterRound syncs the hand and reopens dealer trades after a clean game result.
+// Unlike resyncHandThenOpenDealer it does NOT mark a game-history issue.
+func (a *App) openDealerAfterRound() {
+	dealerResyncInProgress = true
+	requestRoomUsers(a)
+
+	scanID := a.requestPlayerStrip()
+	if ok := waitForStripScanCompletion(scanID, 20*time.Second); ok {
+		a.AddLogMsg(fmt.Sprintf("[DEALER_REOPEN] hand sync complete (session=%d)", scanID))
+		log.Printf("[DEALER_REOPEN] hand sync complete (session=%d)", scanID)
+	} else {
+		a.AddLogMsg(fmt.Sprintf("[DEALER_REOPEN] hand sync timeout (session=%d), reopening anyway", scanID))
+		log.Printf("[DEALER_REOPEN] hand sync timeout (session=%d), reopening anyway", scanID)
+	}
+
+	dealerResyncInProgress = false
+	if shouldRefreshRoomUsers() {
+		requestRoomUsers(a)
+	}
+	awaitingTradeOpen = true
+	if canAnnounceDealerOpen() {
+		dealerTradeWindowOpen = true
+		openMsg := a.dealerOpenMessage()
+		a.AddLogMsg(fmt.Sprintf("[DEALER_REOPEN] shouting: %q", openMsg))
+		log.Printf("[DEALER_REOPEN] shouting: %q", openMsg)
+		go sendMessageWithDelay(openMsg)
+	} else {
+		dealerTradeWindowOpen = false
+		log.Printf("[DEALER_REOPEN] dealer open skipped (muted or no dice)")
 	}
 	startDealerOpenHeartbeat(a)
 }
@@ -3261,16 +3294,16 @@ func formatTradeShortages(shortages []tradeShortage) string {
 // sendTradeCompletionMessage sends the post-trade game prompt sequence.
 func (a *App) sendTradeCompletionMessage() {
 	tradeItemsMu.Lock()
-	pokerGameBetItems = make([]TradeItem, len(currentTradeItems))
-	copy(pokerGameBetItems, currentTradeItems)
+	gameBetItems = make([]TradeItem, len(currentTradeItems))
+	copy(gameBetItems, currentTradeItems)
 	tradeItemsMu.Unlock()
 	a.emitActiveGameBetItemsUpdate()
 
-	if len(pokerGameBetItems) == 0 {
+	if len(gameBetItems) == 0 {
 		a.AddLogMsg("[TRADE_MESSAGE] no items detected in trade, continuing anyway")
 		log.Printf("[TRADE_MESSAGE] no items detected in trade, continuing anyway")
 	} else {
-		a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE] recorded %d bet item type(s) for payout", len(pokerGameBetItems)))
+		a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE] recorded %d bet item type(s) for payout", len(gameBetItems)))
 	}
 
 	partnerName := strings.TrimSpace(lastTradePartnerName)
@@ -3289,7 +3322,7 @@ func (a *App) sendTradeCompletionMessage() {
 	if partnerName == "" || strings.EqualFold(partnerName, "Unknown") {
 		partnerName = "Player"
 	}
-	a.beginGameHistory(partnerName, pokerGameBetItems)
+	a.beginGameHistory(partnerName, gameBetItems)
 
 	first := fmt.Sprintf("%s what game do you want to play?", partnerName)
 	second := "Say Poker, 21, 13"

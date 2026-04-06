@@ -282,7 +282,7 @@ func (a *App) startup(ctx context.Context) {
 	}()
 	go func() {
 		time.Sleep(1500 * time.Millisecond)
-		scanID := a.requestPlayerStrip()
+		scanID := a.requestPlayerStrip(true)
 		if ok := waitForStripScanCompletion(scanID, 20*time.Second); ok {
 			a.AddLogMsg(fmt.Sprintf("[STRIP] initial hand sync complete (session=%d)", scanID))
 			log.Printf("[STRIP] initial hand sync complete (session=%d)", scanID)
@@ -300,7 +300,7 @@ func (a *App) startup(ctx context.Context) {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			a.requestPlayerStrip()
+			a.requestPlayerStrip(false)
 		}
 	}()
 }
@@ -1005,14 +1005,12 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			// Send the trade items summary to chat
 			a.sendTradeCompletionMessage()
 			go func() {
-				scanID := a.requestPlayerStrip()
-				if ok := waitForStripScanCompletion(scanID, 20*time.Second); ok {
-					a.AddLogMsg(fmt.Sprintf("[TRADE_COMPLETED] hand sync complete (session=%d) - updating trade snapshot", scanID))
-					log.Printf("[TRADE_COMPLETED] hand sync complete (session=%d) - updating trade snapshot", scanID)
-					a.captureTradeHandSnapshot()
+				if ok := a.forceRefreshHandSnapshot("trade completed"); ok {
+					a.AddLogMsg("[TRADE_COMPLETED] forced hand refresh complete after trade")
+					log.Printf("[TRADE_COMPLETED] forced hand refresh complete after trade")
 				} else {
-					a.AddLogMsg(fmt.Sprintf("[TRADE_COMPLETED] hand sync timeout (session=%d)", scanID))
-					log.Printf("[TRADE_COMPLETED] hand sync timeout (session=%d)", scanID)
+					a.AddLogMsg("[TRADE_COMPLETED] forced hand refresh failed after trade")
+					log.Printf("[TRADE_COMPLETED] forced hand refresh failed after trade")
 				}
 			}()
 		}
@@ -1276,20 +1274,11 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		addItemMu.Unlock()
 
 		go func() {
-			scanID := a.requestPlayerStrip()
-			if ok := waitForStripScanCompletion(scanID, 20*time.Second); ok {
-				// Under strict lifecycle, only capture if we don't already
-				// have a frozen snapshot for the current round.
-				if !strictTradeSnapshotLifecycle || !tradeHandSnapshotReady {
-					a.captureTradeHandSnapshot()
-				} else {
-					a.AddLogMsg("[TRADE_HAND_SNAPSHOT] strict lifecycle active and snapshot already ready; skipping capture")
-					log.Printf("[TRADE_HAND_SNAPSHOT] strict lifecycle active and snapshot already ready; skipping capture")
-				}
+			if ok := a.forceRefreshHandSnapshot("incoming trade open"); ok {
 				a.notifyTradeQuantityCoverage()
 			} else {
-				a.AddLogMsg(fmt.Sprintf("[TRADE_HAND_SNAPSHOT] hand scan timeout (session=%d)", scanID))
-				log.Printf("[TRADE_HAND_SNAPSHOT] hand scan timeout (session=%d)", scanID)
+				a.AddLogMsg("[TRADE_HAND_SNAPSHOT] forced refresh failed on incoming trade open")
+				log.Printf("[TRADE_HAND_SNAPSHOT] forced refresh failed on incoming trade open")
 			}
 		}()
 		return
@@ -1640,7 +1629,7 @@ func (a *App) autoAddPayoutItems() {
 		if attempt < 3 {
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] payout still short after hand scan attempt %d, requesting next hand scan: %s", attempt, formatMissingCounts(missing)))
 			log.Printf("[PAYOUT_DEBUG] payout still short after hand scan attempt %d, requesting next hand scan: %s", attempt, formatMissingCounts(missing))
-			go a.requestPlayerStrip()
+			go a.requestPlayerStrip(true)
 			time.Sleep(8 * time.Second)
 		} else {
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] payout still short after final hand scan attempt: %s", formatMissingCounts(missing)))
@@ -2961,14 +2950,12 @@ func (a *App) ClearTradeItems() {
 	tradeItemsMu.Unlock()
 
 	handItemsMu.Lock()
-	// Only clear the frozen trade-hand snapshot when strict lifecycle is
-	// disabled. Under the strict policy the snapshot should remain valid
-	// for the dealer-open period and only be refreshed after a completed
-	// game.
-	if !strictTradeSnapshotLifecycle {
-		tradeHandSnapshot = []TradeItem{}
-		tradeHandSnapshotReady = false
-	}
+	// Always clear any frozen trade-hand snapshot when trades are cleared.
+	// Keeping stale snapshots across rounds was causing reopened dealer
+	// sessions to operate on old hand state. Reset snapshot unconditionally
+	// so the next reopen must build a fresh one.
+	tradeHandSnapshot = nil
+	tradeHandSnapshotReady = false
 	// Mark trade as closed so periodic/rescans may resume normally.
 	tradeOpen = false
 	handItemsMu.Unlock()
@@ -3018,12 +3005,14 @@ func (a *App) emitActiveGameBetItemsUpdate() {
 }
 
 // requestPlayerStrip sends GETSTRIP[65] to refresh the player's hand inventory.
-func (a *App) requestPlayerStrip() int {
+// If force is true, it will always start a brand new full scan even if a frozen
+// snapshot already exists.
+func (a *App) requestPlayerStrip(force bool) int {
 	handItemsMu.Lock()
 	snapshotReady := tradeHandSnapshotReady
 	handItemsMu.Unlock()
 
-	if tradeOpen && snapshotReady {
+	if !force && tradeOpen && snapshotReady {
 		a.AddLogMsg("[STRIP_DEBUG] skipped hand scan because trade snapshot is already frozen")
 		log.Printf("[STRIP_DEBUG] skipped hand scan because trade snapshot is already frozen")
 
@@ -3043,8 +3032,8 @@ func (a *App) requestPlayerStrip() int {
 	sid := stripScanSessionID
 	stripScanMu.Unlock()
 
-	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] start scan session=%d", sid))
-	log.Printf("[STRIP_DEBUG] start scan session=%d", sid)
+	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] start scan session=%d force=%t", sid, force))
+	log.Printf("[STRIP_DEBUG] start scan session=%d force=%t", sid, force)
 
 	ext.Send(out.GETSTRIP, "new")
 	a.AddLogMsg("[STRIP_DEBUG] raw GETSTRIP send payload=\"new\"")
@@ -3083,24 +3072,19 @@ func (a *App) resyncHandThenOpenDealer() {
 	log.Printf("[TRADE_REOPEN] full reset complete; syncing room users and hand before reopening trades")
 	requestRoomUsers(a)
 
-	scanID := a.requestPlayerStrip()
-	if ok := waitForStripScanCompletion(scanID, 20*time.Second); ok {
-		a.AddLogMsg(fmt.Sprintf("[TRADE_REOPEN] hand sync complete (session=%d)", scanID))
-		log.Printf("[TRADE_REOPEN] hand sync complete (session=%d)", scanID)
-		// Capture a fresh frozen snapshot for the upcoming dealer-open round.
-		if !strictTradeSnapshotLifecycle || !tradeHandSnapshotReady {
-			a.captureTradeHandSnapshot()
-			log.Printf("[TRADE_REOPEN] captured trade hand snapshot (session=%d)", scanID)
-		}
-	} else {
-		a.AddLogMsg(fmt.Sprintf("[TRADE_REOPEN] hand sync timeout (session=%d), reopening anyway", scanID))
-		log.Printf("[TRADE_REOPEN] hand sync timeout (session=%d), reopening anyway", scanID)
-	}
+	ok := a.forceRefreshHandSnapshot("resyncHandThenOpenDealer")
 
 	dealerResyncInProgress = false
 	if shouldRefreshRoomUsers() {
 		requestRoomUsers(a)
 	}
+
+	if !ok {
+		a.AddLogMsg("[TRADE_REOPEN] refusing to announce dealer open because forced hand refresh failed")
+		log.Printf("[TRADE_REOPEN] refusing to announce dealer open because forced hand refresh failed")
+		return
+	}
+
 	awaitingTradeOpen = true
 	if canAnnounceDealerOpen() {
 		dealerTradeWindowOpen = true
@@ -3127,24 +3111,19 @@ func (a *App) openDealerAfterRound() {
 	lastTradePartnerID = 0
 	lastTradePartnerToken = ""
 
-	scanID := a.requestPlayerStrip()
-	if ok := waitForStripScanCompletion(scanID, 20*time.Second); ok {
-		a.AddLogMsg(fmt.Sprintf("[DEALER_REOPEN] hand sync complete (session=%d)", scanID))
-		log.Printf("[DEALER_REOPEN] hand sync complete (session=%d)", scanID)
-		// Capture a frozen snapshot to be used for the upcoming dealer-open period.
-		if !strictTradeSnapshotLifecycle || !tradeHandSnapshotReady {
-			a.captureTradeHandSnapshot()
-			log.Printf("[DEALER_REOPEN] captured trade hand snapshot (session=%d)", scanID)
-		}
-	} else {
-		a.AddLogMsg(fmt.Sprintf("[DEALER_REOPEN] hand sync timeout (session=%d), reopening anyway", scanID))
-		log.Printf("[DEALER_REOPEN] hand sync timeout (session=%d), reopening anyway", scanID)
-	}
+	ok := a.forceRefreshHandSnapshot("openDealerAfterRound")
 
 	dealerResyncInProgress = false
 	if shouldRefreshRoomUsers() {
 		requestRoomUsers(a)
 	}
+
+	if !ok {
+		a.AddLogMsg("[DEALER_REOPEN] refusing to announce dealer open because forced hand refresh failed")
+		log.Printf("[DEALER_REOPEN] refusing to announce dealer open because forced hand refresh failed")
+		return
+	}
+
 	awaitingTradeOpen = true
 	if canAnnounceDealerOpen() {
 		dealerTradeWindowOpen = true
@@ -3510,6 +3489,33 @@ func (a *App) captureTradeHandSnapshot() {
 	joined := strings.Join(parts, ",")
 	a.AddLogMsg("[TRADE_HAND_SNAPSHOT] captured: " + joined)
 	log.Printf("[TRADE_HAND_SNAPSHOT] captured: %s", joined)
+}
+
+func (a *App) invalidateTradeHandSnapshot(reason string) {
+	handItemsMu.Lock()
+	tradeHandSnapshot = nil
+	tradeHandSnapshotReady = false
+	handItemsMu.Unlock()
+
+	a.AddLogMsg(fmt.Sprintf("[TRADE_HAND_SNAPSHOT] invalidated: %s", reason))
+	log.Printf("[TRADE_HAND_SNAPSHOT] invalidated: %s", reason)
+}
+
+func (a *App) forceRefreshHandSnapshot(reason string) bool {
+	a.invalidateTradeHandSnapshot(reason)
+
+	scanID := a.requestPlayerStrip(true)
+	if ok := waitForStripScanCompletion(scanID, 20*time.Second); !ok {
+		a.AddLogMsg(fmt.Sprintf("[TRADE_HAND_SNAPSHOT] forced hand sync timeout (session=%d reason=%s)", scanID, reason))
+		log.Printf("[TRADE_HAND_SNAPSHOT] forced hand sync timeout (session=%d reason=%s)", scanID, reason)
+		return false
+	}
+
+	// Always overwrite with the latest current hand after a forced scan.
+	a.captureTradeHandSnapshot()
+	a.AddLogMsg(fmt.Sprintf("[TRADE_HAND_SNAPSHOT] forced refresh complete (session=%d reason=%s)", scanID, reason))
+	log.Printf("[TRADE_HAND_SNAPSHOT] forced refresh complete (session=%d reason=%s)", scanID, reason)
+	return true
 }
 
 func (a *App) notifyTradeQuantityCoverage() {
@@ -5465,18 +5471,7 @@ func (a *App) roll13Dice() {
 	// If this is the player's initial roll and the two-dice total is <= 6,
 	// immediately trigger a hit (roll the next dice) so the result is seen
 	// without waiting for the external decision prompt.
-	if thirteenPlayerTurn && currentSum <= 6 {
-		a.AddLogMsg(fmt.Sprintf("[13_DEBUG] initial two dice total=%d -> immediate hit", currentSum))
-		log.Printf("[13_DEBUG] initial two dice total=%d -> immediate hit", currentSum)
-		// Prevent duplicate hits from evaluate13Hand by marking a hit in flight
-		thirteenHitInFlight = true
-		is13Hitting = true
-		go a.hit13Dice()
-		// hit13Dice will call evaluate13Hand when complete
-		is13Rolling = false
-		return
-	}
-
+	// Fall through to evaluation and prompt the player; do not auto-hit.
 	a.evaluate13Hand()
 	is13Rolling = false
 }

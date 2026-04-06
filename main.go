@@ -3358,20 +3358,41 @@ func (a *App) getTradeCoverageShortages() []tradeShortage {
 		return nil
 	}
 
-	// map hand counts
+	// Build canonical maps using normalizeClassKeyWithVariant so
+	// variant suffixes (e.g. *4) are treated as part of the name.
 	handMap := map[string]int{}
 	for _, it := range handSnapshot {
-		handMap[it.Name] += it.Quantity
+		key := strings.ToLower(strings.TrimSpace(it.Name))
+		if k, ok := normalizeClassKeyWithVariant(it.Name); ok {
+			key = k
+		}
+		handMap[key] += it.Quantity
 	}
 
-	// map incoming counts
 	incomingMap := map[string]int{}
 	for _, it := range partnerItems {
-		incomingMap[it.Name] += it.Quantity
+		key := strings.ToLower(strings.TrimSpace(it.Name))
+		if k, ok := normalizeClassKeyWithVariant(it.Name); ok {
+			key = k
+		}
+		incomingMap[key] += it.Quantity
+	}
+
+	// Recompute required payouts using canonical keys to match above maps.
+	requiredCanon := map[string]int{}
+	for _, it := range partnerItems {
+		key := strings.ToLower(strings.TrimSpace(it.Name))
+		if k, ok := normalizeClassKeyWithVariant(it.Name); ok {
+			key = k
+		}
+		if it.Quantity <= 0 {
+			continue
+		}
+		requiredCanon[key] += it.Quantity * 2
 	}
 
 	shortages := make([]tradeShortage, 0)
-	for name, req := range required {
+	for name, req := range requiredCanon {
 		haveHand := handMap[name]
 		incoming := incomingMap[name]
 		if haveHand < req {
@@ -3384,6 +3405,28 @@ func (a *App) getTradeCoverageShortages() []tradeShortage {
 				Incoming:    incoming,
 			})
 		}
+	}
+
+	// If shortages present, log debug view of maps to aid diagnosis.
+	if len(shortages) > 0 {
+		// build readable lists
+		handKeys := make([]string, 0, len(handMap))
+		for k := range handMap {
+			handKeys = append(handKeys, fmt.Sprintf("%s=%d", k, handMap[k]))
+		}
+		sort.Strings(handKeys)
+		incomingKeys := make([]string, 0, len(incomingMap))
+		for k := range incomingMap {
+			incomingKeys = append(incomingKeys, fmt.Sprintf("%s=%d", k, incomingMap[k]))
+		}
+		sort.Strings(incomingKeys)
+		reqKeys := make([]string, 0, len(requiredCanon))
+		for k := range requiredCanon {
+			reqKeys = append(reqKeys, fmt.Sprintf("%s=%d", k, requiredCanon[k]))
+		}
+		sort.Strings(reqKeys)
+		a.AddLogMsg(fmt.Sprintf("[TRADE_COVERAGE_DEBUG] hand=%s incoming=%s required=%s", strings.Join(handKeys, ","), strings.Join(incomingKeys, ","), strings.Join(reqKeys, ",")))
+		log.Printf("[TRADE_COVERAGE_DEBUG] hand=%s incoming=%s required=%s", strings.Join(handKeys, ","), strings.Join(incomingKeys, ","), strings.Join(reqKeys, ","))
 	}
 
 	return shortages

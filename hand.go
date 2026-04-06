@@ -312,55 +312,153 @@ func (a *App) finalizeBlackjackRound(playerWins bool, reason string) {
 }
 
 func (a *App) evaluate13Hand() {
+	defer func() {
+		if r := recover(); r != nil {
+			a.AddLogMsg(fmt.Sprintf("[13_CRASH_GUARD] recovered panic in evaluate13Hand: %v", r))
+			log.Printf("[13_CRASH_GUARD] recovered panic in evaluate13Hand: %v", r)
+			reset13Sequence()
+			is13Rolling = false
+			is13Hitting = false
+		}
+	}()
+
 	mutex.Lock()
 	mutex.Unlock()
-
-	if !ChatIsDisabled {
-		// Log the current sum for debugging purposes
-		log.Printf("Evaluating hand: Current sum = %d\n", currentSum)
-
-		// If sum is less than 15, call hitBjDice to roll another dice
-		if currentSum < 7 {
-			log.Println("Sum is less than 7. Hitting another dice.")
-			a.hit13Dice() // This will hit the dice and then re-evaluate the hand
-			return        // Return early after hitting, so we don't send a message yet
-		}
-
-		// Convert sum to string and send to chat
-		hand := strconv.Itoa(currentSum)
-		logRollResult := fmt.Sprintf("13 Result: %s\n", hand)
-		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
-		a.AddLogMsg(logRollResult)
-		a.setCurrentGameHistoryResults(hand, "", "Not Recorded", "Result Recorded", true)
-		a.noteCurrentGameHistory("13 result recorded; winner was not automatically tracked")
-		if !isMuted {
-			// If the user is not muted, send the message
-			sendMessageWithDelay(hand)
-		} else {
-			// If the user is muted, queue the message to send later
-			log.Printf("User is muted. Queuing message: %s", hand)
-			// ToDo:
-			// messageQueue = append(messageQueue, hand)
-		}
-	} else {
-		// Log the current sum for debugging purposes
-		log.Printf("Evaluating hand: Current sum = %d\n", currentSum)
-
-		// If sum is less than 15, call hitBjDice to roll another dice
-		if currentSum < 7 {
-			log.Println("Sum is less than 7. Hitting another dice.")
-			a.hit13Dice() // This will hit the dice and then re-evaluate the hand
-			return        // Return early after hitting, so we don't send a message yet
-		}
-
-		// Convert sum to string and send to chat
-		hand := strconv.Itoa(currentSum)
-		logRollResult := fmt.Sprintf("13 Result: %s\n", hand)
-		time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
-		a.AddLogMsg(logRollResult)
-		a.setCurrentGameHistoryResults(hand, "", "Not Recorded", "Result Recorded", true)
-		a.noteCurrentGameHistory("13 result recorded; winner was not automatically tracked")
+	if !thirteenRoundActive {
+		is13Rolling = false
+		is13Hitting = false
+		return
 	}
+
+	a.AddLogMsg(fmt.Sprintf("[13] evaluating sum=%d playerTurn=%t", currentSum, thirteenPlayerTurn))
+	log.Printf("[13] evaluating sum=%d playerTurn=%t", currentSum, thirteenPlayerTurn)
+	a.AddLogMsg(fmt.Sprintf("[13_DEBUG] evaluate start roundActive=%t playerTurn=%t sum=%d hitInFlight=%t awaitingDecision=%t", thirteenRoundActive, thirteenPlayerTurn, currentSum, thirteenHitInFlight, awaiting13Decision))
+	log.Printf("[13_DEBUG] evaluate start roundActive=%t playerTurn=%t sum=%d hitInFlight=%t awaitingDecision=%t", thirteenRoundActive, thirteenPlayerTurn, currentSum, thirteenHitInFlight, awaiting13Decision)
+
+	if thirteenPlayerTurn {
+		playerLabel := strings.TrimSpace(thirteenPlayerName)
+		if playerLabel == "" {
+			playerLabel = strings.TrimSpace(lastTradePartnerName)
+		}
+		if playerLabel == "" {
+			playerLabel = "Player"
+		}
+
+		thirteenPlayerTotal = currentSum
+		a.AddLogMsg(fmt.Sprintf("[13] player total now %d", thirteenPlayerTotal))
+		log.Printf("[13] player total now %d", thirteenPlayerTotal)
+
+		if thirteenPlayerTotal > 13 {
+			a.finalize13Round(false, "player bust")
+			is13Rolling = false
+			is13Hitting = false
+			return
+		}
+
+		if thirteenPlayerTotal == 13 {
+			a.AddLogMsg("[13] player total 13; auto-stay and moving to dealer roll")
+			log.Printf("[13] player total 13; auto-stay and moving to dealer roll")
+			if !ChatIsDisabled && !isMuted {
+				sendMessageWithDelay(fmt.Sprintf("%s total %d", playerLabel, thirteenPlayerTotal))
+			}
+			a.start13DealerTurn("player reached 13 auto-stay")
+			is13Rolling = false
+			is13Hitting = false
+			return
+		}
+
+		if thirteenPlayerTotal < 7 {
+			a.AddLogMsg(fmt.Sprintf("[13] player total %d < 7; auto-hit", thirteenPlayerTotal))
+			log.Printf("[13] player total %d < 7; auto-hit", thirteenPlayerTotal)
+			if thirteenHitInFlight {
+				a.AddLogMsg("[13] auto-hit deferred: hit already in flight")
+				log.Printf("[13] auto-hit deferred: hit already in flight")
+				go func() {
+					time.Sleep(150 * time.Millisecond)
+					a.evaluate13Hand()
+				}()
+				return
+			}
+			thirteenHitInFlight = true
+			is13Hitting = true
+			go a.hit13Dice()
+			return
+		}
+
+		awaiting13Decision = true
+		awaiting13DecisionPartnerName = strings.TrimSpace(thirteenPlayerName)
+		if awaiting13DecisionPartnerName == "" {
+			awaiting13DecisionPartnerName = strings.TrimSpace(lastTradePartnerName)
+		}
+		if awaiting13DecisionPartnerName == "" {
+			awaiting13DecisionPartnerName = "Player"
+		}
+		if chatIdx, ok := lookupRoomEntityIndexByName(awaiting13DecisionPartnerName); ok && chatIdx > 0 {
+			awaiting13DecisionPartnerID = chatIdx
+			a.AddLogMsg(fmt.Sprintf("[13_DEBUG] prompt target resolved via room index=%d name=%q", awaiting13DecisionPartnerID, awaiting13DecisionPartnerName))
+			log.Printf("[13_DEBUG] prompt target resolved via room index=%d name=%q", awaiting13DecisionPartnerID, awaiting13DecisionPartnerName)
+		} else if chatIdx, ok := lookupUsers28RoomIndexByName(awaiting13DecisionPartnerName); ok && chatIdx > 0 {
+			awaiting13DecisionPartnerID = chatIdx
+			a.AddLogMsg(fmt.Sprintf("[13_DEBUG] prompt target resolved via users28 roomIndex=%d name=%q", awaiting13DecisionPartnerID, awaiting13DecisionPartnerName))
+			log.Printf("[13_DEBUG] prompt target resolved via users28 roomIndex=%d name=%q", awaiting13DecisionPartnerID, awaiting13DecisionPartnerName)
+		} else {
+			awaiting13DecisionPartnerID = lastTradePartnerID
+			a.AddLogMsg(fmt.Sprintf("[13_DEBUG] prompt target fallback index=%d name=%q", awaiting13DecisionPartnerID, awaiting13DecisionPartnerName))
+			log.Printf("[13_DEBUG] prompt target fallback index=%d name=%q", awaiting13DecisionPartnerID, awaiting13DecisionPartnerName)
+		}
+
+		prompt := fmt.Sprintf("%s total %d. Hit or stay?", playerLabel, thirteenPlayerTotal)
+		a.AddLogMsg(fmt.Sprintf("[13] prompting decision: %q", prompt))
+		log.Printf("[13] prompting decision: %q", prompt)
+		if !ChatIsDisabled && !isMuted {
+			a.AddLogMsg("[13_DEBUG] sending hit/stay prompt to chat")
+			log.Printf("[13_DEBUG] sending hit/stay prompt to chat")
+			sendMessageWithDelay(prompt)
+		} else {
+			a.AddLogMsg("[13] prompt not sent (chat disabled or muted); auto-staying")
+			log.Printf("[13] prompt not sent (chat disabled or muted); auto-staying")
+			awaiting13Decision = false
+			a.start13DealerTurn("prompt unavailable auto-stay")
+			is13Rolling = false
+			is13Hitting = false
+			return
+		}
+
+		is13Rolling = false
+		is13Hitting = false
+		return
+	}
+
+	thirteenDealerTotal = currentSum
+	a.AddLogMsg(fmt.Sprintf("[13] dealer total now %d (player=%d)", thirteenDealerTotal, thirteenPlayerTotal))
+	log.Printf("[13] dealer total now %d (player=%d)", thirteenDealerTotal, thirteenPlayerTotal)
+
+	if thirteenDealerTotal > 13 {
+		a.finalize13Round(true, "dealer bust")
+		is13Rolling = false
+		is13Hitting = false
+		return
+	}
+
+	if thirteenDealerTotal < thirteenPlayerTotal {
+		a.AddLogMsg(fmt.Sprintf("[13] dealer total %d < player %d; dealer hits", thirteenDealerTotal, thirteenPlayerTotal))
+		log.Printf("[13] dealer total %d < player %d; dealer hits", thirteenDealerTotal, thirteenPlayerTotal)
+		if thirteenHitInFlight {
+			a.AddLogMsg("[13] dealer hit deferred: hit already in flight")
+			log.Printf("[13] dealer hit deferred: hit already in flight")
+			go func() {
+				time.Sleep(150 * time.Millisecond)
+				a.evaluate13Hand()
+			}()
+			return
+		}
+		thirteenHitInFlight = true
+		is13Hitting = true
+		go a.hit13Dice()
+		return
+	}
+
+	a.finalize13Round(false, "dealer beat-or-tie")
 	is13Rolling = false
 	is13Hitting = false
 }

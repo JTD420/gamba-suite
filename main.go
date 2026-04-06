@@ -65,59 +65,70 @@ var (
 	pokerSequenceStage                   int
 	blackjackHitInFlight                 bool
 	blackjackNextHitIndex                int
-	pokerSequencePlayerName              string
-	pokerSequencePlayerResult            PokerHandResult
-	pokerSequencePlayerHand              string
-	payoutActive                         bool
-	payoutTradeActive                    bool
-	payoutTargetID                       int
-	payoutTargetName                     string
-	payoutAttempts                       int
-	payoutSessionID                      int
-	payoutTradeSent                      bool
-	payoutExpectedAddCount               int
-	payoutActualAddCount                 int
-	underfundedTradeMonitorID            int
-	underfundedTradeMonitorNotice        string
-	shortageMonitorID                    int
-	shortageMonitorActive                bool
-	shortageMonitorDeadline              time.Time
-	lastTradeOpenData                    string
-	lastTradeOpen                        string
-	tradeOpen                            bool
-	isPokerRolling                       bool
-	isTriRolling                         bool
-	isBJRolling                          bool
-	is13Rolling                          bool
-	is13Hitting                          bool
-	isHitting                            bool
-	isClosing                            bool
-	ChatIsDisabled                       bool
-	mutex                                sync.Mutex
-	resultsWaitGroup                     sync.WaitGroup
-	rollDelay                            = 550 * time.Millisecond
-	stripNextDelay                       = 2250 * time.Millisecond
-	stripGetNewPayload                   = "new"
-	stripGetNextPayload                  = "next"
-	tradeUserPattern                     = regexp.MustCompile(`\[(\d+)\]`)
-	stripItemNameRe                      = regexp.MustCompile(`(?:CF_\d+_[a-z][a-z_]*|[a-z][a-z0-9_]*_[a-z0-9_]+)(?:\*\d+)?`)
-	gameChoiceCleanupRe                  = regexp.MustCompile(`[^a-z0-9]+`)
-	roomEntities                         = map[int]room.Entity{}
-	roomMu                               sync.Mutex
-	lastRoomUsersRequestAt               time.Time
-	roomUsersReqMu                       sync.Mutex
-	users28ByToken                       = map[string]string{}
-	users28ByIndex                       = map[int]string{} // roomIndex -> name
-	users28ByShortToken                  = map[string]string{}
-	roomIdentityByShortToken             = map[string]RoomIdentityEntry{}
-	users28Mu                            sync.Mutex
-	headerSniffUntil                     time.Time
-	headerSniffSeen                      = map[uint16]bool{}
-	headerSniffMu                        sync.Mutex
-	currentTradeItems                    []TradeItem
-	currentOwnTradeItems                 []TradeItem
-	tradeItemsMu                         sync.Mutex
-	lastAddItemWasOurs                   bool
+	// 13-game state
+	awaiting13Decision            bool
+	awaiting13DecisionPartnerID   int
+	awaiting13DecisionPartnerName string
+	thirteenRoundActive           bool
+	thirteenPlayerTurn            bool
+	thirteenPlayerTotal           int
+	thirteenDealerTotal           int
+	thirteenPlayerName            string
+	thirteenHitInFlight           bool
+	thirteenNextHitIndex          int
+	pokerSequencePlayerName       string
+	pokerSequencePlayerResult     PokerHandResult
+	pokerSequencePlayerHand       string
+	payoutActive                  bool
+	payoutTradeActive             bool
+	payoutTargetID                int
+	payoutTargetName              string
+	payoutAttempts                int
+	payoutSessionID               int
+	payoutTradeSent               bool
+	payoutExpectedAddCount        int
+	payoutActualAddCount          int
+	underfundedTradeMonitorID     int
+	underfundedTradeMonitorNotice string
+	shortageMonitorID             int
+	shortageMonitorActive         bool
+	shortageMonitorDeadline       time.Time
+	lastTradeOpenData             string
+	lastTradeOpen                 string
+	tradeOpen                     bool
+	isPokerRolling                bool
+	isTriRolling                  bool
+	isBJRolling                   bool
+	is13Rolling                   bool
+	is13Hitting                   bool
+	isHitting                     bool
+	isClosing                     bool
+	ChatIsDisabled                bool
+	mutex                         sync.Mutex
+	resultsWaitGroup              sync.WaitGroup
+	rollDelay                     = 550 * time.Millisecond
+	stripNextDelay                = 2250 * time.Millisecond
+	stripGetNewPayload            = "new"
+	stripGetNextPayload           = "next"
+	tradeUserPattern              = regexp.MustCompile(`\[(\d+)\]`)
+	stripItemNameRe               = regexp.MustCompile(`(?:CF_\d+_[a-z][a-z_]*|[a-z][a-z0-9_]*_[a-z0-9_]+)(?:\*\d+)?`)
+	gameChoiceCleanupRe           = regexp.MustCompile(`[^a-z0-9]+`)
+	roomEntities                  = map[int]room.Entity{}
+	roomMu                        sync.Mutex
+	lastRoomUsersRequestAt        time.Time
+	roomUsersReqMu                sync.Mutex
+	users28ByToken                = map[string]string{}
+	users28ByIndex                = map[int]string{} // roomIndex -> name
+	users28ByShortToken           = map[string]string{}
+	roomIdentityByShortToken      = map[string]RoomIdentityEntry{}
+	users28Mu                     sync.Mutex
+	headerSniffUntil              time.Time
+	headerSniffSeen               = map[uint16]bool{}
+	headerSniffMu                 sync.Mutex
+	currentTradeItems             []TradeItem
+	currentOwnTradeItems          []TradeItem
+	tradeItemsMu                  sync.Mutex
+	lastAddItemWasOurs            bool
 	// lastAddItemByUsAt records when we observed an outgoing TRADE_ADDITEM
 	// packet. Use this timestamp in debugging to detect races between the
 	// outgoing add and the subsequent server TRADE_ITEMS update.
@@ -329,7 +340,7 @@ func (a *App) dealerOpenMessage() string {
 }
 
 func dealerGameActive() bool {
-	return awaitingGameChoice || awaitingBlackjackDecision || blackjackRoundActive || pokerSequenceStage > 0 || isPokerRolling || isTriRolling || isBJRolling || is13Rolling || isHitting || is13Hitting || isClosing
+	return awaitingGameChoice || awaitingBlackjackDecision || awaiting13Decision || blackjackRoundActive || thirteenRoundActive || pokerSequenceStage > 0 || isPokerRolling || isTriRolling || isBJRolling || is13Rolling || isHitting || is13Hitting || isClosing
 }
 
 func dealerReadyForNewTrade() bool {
@@ -1364,6 +1375,19 @@ func resetBlackjackSequence() {
 	blackjackPlayerName = ""
 	blackjackHitInFlight = false
 	blackjackNextHitIndex = 3
+}
+
+func reset13Sequence() {
+	awaiting13Decision = false
+	awaiting13DecisionPartnerID = 0
+	awaiting13DecisionPartnerName = ""
+	thirteenRoundActive = false
+	thirteenPlayerTurn = false
+	thirteenPlayerTotal = 0
+	thirteenDealerTotal = 0
+	thirteenPlayerName = ""
+	thirteenHitInFlight = false
+	thirteenNextHitIndex = 2
 }
 
 func stopPayout() {
@@ -4393,6 +4417,100 @@ func (a *App) beginBlackjackSequence() {
 	}(second)
 }
 
+func (a *App) begin13Sequence() {
+	playerName := strings.TrimSpace(lastTradePartnerName)
+	if playerName == "" {
+		playerName = "Player"
+	}
+
+	resetPokerSequence()
+	resetBlackjackSequence()
+	reset13Sequence()
+	thirteenRoundActive = true
+	thirteenPlayerTurn = true
+	thirteenPlayerName = playerName
+
+	first := "Lets Play!"
+	second := fmt.Sprintf("%s Roll", playerName)
+
+	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", first))
+	log.Printf("[GAME_SELECT] shouting: %q", first)
+	ext.Send(out.SHOUT, first)
+
+	go func(msg string) {
+		time.Sleep(700 * time.Millisecond)
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", msg))
+		log.Printf("[GAME_SELECT] shouting: %q", msg)
+		ext.Send(out.SHOUT, msg)
+
+		time.Sleep(700 * time.Millisecond)
+		is13Rolling = true
+		a.AddLogMsg("13 Roll:\n")
+		go a.roll13Dice()
+	}(second)
+}
+
+func (a *App) start13DealerTurn(reason string) {
+	awaiting13Decision = false
+	thirteenPlayerTurn = false
+	a.AddLogMsg(fmt.Sprintf("[13_DEBUG] dealer turn starting reason=%s playerTotal=%d dealerTotal=%d", reason, thirteenPlayerTotal, thirteenDealerTotal))
+	log.Printf("[13_DEBUG] dealer turn starting reason=%s playerTotal=%d dealerTotal=%d", reason, thirteenPlayerTotal, thirteenDealerTotal)
+	message := "Dealer Roll"
+	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", message))
+	log.Printf("[GAME_SELECT] shouting: %q", message)
+	ext.Send(out.SHOUT, message)
+	go func() {
+		time.Sleep(700 * time.Millisecond)
+		is13Rolling = true
+		a.roll13Dice()
+	}()
+}
+
+func (a *App) finalize13Round(playerWins bool, reason string) {
+	playerName := strings.TrimSpace(thirteenPlayerName)
+	if playerName == "" {
+		playerName = strings.TrimSpace(lastTradePartnerName)
+	}
+	if playerName == "" {
+		playerName = "Player"
+	}
+
+	playerHand := strconv.Itoa(thirteenPlayerTotal)
+	dealerHand := strconv.Itoa(thirteenDealerTotal)
+	winnerName := "Dealer"
+	if playerWins {
+		winnerName = playerName
+	}
+	winnerMsg := fmt.Sprintf("%s Wins - %s: %s | Dealer: %s", winnerName, playerName, playerHand, dealerHand)
+
+	a.AddLogMsg(fmt.Sprintf("[13_RULES] winner=%s reason=%s player=%d dealer=%d", winnerName, reason, thirteenPlayerTotal, thirteenDealerTotal))
+	log.Printf("[13_RULES] winner=%s reason=%s player=%d dealer=%d", winnerName, reason, thirteenPlayerTotal, thirteenDealerTotal)
+	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", winnerMsg))
+	log.Printf("[GAME_SELECT] shouting: %q", winnerMsg)
+	if !ChatIsDisabled {
+		waitForUnmute(90 * time.Second)
+		time.Sleep(800 * time.Millisecond)
+		sendMessageWithDelay(winnerMsg)
+	}
+
+	payoutTargetID := lastTradePartnerID
+	payoutTargetName := playerName
+	reset13Sequence()
+
+	if playerWins && payoutTargetID > 0 {
+		a.setCurrentGameHistoryResults(playerHand, dealerHand, playerName, "Payout Pending", false)
+		a.noteCurrentGameHistory(winnerMsg)
+		a.AddLogMsg(fmt.Sprintf("[PAYOUT] 13 player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID))
+		log.Printf("[PAYOUT] 13 player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID)
+		startPayout(a, payoutTargetID, payoutTargetName)
+		return
+	}
+
+	a.setCurrentGameHistoryResults(playerHand, dealerHand, "Dealer", "Completed", true)
+	a.noteCurrentGameHistory(winnerMsg)
+	go a.openDealerAfterRound()
+}
+
 // Reset all saved dice states
 func resetDiceState() {
 	mutex.Lock()
@@ -4929,6 +5047,8 @@ func (a *App) roll13Dice() {
 			return
 		}
 		currentSum = 0
+		// start the rotating hit index at slot 2 (next available after initial two)
+		thirteenNextHitIndex = 2
 		for _, index := range []int{0, 1} {
 			diceList[index].Value = rand.Intn(6) + 1
 			diceList[index].IsClosed = false
@@ -4942,8 +5062,8 @@ func (a *App) roll13Dice() {
 		return
 	}
 
-	go a.closeAllDice()
-	time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
+	// Do not close other dice before starting a 13 roll —
+	// closing can interfere with subsequent hit rolls. Keep slots available.
 	mutex.Lock()
 
 	if len(diceList) < 5 {
@@ -4955,6 +5075,8 @@ func (a *App) roll13Dice() {
 
 	currentSum = 0 // Reset sum before starting
 	resultsWaitGroup.Add(2)
+	// start the rotating hit index at slot 2 (next available after initial two)
+	thirteenNextHitIndex = 2
 	mutex.Unlock()
 
 	// Roll the first three dice in order
@@ -4972,11 +5094,27 @@ func (a *App) roll13Dice() {
 	}
 	mutex.Unlock()
 
+	// If this is the player's initial roll and the two-dice total is <= 6,
+	// immediately trigger a hit (roll the next dice) so the result is seen
+	// without waiting for the external decision prompt.
+	if thirteenPlayerTurn && currentSum <= 6 {
+		a.AddLogMsg(fmt.Sprintf("[13_DEBUG] initial two dice total=%d -> immediate hit", currentSum))
+		log.Printf("[13_DEBUG] initial two dice total=%d -> immediate hit", currentSum)
+		// Prevent duplicate hits from evaluate13Hand by marking a hit in flight
+		thirteenHitInFlight = true
+		is13Hitting = true
+		go a.hit13Dice()
+		// hit13Dice will call evaluate13Hand when complete
+		is13Rolling = false
+		return
+	}
+
 	a.evaluate13Hand()
 	is13Rolling = false
 }
 
 func (a *App) hit13Dice() {
+	defer func() { thirteenHitInFlight = false }()
 	if fakeDiceTestingMode {
 		mutex.Lock()
 		if len(diceList) < 5 {
@@ -4987,26 +5125,19 @@ func (a *App) hit13Dice() {
 			return
 		}
 
-		rolled := false
-		for i := 2; i < 5; i++ {
-			if diceList[i].Value == 0 {
-				diceList[i].Value = rand.Intn(6) + 1
-				diceList[i].IsClosed = false
-				currentSum += diceList[i].Value
-				rolled = true
-				logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceList[i].ID, diceList[i].Value)
-				a.AddLogMsg(logRollResult)
-				break
-			}
+		slot := thirteenNextHitIndex
+		if slot < 0 || slot >= len(diceList) {
+			slot = 0
 		}
+		thirteenNextHitIndex = (slot + 1) % len(diceList)
 
-		if !rolled {
-			diceList[4].Value = rand.Intn(6) + 1
-			diceList[4].IsClosed = false
-			currentSum += diceList[4].Value
-			logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceList[4].ID, diceList[4].Value)
-			a.AddLogMsg(logRollResult)
-		}
+		diceList[slot].Value = rand.Intn(6) + 1
+		diceList[slot].IsClosed = false
+		currentSum += diceList[slot].Value
+		logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceList[slot].ID, diceList[slot].Value)
+		a.AddLogMsg(logRollResult)
+		a.AddLogMsg(fmt.Sprintf("[13_DEBUG] hit actor=%s slot=%d diceID=%d value=%d newTotal=%d nextSlot=%d", map[bool]string{true: "player", false: "dealer"}[thirteenPlayerTurn], slot, diceList[slot].ID, diceList[slot].Value, currentSum, thirteenNextHitIndex))
+		log.Printf("[13_DEBUG] hit actor=%s slot=%d diceID=%d value=%d newTotal=%d nextSlot=%d", map[bool]string{true: "player", false: "dealer"}[thirteenPlayerTurn], slot, diceList[slot].ID, diceList[slot].Value, currentSum, thirteenNextHitIndex)
 		mutex.Unlock()
 
 		a.evaluate13Hand()
@@ -5014,7 +5145,6 @@ func (a *App) hit13Dice() {
 		is13Rolling = false
 		return
 	}
-
 	mutex.Lock()
 
 	if len(diceList) < 5 {
@@ -5025,45 +5155,32 @@ func (a *App) hit13Dice() {
 		return
 	}
 
+	slot := thirteenNextHitIndex
+	if slot < 0 || slot >= len(diceList) {
+		slot = 0
+	}
+	nextSlot := (slot + 1) % len(diceList)
+	thirteenNextHitIndex = nextSlot
+	diceID := diceList[slot].ID
+	a.AddLogMsg(fmt.Sprintf("[13_DEBUG] hit queued actor=%s slot=%d diceID=%d nextSlot=%d", map[bool]string{true: "player", false: "dealer"}[thirteenPlayerTurn], slot, diceID, nextSlot))
+	log.Printf("[13_DEBUG] hit queued actor=%s slot=%d diceID=%d nextSlot=%d", map[bool]string{true: "player", false: "dealer"}[thirteenPlayerTurn], slot, diceID, nextSlot)
+
 	resultsWaitGroup.Add(1)
 	mutex.Unlock()
 
-	for i := 2; i < 5; i++ { // Start from index 2 to roll the next available dice
-		if diceList[i].Value == 0 {
-			diceList[i].Roll()
-			time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
-			resultsWaitGroup.Wait()
-
-			mutex.Lock()
-			currentSum += diceList[i].Value // Add value to current sum
-			mutex.Unlock()
-
-			// Re-evaluate the hand after hitting
-			a.evaluate13Hand()
-
-			is13Rolling = false
-			is13Hitting = false
-			return
-		}
-	}
-
-	// If all dice have been rolled, re-roll the last one
-	oldValue := diceList[4].Value
-	// sleep random between 1000 and 1500ms
-	time.Sleep(time.Duration(rand.Intn(1000)+500) * time.Millisecond)
-	diceList[4].Roll()
+	diceList[slot].Roll()
 
 	time.Sleep(rollDelay + time.Duration(rand.Intn(100))*time.Millisecond)
-	resultsWaitGroup.Wait()
-	newValue := diceList[4].Value
+	a.waitForBlackjackDiceResults([]int{slot}, 5*time.Second, "hit-roll")
+	newValue := diceList[slot].Value
 
 	mutex.Lock()
 	currentSum = currentSum + newValue // Adjust current sum
+	newTotal := currentSum
 	mutex.Unlock()
 
-	// Log the value of the dice rolled
-	log.Printf("Hit: Re-rolled dice %d = %d (old value was %d)\n", diceList[4].ID, newValue, oldValue)
-
+	a.AddLogMsg(fmt.Sprintf("[13_DEBUG] hit resolved actor=%s slot=%d diceID=%d value=%d newTotal=%d", map[bool]string{true: "player", false: "dealer"}[thirteenPlayerTurn], slot, diceID, newValue, newTotal))
+	log.Printf("[13_DEBUG] hit resolved actor=%s slot=%d diceID=%d value=%d newTotal=%d", map[bool]string{true: "player", false: "dealer"}[thirteenPlayerTurn], slot, diceID, newValue, newTotal)
 	// Re-evaluate the hand with the updated sum
 	a.evaluate13Hand()
 
@@ -5093,10 +5210,12 @@ func (a *App) ShowCommands() {
 			"Closes any of your open dice. \n" +
 			"------------------------------------\n" +
 			":21 \n" +
-			"Auto rolls and if chat is enabled \nsays the sum in chat when > 15. \n" +
+			"Plays like Blackjack: auto-hit below 17, prompt between 17-20,\n" +
+			"auto-stay at 21; announces result in chat. \n" +
 			"------------------------------------\n" +
 			":13 \n" +
-			"Auto rolls and if chat is enabled \nsays the sum in chat when > 8. \n" +
+			"Plays like Blackjack-to-13: auto-hit below 7, prompt between 7-12,\n" +
+			"auto-stay at 13; announces result in chat. \n" +
 			"------------------------------------\n" +
 			":tri \n" +
 			"Auto rolls 3 dice in Tri Formation \nif chat is enabled says the \nresults in chat. \n" +
@@ -5292,6 +5411,53 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 		return
 	}
 
+	if awaiting13Decision {
+		decision, ok := normalizeBlackjackDecision(msg)
+		if !ok {
+			a.AddLogMsg(fmt.Sprintf("[13_DEBUG] awaiting decision from %q(index=%d), ignored non-decision message=%q", awaiting13DecisionPartnerName, awaiting13DecisionPartnerID, msg))
+			log.Printf("[13_DEBUG] awaiting decision from %q(index=%d), ignored non-decision message=%q", awaiting13DecisionPartnerName, awaiting13DecisionPartnerID, msg)
+			return
+		}
+
+		indexMatch := awaiting13DecisionPartnerID > 0 && index == awaiting13DecisionPartnerID
+		nameMatch := awaiting13DecisionPartnerName != "" && strings.EqualFold(senderName, awaiting13DecisionPartnerName)
+		if !indexMatch && !nameMatch && awaiting13DecisionPartnerName != "" {
+			if expectedIdx, ok := lookupRoomEntityIndexByName(awaiting13DecisionPartnerName); ok && expectedIdx > 0 && expectedIdx == index {
+				indexMatch = true
+			}
+		}
+		if !indexMatch && !nameMatch && awaiting13DecisionPartnerName != "" {
+			if expectedIdx, ok := lookupUsers28RoomIndexByName(awaiting13DecisionPartnerName); ok && expectedIdx > 0 && expectedIdx == index {
+				indexMatch = true
+			}
+		}
+
+		if !indexMatch && !nameMatch {
+			a.AddLogMsg(fmt.Sprintf("[13] ignoring decision %q from %q (index %d); waiting for %q (index %d)", decision, senderName, index, awaiting13DecisionPartnerName, awaiting13DecisionPartnerID))
+			log.Printf("[13] ignoring decision %q from %q (index %d); waiting for %q (index %d)", decision, senderName, index, awaiting13DecisionPartnerName, awaiting13DecisionPartnerID)
+			return
+		}
+
+		e.Block()
+		awaiting13Decision = false
+		a.AddLogMsg(fmt.Sprintf("[13_DEBUG] accepted decision=%q from sender=%q index=%d (expectedName=%q expectedIndex=%d)", decision, senderName, index, awaiting13DecisionPartnerName, awaiting13DecisionPartnerID))
+		log.Printf("[13_DEBUG] accepted decision=%q from sender=%q index=%d (expectedName=%q expectedIndex=%d)", decision, senderName, index, awaiting13DecisionPartnerName, awaiting13DecisionPartnerID)
+
+		if decision == "hit" {
+			a.AddLogMsg("[13] player chose hit")
+			log.Printf("[13] player chose hit")
+			is13Hitting = true
+			is13Rolling = true
+			thirteenHitInFlight = true
+			go a.hit13Dice()
+		} else {
+			a.AddLogMsg("[13] player chose stay")
+			log.Printf("[13] player chose stay")
+			a.start13DealerTurn("player stayed")
+		}
+		return
+	}
+
 	if !awaitingGameChoice {
 		return
 	}
@@ -5394,13 +5560,10 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 		log.Printf("[GAME_SELECT] %d selected 21; starting player/dealer 21 sequence", index)
 		a.beginBlackjackSequence()
 	case "13":
-		resetBlackjackSequence()
-		resetPokerSequence()
-		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected 13; starting internal roll", index))
-		log.Printf("[GAME_SELECT] %d selected 13; starting internal roll", index)
-		is13Rolling = true
-		a.AddLogMsg("13 Roll:\n")
-		go a.roll13Dice()
+		// Start the 13-game sequence (similar flow to 21)
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected 13; starting 13 sequence", index))
+		log.Printf("[GAME_SELECT] %d selected 13; starting 13 sequence", index)
+		a.begin13Sequence()
 	}
 }
 

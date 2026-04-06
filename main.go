@@ -3504,15 +3504,26 @@ func (a *App) notifyTradeQuantityCoverage() {
 		log.Printf("[TRADE_COVERAGE] shortages detected but skipping enforcement during payout trade")
 		return
 	}
-	// Build a concise message listing raw class*count for each short item
+	// Build a concise, human-friendly message listing each short item
 	// (explicitly showing 0 when the dealer has none) and shout it.
 	parts := make([]string, 0, len(shortages))
 	for _, s := range shortages {
-		// Show the total available (hand + partner offered) so the partner
-		// understands the true shortfall.
-		parts = append(parts, fmt.Sprintf("%s*%d", s.Name, s.Have))
+		// Show only how many the dealer has in-hand so the partner
+		// knows how many they can add. Preserve variant suffixes
+		// and format the internal name for readability.
+		displayName := s.Name
+		variant := ""
+		if star := strings.LastIndex(s.Name, "*"); star > 0 {
+			variant = s.Name[star+1:]
+			displayName = s.Name[:star]
+		}
+		display := formatTradeItemName(displayName)
+		if variant != "" {
+			display = fmt.Sprintf("%s*%s", display, variant)
+		}
+		parts = append(parts, fmt.Sprintf("%s x %d", display, s.HaveHand))
 	}
-	msg := fmt.Sprintf("I only have \"%s\"", strings.Join(parts, ","))
+	msg := fmt.Sprintf("I only have %s", strings.Join(parts, ", "))
 	lastTradeCoverageNotice = msg
 	lastTradeBlockNotice = msg
 

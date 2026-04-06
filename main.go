@@ -5578,12 +5578,13 @@ func (a *App) ShowCommands() {
 			"Closes any of your open dice. \n" +
 			"------------------------------------\n" +
 			":21 \n" +
-			"Plays like Blackjack: auto-hit below 18, prompt between 18-20,\n" +
-			"auto-stay at 21; announces result in chat. \n" +
+			"Rolls 3 dice first, then asks the player hit or stay.\n" +
+			"Dealer plays automatically. \n" +
 			"------------------------------------\n" +
 			":13 \n" +
-			"Plays like Blackjack-to-13: auto-hit below 8, prompt between 8-12,\n" +
-			"auto-stay at 13; announces result in chat. \n" +
+			"Rolls 2 dice first, then asks the player hit or stay.\n" +
+			"Dealer plays automatically. \n" +
+			"------------------------------------\n" +
 			"------------------------------------\n" +
 			":tri \n" +
 			"Auto rolls 3 dice in Tri Formation \nif chat is enabled says the \nresults in chat. \n" +

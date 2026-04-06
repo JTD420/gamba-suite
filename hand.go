@@ -145,30 +145,16 @@ func (a *App) evaluateBlackjackHand() {
 		if blackjackPlayerTotal == 21 {
 			a.AddLogMsg("[BJ] player total 21; auto-stay and moving to dealer roll")
 			log.Printf("[BJ] player total 21; auto-stay and moving to dealer roll")
-			if !ChatIsDisabled && !isMuted {
-				sendMessageWithDelay(fmt.Sprintf("%s total %d", playerLabel, blackjackPlayerTotal))
-			}
 			a.startBlackjackDealerTurn("player reached 21 auto-stay")
 			isBJRolling = false
 			isHitting = false
 			return
 		}
 
-		if blackjackPlayerTotal < 18 {
-			a.AddLogMsg(fmt.Sprintf("[BJ] player total %d < 18; auto-hit", blackjackPlayerTotal))
-			log.Printf("[BJ] player total %d < 18; auto-hit", blackjackPlayerTotal)
-			if blackjackHitInFlight {
-				a.AddLogMsg("[BJ] auto-hit deferred: hit already in flight")
-				log.Printf("[BJ] auto-hit deferred: hit already in flight")
-				go func() {
-					time.Sleep(150 * time.Millisecond)
-					a.evaluateBlackjackHand()
-				}()
-				return
-			}
-			blackjackHitInFlight = true
-			isHitting = true
-			go a.hitBjDice()
+		// only prompt once - do not spam chat
+		if awaitingBlackjackDecision {
+			isBJRolling = false
+			isHitting = false
 			return
 		}
 
@@ -358,30 +344,16 @@ func (a *App) evaluate13Hand() {
 		if thirteenPlayerTotal == 13 {
 			a.AddLogMsg("[13] player total 13; auto-stay and moving to dealer roll")
 			log.Printf("[13] player total 13; auto-stay and moving to dealer roll")
-			if !ChatIsDisabled && !isMuted {
-				sendMessageWithDelay(fmt.Sprintf("%s total %d", playerLabel, thirteenPlayerTotal))
-			}
 			a.start13DealerTurn("player reached 13 auto-stay")
 			is13Rolling = false
 			is13Hitting = false
 			return
 		}
 
-		if thirteenPlayerTotal < 8 {
-			a.AddLogMsg(fmt.Sprintf("[13] player total %d < 8; auto-hit", thirteenPlayerTotal))
-			log.Printf("[13] player total %d < 8; auto-hit", thirteenPlayerTotal)
-			if thirteenHitInFlight {
-				a.AddLogMsg("[13] auto-hit deferred: hit already in flight")
-				log.Printf("[13] auto-hit deferred: hit already in flight")
-				go func() {
-					time.Sleep(150 * time.Millisecond)
-					a.evaluate13Hand()
-				}()
-				return
-			}
-			thirteenHitInFlight = true
-			is13Hitting = true
-			go a.hit13Dice()
+		// only prompt once - do not spam chat
+		if awaiting13Decision {
+			is13Rolling = false
+			is13Hitting = false
 			return
 		}
 

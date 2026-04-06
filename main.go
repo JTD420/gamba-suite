@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"bytes"
@@ -2803,9 +2803,9 @@ func handleStripPacket(a *App, e *g.Intercept) {
 	if !pageRepeated {
 		for className, qty := range classQtys {
 			stripScanCounts[className] += qty
-			for className, ids := range classItemIDs {
-				stripScanItemIDs[className] = append(stripScanItemIDs[className], ids...)
-			}
+		}
+		for name, ids := range classItemIDs {
+			stripScanItemIDs[name] = append(stripScanItemIDs[name], ids...)
 		}
 	}
 

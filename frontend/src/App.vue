@@ -157,14 +157,30 @@
 
       <div class="history-actions">
         <button type="button" class="copy-btn history-danger-btn" @click="showClearHistoryConfirm = true">Clear History</button>
+        <button type="button" class="copy-btn" @click="seedFakeHistory">Seed Fake Data (1000)</button>
       </div>
 
-      <input
-        v-model="historySearch"
-        type="text"
-        class="history-search"
-        placeholder="Search by player name"
-      />
+      <div class="history-search-wrapper">
+        <input
+          v-model="historySearch"
+          type="text"
+          class="history-search"
+          placeholder="Search by player name"
+          @input="onHistorySearchInput"
+          @focus="showNameSuggestions = true"
+          @blur="hideNameSuggestionsWithDelay"
+          autocomplete="off"
+        />
+        <ul v-if="showNameSuggestions && playerNameSuggestions.length" class="history-suggestions" @mousedown.prevent>
+          <li v-for="(name, idx) in playerNameSuggestions" :key="`suggest-${idx}`" @mousedown.prevent="selectHistorySuggestion(name)">{{ name }}</li>
+        </ul>
+      </div>
+
+      <div class="history-filter-row">
+        <label class="history-filter-flagged">
+          <input type="checkbox" v-model="showFlaggedOnly" /> Show flagged only
+        </label>
+      </div>
 
       <div v-if="filteredGameHistory.length === 0" class="trade-empty">
         No game history matched your search.
@@ -398,6 +414,8 @@ export default {
       chatLog: [],
       lastTradePartnerName: 'None',
       tradeNamePollTimer: null,
+      showNameSuggestions: false,
+      showFlaggedOnly: false,
     };
   },
   computed: {
@@ -465,11 +483,33 @@ export default {
       return '';
     },
     filteredGameHistory() {
-      const query = this.historySearch.trim().toLowerCase();
-      if (!query) {
-        return this.gameHistory;
+      const q = this.historySearch.trim().toLowerCase();
+      let list = this.gameHistory || [];
+      if (this.showFlaggedOnly) {
+        list = list.filter((entry) => entry && entry.issue);
       }
-      return this.gameHistory.filter((entry) => String(entry.playerName || '').toLowerCase().includes(query));
+      if (!q) {
+        return list;
+      }
+      return list.filter((entry) => String(entry.playerName || '').toLowerCase().includes(q));
+    },
+    playerNameSuggestions() {
+      const q = String(this.historySearch || '').trim().toLowerCase();
+      const namesSet = new Set();
+      let base = (this.gameHistory || []);
+      if (this.showFlaggedOnly) {
+        base = base.filter((entry) => entry && entry.issue);
+      }
+      base.forEach((entry) => {
+        if (entry && entry.playerName) {
+          namesSet.add(String(entry.playerName));
+        }
+      });
+      const names = Array.from(namesSet).sort((a, b) => a.localeCompare(b));
+      if (!q) {
+        return names.slice(0, 10);
+      }
+      return names.filter(n => n.toLowerCase().includes(q)).slice(0, 10);
     },
   },
   methods: {
@@ -488,6 +528,70 @@ export default {
     closeClearHistoryConfirm() {
       this.showClearHistoryConfirm = false;
     },
+    onHistorySearchInput() {
+      this.showNameSuggestions = true;
+    },
+    seedFakeHistory() {
+      const names = [
+        'Alex','Sam','Taylor','Jordan','Casey','Riley','Jamie','Morgan','Cameron','Avery',
+        'Hayden','Parker','Quinn','Rowan','Dakota','Skyler','Reese','Marley','Sasha','Eli',
+        'Jesse','Kris','Logan','Charlie','Blake','Devin','Drew','Finley','Emerson','Harper',
+        'Kai','Luca','Nico','Noel','Owen','Paige','Remy','Rory','Soren','Toby',
+        'Violet','Will','Zara','Yuri','Ira','Mina','Gabe','Ivy','Brad','Nate'
+      ];
+      const games = ['21','13','poker','tri','roll'];
+      const now = Date.now();
+      const rows = [];
+      for (let i = 0; i < 1000; i++) {
+        const playerName = names[Math.floor(Math.random() * names.length)];
+        const game = games[Math.floor(Math.random() * games.length)];
+        const startedAt = new Date(now - Math.floor(Math.random() * 1000 * 60 * 60 * 24 * 365)).toISOString();
+        const completedAt = new Date(Date.parse(startedAt) + Math.floor(Math.random() * 1000 * 60 * 60 * 24)).toISOString();
+        const playerScore = Math.floor(Math.random() * 21) + 1;
+        const dealerScore = Math.floor(Math.random() * 21) + 1;
+        const winner = playerScore >= dealerScore ? playerName : 'Dealer';
+        const betItems = [];
+        const betCount = Math.floor(Math.random() * 3);
+        for (let j = 0; j < betCount; j++) {
+          betItems.push({ Name: 'coin', Quantity: Math.floor(Math.random() * 10) + 1 });
+        }
+        const entry = {
+          id: `fake-${i}-${now}`,
+          playerName,
+          game,
+          startedAt,
+          completedAt,
+          winner,
+          status: 'Completed',
+          betItems,
+          payoutItems: [],
+          notes: [],
+          issue: Math.random() < 0.02,
+          issueReason: Math.random() < 0.02 ? 'Flagged test' : undefined,
+          playerResult: String(playerScore),
+          dealerResult: String(dealerScore),
+        };
+        rows.push(entry);
+      }
+      // Ensure some flagged entries exist for testing
+      const flaggedCount = 25;
+      for (let k = 0; k < flaggedCount; k++) {
+        const idx = Math.floor(Math.random() * rows.length);
+        rows[idx].issue = true;
+        rows[idx].issueReason = rows[idx].issueReason || 'Flagged test';
+      }
+      this.gameHistory = rows;
+      this.addLogMsg(`[UI] Seeded ${rows.length} fake history rows`);
+    },
+      selectHistorySuggestion(name) {
+        this.historySearch = name;
+        this.showNameSuggestions = false;
+      },
+      hideNameSuggestionsWithDelay() {
+        setTimeout(() => {
+          this.showNameSuggestions = false;
+        }, 180);
+      },
     async confirmClearHistory() {
       try {
         await window.go.main.App.ClearGameHistory();
@@ -897,6 +1001,50 @@ input[type="text"]::placeholder {
   box-sizing: border-box;
 }
 
+.history-search-wrapper {
+  position: relative;
+}
+.history-suggestions {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 6px);
+  background: #151515;
+  border: 1px solid #333;
+  border-radius: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+  z-index: 200;
+  list-style: none;
+  margin: 0;
+  padding: 6px 0;
+}
+.history-suggestions li {
+  padding: 8px 12px;
+  cursor: pointer;
+  color: #e0e0e0;
+}
+.history-suggestions li:hover {
+  background: #222;
+}
+.history-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.history-filter-flagged {
+  color: #e0e0e0;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.history-filter-flagged input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+}
+
 .history-actions {
   display: flex;
   justify-content: flex-end;
@@ -1024,6 +1172,13 @@ input[type="text"]::placeholder {
   border-radius: 4px;
   height: 200px;
   overflow-y: auto;
+  overflow-x: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-wrap: break-word;
+  word-break: break-word;
+  box-sizing: border-box;
+  max-width: 100%;
   font-family: monospace;
   margin-top: 10px;
   color: #00ff00; /* Green text color for the hacker console style */

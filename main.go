@@ -3384,7 +3384,9 @@ func (a *App) notifyTradeQuantityCoverage() {
 	// (explicitly showing 0 when the dealer has none) and shout it.
 	parts := make([]string, 0, len(shortages))
 	for _, s := range shortages {
-		parts = append(parts, fmt.Sprintf("%s*%d", s.Name, s.HaveHand))
+		// Show the total available (hand + partner offered) so the partner
+		// understands the true shortfall.
+		parts = append(parts, fmt.Sprintf("%s*%d", s.Name, s.Have))
 	}
 	msg := fmt.Sprintf("I only have \"%s\"", strings.Join(parts, ","))
 	lastTradeCoverageNotice = msg
@@ -3471,11 +3473,12 @@ func (a *App) getTradeCoverageShortages() []tradeShortage {
 	for name, req := range requiredCanon {
 		haveHand := handMap[name]
 		incoming := incomingMap[name]
-		if haveHand < req {
+		available := haveHand + incoming
+		if available < req {
 			shortages = append(shortages, tradeShortage{
 				Name:        name,
 				Required:    req,
-				Have:        haveHand,
+				Have:        available,
 				PayoutTotal: req,
 				HaveHand:    haveHand,
 				Incoming:    incoming,

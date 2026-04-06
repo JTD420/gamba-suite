@@ -640,3 +640,64 @@ Incoming CHAT message from index, senderName resolved
 │
 └─ if partner name unknown → accept first chat from any resolved sender
 ```
+
+## Recent Implementation Notes (April 06, 2026)
+
+This section documents behavioral and implementation changes added to the codebase to help debugging and maintenance. If something breaks, consult these notes first — they describe the current runtime invariants and where to look in the code.
+
+- **Strict trade-hand snapshot lifecycle**
+    - A new global policy flag `strictTradeSnapshotLifecycle` (default: true) controls when the dealer's frozen trade-hand snapshot may be updated.
+    - When strict lifecycle is enabled the snapshot is considered a stable baseline for one dealer-open period and is refreshed only at controlled points:
+        - Initial startup: the startup flow runs a `GETSTRIP` and captures a baseline snapshot before the first `Dealer Open` announcement.
+        - Before dealer-open when re-opening after a round: both `resyncHandThenOpenDealer()` and `openDealerAfterRound()` perform a hand rescan and capture a fresh frozen snapshot on success.
+        - After a completed normal bet trade (`TRADE_COMPLETED` for non-payout trades) the handler triggers a hand rescan and captures a new snapshot for the next round.
+    - While strict lifecycle is active, mid-trade strip scans (the normal `finalizeStripScan()` path) will NOT overwrite the frozen snapshot. This avoids transient mid-trade inventory changes from invalidating coverage checks.
+    - `ClearTradeItems()` no longer clears the frozen snapshot when strict lifecycle is enabled — the snapshot persists for the dealer-open period.
+
+- **`requestPlayerStrip()` behavior**
+    - `requestPlayerStrip()` will skip starting a new scan if a trade is open and the frozen snapshot is already ready (`tradeOpen && tradeHandSnapshotReady`), returning the current scan session id instead. This prevents accidental overwrites during an active round.
+
+- **Snapshot capture points (summary)**
+    - Startup initial `GETSTRIP` -> capture snapshot.
+    - `resyncHandThenOpenDealer()` / `openDealerAfterRound()` -> capture snapshot if strip scan completes successfully (prepares the next dealer-open baseline).
+    - `TRADE_COMPLETED` for normal bet trades -> rescan and `captureTradeHandSnapshot()` to refresh for next round.
+    - If `strictTradeSnapshotLifecycle` is disabled, the code falls back to the previous behavior where every finalized strip scan may update the frozen snapshot.
+
+- **Trade coverage and shortage logic**
+    - `getTradeCoverageShortages()` now:
+        - Canonicalizes class keys with `normalizeClassKeyWithVariant()` so class variant suffixes like `*4` are treated as part of the class key (e.g. `chair_plasty*4`).
+        - Computes required payout quantities as `bet * 2` via `payoutRequirementsFromBetItems()`.
+        - Computes availability as `dealer_hand + partner_offered` (i.e., availability includes items the partner has already placed in the trade). Shortages are only reported when `available < required`.
+        - Records both `Have` (combined available), `HaveHand` (dealer hand only), and `Incoming` (partner offered) on each shortage entry.
+        - Emits a debug log `[TRADE_COVERAGE_DEBUG]` containing canonical `hand=... incoming=... required=...` maps when shortages exist.
+
+- **Notification and enforcement on shortages**
+    - `notifyTradeQuantityCoverage()` builds a concise human-readable shout listing `class*<available>` for each short item, sets `lastTradeCoverageNotice` and `lastTradeBlockNotice`, and (for non-payout trades) shouts the message then force-closes the trade after a short delay to free the booth.
+    - During an active payout flow (`payoutTradeActive`) shortage enforcement is skipped — the payout logic manages shortages and retries differently.
+    - A short-lived `shortageMonitor` still exists: if shortages remain unresolved past its deadline it will force-close the trade as a fallback.
+
+- **Auto-accept / Auto-confirm safety**
+    - Both `scheduleAutoTradeAccept()` and `scheduleAutoTradeConfirm()` now wait briefly for a valid hand snapshot before auto-sending accept/confirm. If the snapshot is unavailable (functions return `nil`) or if `getTradeCoverageShortages()` reports shortages, the auto-flow cancels.
+    - `getTradeCoverageShortages()` returning `nil` is treated by callers as "snapshot not ready" and prevents immediate auto-accept/confirm.
+
+- **Trade item parsing improvements**
+    - `extractTradeItemAndQuantity()` includes a robust fallback using `stripItemNameRe` to find a class-like substring anywhere in the raw field payload when the usual `{...}` or `|` patterns are not present. Fallback matches are logged with `[TRADE_ITEMS_PARSE_FALLBACK]` to help diagnose malformed server payloads.
+    - `normalizeClassKeyWithVariant()` preserves `*<N>` suffixes as part of the canonical class key so coloured/variant classes are handled consistently.
+
+- **Payout flow adjustments**
+    - Payout required counts are computed up-front from the bet items (bet × 2 per type). The code sets `payoutExpectedAddCount` = total required so outgoing intercepts can track progress.
+    - `autoAddPayoutItems()` selects physical IDs from `snapshotHandItemIDs()` and attempts up to 3 hand-scan retries if the dealer appears short.
+    - Adds are first queued/sent as negative item IDs (common Shockwave convention). If the server does not reflect them in `currentOwnTradeItems`, `verifyAndRetryPayoutAdds()` retries with positive IDs as a fallback.
+    - `verifyAndRetryPayoutAdds()` uses `ownTradeOfferTotal()` and `ownTradeHasRequiredPayoutOffer()` to determine whether to accept automatically. As a last-resort fallback, if the code queued a full planned set and `payoutActualAddCount >= requiredTotal`, the code may auto-accept even when attribution is unreliable.
+    - Debug logging under `[PAYOUT_DEBUG]` shows planned IDs, attempts, and counts for troubleshooting.
+
+- **Practical troubleshooting checklist**
+    1. If shortages are reported incorrectly, inspect `[TRADE_COVERAGE_DEBUG]` to see canonical hand/incoming/required maps and verify whether `normalizeClassKeyWithVariant()` produced the expected keys.
+    2. If auto-accept/confirm isn't happening: check whether `getTradeCoverageShortages()` returns `nil` (snapshot missing) or a non-empty slice (shortage). Confirm `tradeHandSnapshotReady` is true.
+    3. If payout items never appear in your own offer after `autoAddPayoutItems()`, check `[PAYOUT_DEBUG]` logs to see whether negative-adds were sent and whether the positive-id fallback ran; verify `payoutActualAddCount` progression.
+    4. If snapshots appear stale, check `strictTradeSnapshotLifecycle` (default true). Temporarily set it to `false` to allow finalised strip scans to update snapshots during debugging.
+    5. To force a fresh snapshot during debugging: call `requestPlayerStrip()` and wait for `STRIPINFO_2` pages to finish (or watch for `[STRIP] scan complete ...` logs). In strict mode a finalized scan will only replace the frozen snapshot when none exists or when strict lifecycle is disabled.
+
+---
+
+If you want, I can also add small pointers inside `main.go` (near `captureTradeHandSnapshot`, `getTradeCoverageShortages`, and `autoAddPayoutItems`) to point maintainers at the exact lines where these policies are enforced.

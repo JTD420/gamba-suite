@@ -79,8 +79,12 @@ var (
 	payoutActualAddCount                 int
 	underfundedTradeMonitorID            int
 	underfundedTradeMonitorNotice        string
+	shortageMonitorID                    int
+	shortageMonitorActive                bool
+	shortageMonitorDeadline              time.Time
 	lastTradeOpenData                    string
 	lastTradeOpen                        string
+	tradeOpen                            bool
 	isPokerRolling                       bool
 	isTriRolling                         bool
 	isBJRolling                          bool
@@ -114,31 +118,41 @@ var (
 	currentOwnTradeItems                 []TradeItem
 	tradeItemsMu                         sync.Mutex
 	lastAddItemWasOurs                   bool
-	addItemMu                            sync.Mutex
-	currentHandItems                     []TradeItem
-	currentHandItemIDs                   map[string][]int
-	handItemsMu                          sync.Mutex
-	gameBetItems                         []TradeItem
-	stripScanMu                          sync.Mutex
-	stripScanActive                      bool
-	stripScanSessionID                   = 0
-	stripScanPageCount                   = 0
-	stripScanSeenItemIDs                 = map[int]struct{}{}
-	stripScanCounts                      = map[string]int{}
-	stripScanItemIDs                     = map[string][]int{}
-	knownDiceIDs                         = map[int]struct{}{}
-	fakeDiceTestingMode                  bool
-	dealerOpenHeartbeatID                int
-	dealerOpenHeartbeatActive            bool
-	dealerResyncInProgress               bool
-	lastOutgoingTradeOpenID              int
-	lastOutgoingTradeOpenAt              time.Time
-	tradeOpenStateMu                     sync.Mutex
-	tradeWindowTimeoutMonitorID          int
-	tradeWindowOpenedAt                  time.Time
-	tradeWindowDeadline                  time.Time
-	tradeWindowTimeoutActive             bool
-	blockAllTrades                       = true
+	// lastAddItemByUsAt records when we observed an outgoing TRADE_ADDITEM
+	// packet. Use this timestamp in debugging to detect races between the
+	// outgoing add and the subsequent server TRADE_ITEMS update.
+	lastAddItemByUsAt      time.Time
+	addItemMu              sync.Mutex
+	currentHandItems       []TradeItem
+	currentHandItemIDs     map[string][]int
+	tradeHandSnapshot      []TradeItem
+	tradeHandSnapshotReady bool
+	handItemsMu            sync.Mutex
+	// lastAllTradeItems stores the last full TRADE_ITEMS (all items) packet
+	// so we can compute deltas between successive full-state packets. This
+	// helps reliably attribute the first added item to the correct side.
+	lastAllTradeItems           []TradeItem
+	gameBetItems                []TradeItem
+	stripScanMu                 sync.Mutex
+	stripScanActive             bool
+	stripScanSessionID          = 0
+	stripScanPageCount          = 0
+	stripScanSeenItemIDs        = map[int]struct{}{}
+	stripScanCounts             = map[string]int{}
+	stripScanItemIDs            = map[string][]int{}
+	knownDiceIDs                = map[int]struct{}{}
+	fakeDiceTestingMode         bool
+	dealerOpenHeartbeatID       int
+	dealerOpenHeartbeatActive   bool
+	dealerResyncInProgress      bool
+	lastOutgoingTradeOpenID     int
+	lastOutgoingTradeOpenAt     time.Time
+	tradeOpenStateMu            sync.Mutex
+	tradeWindowTimeoutMonitorID int
+	tradeWindowOpenedAt         time.Time
+	tradeWindowDeadline         time.Time
+	tradeWindowTimeoutActive    bool
+	blockAllTrades              = true
 )
 
 type TradeItem struct {
@@ -687,21 +701,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		}
 	}()
 
-	if e.Packet.Header.Dir == g.Out && (e.Packet.Header.Value == 69 || e.Packet.Header.Value == 402) && !payoutTradeActive {
-		shortages := a.getTradeCoverageShortages()
-		if len(shortages) > 0 {
-			notice := formatTradeShortages(shortages)
-			msg := fmt.Sprintf("Trade blocked: insufficient payout stock (%s)", notice)
-			e.Block()
-			a.AddLogMsg("[TRADE_GUARD] " + msg)
-			log.Printf("[TRADE_GUARD] %s", msg)
-			if notice != lastTradeBlockNotice {
-				lastTradeBlockNotice = notice
-				ext.Send(out.SHOUT, msg)
-			}
-			return
-		}
-	}
+	// NOTE: payout coverage guard removed — proceed with outgoing accept/confirm.
 
 	// TRADE_OPEN outgoing 71 - remember recent target so matching incoming 104 isn't blocked by dealer guard.
 	if e.Packet.Header.Dir == g.Out && e.Packet.Header.Value == 71 {
@@ -719,7 +719,11 @@ func handleTradePacket(a *App, e *g.Intercept) {
 	if e.Packet.Header.Dir == g.Out && e.Packet.Header.Value == 72 {
 		addItemMu.Lock()
 		lastAddItemWasOurs = true
+		lastAddItemByUsAt = time.Now()
 		addItemMu.Unlock()
+		// Debug log outgoing add with timestamp
+		a.AddLogMsg(fmt.Sprintf("[TRADE_ADDITEM_DEBUG] outgoing TRADE_ADDITEM payload=%q at=%s", string(e.Packet.Data), lastAddItemByUsAt.Format(time.RFC3339Nano)))
+		log.Printf("[TRADE_ADDITEM_DEBUG] outgoing TRADE_ADDITEM payload=%q at=%s", string(e.Packet.Data), lastAddItemByUsAt.Format(time.RFC3339Nano))
 		if payoutTradeActive {
 			payoutActualAddCount++
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] observed outgoing TRADE_ADDITEM count %d/%d", payoutActualAddCount, payoutExpectedAddCount))
@@ -753,51 +757,152 @@ func handleTradePacket(a *App, e *g.Intercept) {
 	}
 
 	// TRADE_ITEMS header 108 - incoming server echo of full trade state (always incoming)
-	// Ownership: if we just sent TRADE_ADDITEM[72], the new item is ours; otherwise partner triggered.
-	// Compute each side by diffing total items against the other side's last known list.
+	// Two modes:
+	// - Non-payout mode: treat the incoming list as the partner's offer directly
+	//   (simpler and avoids racey diff logic that can hide the first add).
+	// - Payout mode: keep delta attribution so automated payout adds by the
+	//   dealer are assigned to our own offer correctly.
 	if e.Packet.Header.Value == 108 {
 		allItems := a.parseTradeItemsPacket(e.Packet.Data)
 
+		if !payoutTradeActive {
+			// Non-payout: partner offer is the full list.
+			tradeItemsMu.Lock()
+			currentTradeItems = make([]TradeItem, len(allItems))
+			copy(currentTradeItems, allItems)
+			currentOwnTradeItems = []TradeItem{}
+			// Save baseline full-state
+			lastAllTradeItems = make([]TradeItem, len(allItems))
+			copy(lastAllTradeItems, allItems)
+			tradeItemsMu.Unlock()
+
+			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] partner=%d all=%d (non-payout)", len(currentTradeItems), len(allItems)))
+			log.Printf("[TRADE_ITEMS #108] partner=%d all=%d (non-payout)", len(currentTradeItems), len(allItems))
+
+			for i, item := range allItems {
+				a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] raw[%d] name=%q quantity=%d", i, item.Name, item.Quantity))
+				log.Printf("[TRADE_ITEMS #108] raw[%d] name=%q quantity=%d", i, item.Name, item.Quantity)
+			}
+
+			a.emitTradeItemsUpdate("partner")
+
+			if len(allItems) > 0 {
+				extendTradeWindowTimeoutForPartnerActivity(a)
+			}
+
+			handItemsMu.Lock()
+			ready := tradeHandSnapshotReady
+			handItemsMu.Unlock()
+
+			if !ready {
+				a.AddLogMsg("[TRADE_COVERAGE] snapshot not ready yet, skipping live trade check")
+				log.Printf("[TRADE_COVERAGE] snapshot not ready yet, skipping live trade check")
+				return
+			}
+
+			a.notifyTradeQuantityCoverage()
+			return
+		}
+
+		// Payout mode: compute delta and attribute to the side that sent TRADE_ADDITEM.
+		// Snapshot outgoing-add state and timestamp for debugging/race detection
 		addItemMu.Lock()
 		wasOurs := lastAddItemWasOurs
 		lastAddItemWasOurs = false
+		lastAddAt := lastAddItemByUsAt
 		addItemMu.Unlock()
 
-		side := "partner"
-		if wasOurs {
-			side = "yours"
-		}
-
+		// Prev full-state length for debug
+		prevAllLen := 0
 		tradeItemsMu.Lock()
-		if wasOurs {
-			// We added an item: our offer = total minus known partner items
-			currentOwnTradeItems = diffItems(allItems, currentTradeItems)
-		} else {
-			// Partner added an item: their offer = total minus our known items
-			currentTradeItems = diffItems(allItems, currentOwnTradeItems)
-		}
-		computedPartner := len(currentTradeItems)
-		computedOwn := len(currentOwnTradeItems)
+		prevAllLen = len(lastAllTradeItems)
 		tradeItemsMu.Unlock()
 
-		a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] side=%s total=%d partner=%d own=%d", side, len(allItems), computedPartner, computedOwn))
-		log.Printf("[TRADE_ITEMS #108] side=%s total=%d partner=%d own=%d", side, len(allItems), computedPartner, computedOwn)
+		a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS_DEBUG] incoming TRADE_ITEMS all=%d prevAll=%d wasOursFlag=%t lastAddAt=%s", len(allItems), prevAllLen, wasOurs, lastAddAt.Format(time.RFC3339Nano)))
+		log.Printf("[TRADE_ITEMS_DEBUG] incoming TRADE_ITEMS all=%d prevAll=%d wasOursFlag=%t lastAddAt=%s", len(allItems), prevAllLen, wasOurs, lastAddAt.Format(time.RFC3339Nano))
+
+		// Build maps of previous full-state and current tracked sides
+		prevAll := map[string]int{}
+		tradeItemsMu.Lock()
+		for _, it := range lastAllTradeItems {
+			prevAll[it.Name] = it.Quantity
+		}
+		partnerMap := map[string]int{}
+		for _, it := range currentTradeItems {
+			partnerMap[it.Name] = it.Quantity
+		}
+		ownMap := map[string]int{}
+		for _, it := range currentOwnTradeItems {
+			ownMap[it.Name] = it.Quantity
+		}
+		tradeItemsMu.Unlock()
+
+		allMap := map[string]int{}
+		for _, it := range allItems {
+			allMap[it.Name] += it.Quantity
+		}
+
+		// Compute additions (positive deltas) vs previous full-state
+		added := map[string]int{}
+		for name, q := range allMap {
+			if q > prevAll[name] {
+				added[name] = q - prevAll[name]
+			}
+		}
+
+		// Merge added items into the appropriate side.
+		tradeItemsMu.Lock()
+		if wasOurs {
+			for name, q := range added {
+				ownMap[name] += q
+			}
+		} else {
+			for name, q := range added {
+				partnerMap[name] += q
+			}
+		}
+
+		// Helper: convert map -> sorted slice
+		mapToItems := func(m map[string]int) []TradeItem {
+			names := make([]string, 0, len(m))
+			for n := range m {
+				names = append(names, n)
+			}
+			sort.Strings(names)
+			out := make([]TradeItem, 0, len(names))
+			for _, n := range names {
+				if m[n] <= 0 {
+					continue
+				}
+				out = append(out, TradeItem{Name: n, Quantity: m[n]})
+			}
+			return out
+		}
+
+		currentTradeItems = mapToItems(partnerMap)
+		currentOwnTradeItems = mapToItems(ownMap)
+
+		// Save the new full-state for the next delta calculation
+		lastAllTradeItems = make([]TradeItem, len(allItems))
+		copy(lastAllTradeItems, allItems)
+		tradeItemsMu.Unlock()
+
+		a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] partner=%d own=%d all=%d wasOurs=%t (payout)", len(currentTradeItems), len(currentOwnTradeItems), len(allItems), wasOurs))
+		log.Printf("[TRADE_ITEMS #108] partner=%d own=%d all=%d wasOurs=%t (payout)", len(currentTradeItems), len(currentOwnTradeItems), len(allItems), wasOurs)
 
 		for i, item := range allItems {
 			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] raw[%d] name=%q quantity=%d", i, item.Name, item.Quantity))
 			log.Printf("[TRADE_ITEMS #108] raw[%d] name=%q quantity=%d", i, item.Name, item.Quantity)
 		}
 
-		a.emitTradeItemsUpdate(side)
-		if side == "partner" && len(allItems) > 0 {
+		a.emitTradeItemsUpdate("both")
+
+		if len(allItems) > 0 {
 			extendTradeWindowTimeoutForPartnerActivity(a)
 		}
-		if payoutTradeActive {
-			a.AddLogMsg("[TRADE_COVERAGE] skipped shortage enforcement during payout trade")
-			log.Printf("[TRADE_COVERAGE] skipped shortage enforcement during payout trade")
-		} else {
-			a.notifyTradeQuantityCoverage()
-		}
+
+		a.AddLogMsg("[TRADE_COVERAGE] skipped shortage enforcement during payout trade")
+		log.Printf("[TRADE_COVERAGE] skipped shortage enforcement during payout trade")
 		return
 	}
 
@@ -1061,7 +1166,43 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] shouting: %q", openMsg))
 		log.Printf("[TRADE_OPEN] shouting: %q", openMsg)
 		ext.Send(out.SHOUT, openMsg)
-		go a.requestPlayerStrip()
+
+		handItemsMu.Lock()
+		tradeHandSnapshot = []TradeItem{}
+		tradeHandSnapshotReady = false
+		handItemsMu.Unlock()
+
+		// Mark trade as open so background hand rescans are skipped while
+		// a frozen trade snapshot is being prepared.
+		tradeOpen = true
+
+		// Ensure any previous trade state is cleared so the first TRADE_ITEMS
+		// packet for this new trade is interpreted correctly.
+		tradeItemsMu.Lock()
+		currentTradeItems = []TradeItem{}
+		currentOwnTradeItems = []TradeItem{}
+		tradeItemsMu.Unlock()
+
+		// Reset last full-state so the next TRADE_ITEMS packet is treated as a
+		// fresh baseline for delta calculations.
+		tradeItemsMu.Lock()
+		lastAllTradeItems = nil
+		tradeItemsMu.Unlock()
+
+		addItemMu.Lock()
+		lastAddItemWasOurs = false
+		addItemMu.Unlock()
+
+		go func() {
+			scanID := a.requestPlayerStrip()
+			if ok := waitForStripScanCompletion(scanID, 20*time.Second); ok {
+				a.captureTradeHandSnapshot()
+				a.notifyTradeQuantityCoverage()
+			} else {
+				a.AddLogMsg(fmt.Sprintf("[TRADE_HAND_SNAPSHOT] hand scan timeout (session=%d)", scanID))
+				log.Printf("[TRADE_HAND_SNAPSHOT] hand scan timeout (session=%d)", scanID)
+			}
+		}()
 		return
 	}
 
@@ -1628,6 +1769,7 @@ func (a *App) verifyAndRetryPayoutAdds(plannedIDs []int) {
 }
 
 func stopUnderfundedTradeMonitor() {
+	// Disabled underfunded trade monitor per user request.
 	underfundedTradeMonitorID++
 	underfundedTradeMonitorNotice = ""
 }
@@ -1701,47 +1843,64 @@ func stopTradeWindowTimeoutMonitor() {
 }
 
 func startUnderfundedTradeMonitor(a *App, notice string) {
+	// Underfunded trade monitor disabled per user request.
 	underfundedTradeMonitorID++
-	monitorID := underfundedTradeMonitorID
-	underfundedTradeMonitorNotice = notice
+	underfundedTradeMonitorNotice = ""
+}
 
-	go func(id int) {
-		warn := func(message string) bool {
-			if id != underfundedTradeMonitorID {
-				return false
+// startShortageMonitor begins a short-lived monitor that will force-close
+// a trade if reported shortages remain unresolved for the given timeout.
+func startShortageMonitor(a *App, timeout time.Duration) {
+	shortageMonitorID++
+	id := shortageMonitorID
+	shortageMonitorActive = true
+	shortageMonitorDeadline = time.Now().Add(timeout)
+
+	go func(monitor int) {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			if monitor != shortageMonitorID {
+				return
 			}
+			if !shortageMonitorActive {
+				return
+			}
+
+			// If trade closed externally, stop the monitor.
+			if !tradeOpen {
+				stopShortageMonitor()
+				return
+			}
+
+			// If shortages resolved, stop the monitor.
 			if len(a.getTradeCoverageShortages()) == 0 {
-				return false
+				stopShortageMonitor()
+				return
 			}
-			a.AddLogMsg("[TRADE_COVERAGE] " + message)
-			log.Printf("[TRADE_COVERAGE] %s", message)
-			ext.Send(out.SHOUT, message)
-			return true
-		}
 
-		if !warn("Closing trade in 20secs if offer is not reduced.") {
-			return
+			// If deadline passed, close the trade to free the booth.
+			if time.Now().After(shortageMonitorDeadline) {
+				partnerName := strings.TrimSpace(lastTradePartnerName)
+				if partnerName == "" {
+					partnerName = "Player"
+				}
+				a.AddLogMsg(fmt.Sprintf("[TRADE_COVERAGE] shortage unresolved; force-closing trade with %s", partnerName))
+				log.Printf("[TRADE_COVERAGE] shortage unresolved; force-closing trade with %s", partnerName)
+				ext.Send(out.SHOUT, "Closing trade due to unresolved shortage; please reopen if you still want to play")
+				ext.Send(out.TRADE_CLOSE)
+				stopShortageMonitor()
+				return
+			}
 		}
-		time.Sleep(10 * time.Second)
+	}(id)
+}
 
-		if !warn("Closing trade in 10secs if offer is not reduced.") {
-			return
-		}
-		time.Sleep(5 * time.Second)
-
-		if !warn("Closing trade in 5secs if offer is not reduced.") {
-			return
-		}
-		time.Sleep(5 * time.Second)
-
-		if id != underfundedTradeMonitorID || len(a.getTradeCoverageShortages()) == 0 {
-			return
-		}
-
-		a.AddLogMsg("[TRADE_COVERAGE] closing underfunded trade now")
-		log.Printf("[TRADE_COVERAGE] closing underfunded trade now")
-		ext.Send(out.TRADE_CLOSE)
-	}(monitorID)
+func stopShortageMonitor() {
+	shortageMonitorID++
+	shortageMonitorActive = false
+	shortageMonitorDeadline = time.Time{}
 }
 
 func startDealerOpenHeartbeat(a *App) {
@@ -2601,9 +2760,20 @@ func (a *App) ClearTradeItems() {
 	tradeItemsMu.Lock()
 	currentTradeItems = []TradeItem{}
 	currentOwnTradeItems = []TradeItem{}
+	lastAllTradeItems = nil
 	tradeItemsMu.Unlock()
+
+	handItemsMu.Lock()
+	tradeHandSnapshot = []TradeItem{}
+	tradeHandSnapshotReady = false
+	// Mark trade as closed so periodic/rescans may resume normally.
+	tradeOpen = false
+	handItemsMu.Unlock()
+
 	stopUnderfundedTradeMonitor()
+	stopShortageMonitor()
 	lastTradeCoverageNotice = ""
+	lastTradeBlockNotice = ""
 	a.AddLogMsg("[TRADE_ITEMS] cleared partner and own trade items")
 	log.Printf("[TRADE_ITEMS] cleared partner and own trade items")
 	a.emitTradeItemsUpdate("both")
@@ -2646,28 +2816,40 @@ func (a *App) emitActiveGameBetItemsUpdate() {
 
 // requestPlayerStrip sends GETSTRIP[65] to refresh the player's hand inventory.
 func (a *App) requestPlayerStrip() int {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("[STRIP] GETSTRIP request panicked: %v", r)
-		}
-	}()
+	handItemsMu.Lock()
+	snapshotReady := tradeHandSnapshotReady
+	handItemsMu.Unlock()
+
+	if tradeOpen && snapshotReady {
+		a.AddLogMsg("[STRIP_DEBUG] skipped hand scan because trade snapshot is already frozen")
+		log.Printf("[STRIP_DEBUG] skipped hand scan because trade snapshot is already frozen")
+
+		stripScanMu.Lock()
+		sid := stripScanSessionID
+		stripScanMu.Unlock()
+		return sid
+	}
 
 	stripScanMu.Lock()
-	stripScanSessionID++
-	sessionID := stripScanSessionID
 	stripScanActive = true
+	stripScanSessionID++
 	stripScanPageCount = 0
 	stripScanSeenItemIDs = map[int]struct{}{}
 	stripScanCounts = map[string]int{}
 	stripScanItemIDs = map[string][]int{}
+	sid := stripScanSessionID
 	stripScanMu.Unlock()
-	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] start scan session=%d", sessionID))
-	log.Printf("[STRIP_DEBUG] start scan session=%d", sessionID)
 
-	sendGetStripRaw(a, stripGetNewPayload)
+	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] start scan session=%d", sid))
+	log.Printf("[STRIP_DEBUG] start scan session=%d", sid)
+
+	ext.Send(out.GETSTRIP, "new")
+	a.AddLogMsg("[STRIP_DEBUG] raw GETSTRIP send payload=\"new\"")
+	log.Printf("[STRIP_DEBUG] raw GETSTRIP send payload=%q", "new")
 	a.AddLogMsg("[STRIP] requested player hand scan (GETSTRIP new)")
 	log.Printf("[STRIP] requested player hand scan (GETSTRIP new)")
-	return sessionID
+
+	return sid
 }
 
 func waitForStripScanCompletion(sessionID int, timeout time.Duration) bool {
@@ -2775,15 +2957,10 @@ func handleStripPacket(a *App, e *g.Intercept) {
 	stripScanMu.Lock()
 	active := stripScanActive
 	if !active {
-		stripScanActive = true
-		stripScanSessionID++
-		stripScanPageCount = 0
-		stripScanSeenItemIDs = map[int]struct{}{}
-		stripScanCounts = map[string]int{}
-		stripScanItemIDs = map[string][]int{}
-		active = true
-		a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] packet-triggered scan init session=%d", stripScanSessionID))
-		log.Printf("[STRIP_DEBUG] packet-triggered scan init session=%d", stripScanSessionID)
+		a.AddLogMsg("[STRIP_DEBUG] ignored strip packet because no scan is active")
+		log.Printf("[STRIP_DEBUG] ignored strip packet because no scan is active")
+		stripScanMu.Unlock()
+		return
 	}
 	scanID := stripScanSessionID
 	stripScanPageCount++
@@ -2865,6 +3042,19 @@ func (a *App) finalizeStripScan(sessionID int, reason string) {
 		log.Printf("[STRIP] hand[%d] name=%q qty=%d", i, item.Name, item.Quantity)
 	}
 	a.emitHandItemsUpdate()
+
+	// If a trade is open, refresh the frozen hand snapshot so coverage
+	// checks reflect recent hand removals/additions, then re-run coverage.
+	if tradeOpen {
+		// captureTradeHandSnapshot will copy currentHandItems into tradeHandSnapshot
+		// and mark the snapshot ready for coverage comparisons.
+		go func() {
+			a.captureTradeHandSnapshot()
+			// small delay to ensure snapshot processed before coverage check
+			time.Sleep(50 * time.Millisecond)
+			a.notifyTradeQuantityCoverage()
+		}()
+	}
 }
 
 func (a *App) handleOutgoingGetStrip(e *g.Intercept) {
@@ -3083,84 +3273,123 @@ func (a *App) emitHandItemsUpdate() {
 	runtime.EventsEmit(a.ctx, "handItemsUpdate", string(jsonData))
 }
 
+func (a *App) captureTradeHandSnapshot() {
+	handItemsMu.Lock()
+	tradeHandSnapshot = make([]TradeItem, len(currentHandItems))
+	copy(tradeHandSnapshot, currentHandItems)
+	tradeHandSnapshotReady = true
+	snapshot := make([]TradeItem, len(tradeHandSnapshot))
+	copy(snapshot, tradeHandSnapshot)
+	handItemsMu.Unlock()
+
+	parts := make([]string, 0, len(snapshot))
+	for _, item := range snapshot {
+		parts = append(parts, fmt.Sprintf("%s=%d", item.Name, item.Quantity))
+	}
+
+	joined := strings.Join(parts, ",")
+	a.AddLogMsg("[TRADE_HAND_SNAPSHOT] captured: " + joined)
+	log.Printf("[TRADE_HAND_SNAPSHOT] captured: %s", joined)
+}
+
 func (a *App) notifyTradeQuantityCoverage() {
+	// Compute shortages and notify partner if we cannot cover payout
 	shortages := a.getTradeCoverageShortages()
 	if len(shortages) == 0 {
-		stopUnderfundedTradeMonitor()
 		lastTradeCoverageNotice = ""
 		lastTradeBlockNotice = ""
-		a.AddLogMsg("[TRADE_COVERAGE] hand has enough stock to pay double (bet + match)")
-		log.Printf("[TRADE_COVERAGE] hand has enough stock to pay double (bet + match)")
+		a.AddLogMsg("[TRADE_COVERAGE] sufficient stock for payout")
+		log.Printf("[TRADE_COVERAGE] sufficient stock for payout")
+		// Cancel any active shortage monitor since coverage is sufficient now.
+		stopShortageMonitor()
 		return
 	}
-
-	notice := formatTradeShortages(shortages)
-	if notice == lastTradeCoverageNotice {
-		return
+	// Build the minimal message: raw item class with '*' and quantity, quoted.
+	parts := make([]string, 0, len(shortages))
+	for _, s := range shortages {
+		parts = append(parts, fmt.Sprintf("%s*%d", s.Name, s.HaveHand))
 	}
-	lastTradeCoverageNotice = notice
+	msg := fmt.Sprintf("I only have \"%s\"", strings.Join(parts, ", "))
+	lastTradeCoverageNotice = msg
 
-	primary := shortages[0]
-	msg := fmt.Sprintf("Total \"%s\" available \"%d\" (hand %d, incoming %d) but payout needs \"%d\": please offer less.", formatTradeItemName(primary.Name), primary.HaveHand, primary.HaveHand, primary.Incoming, primary.PayoutTotal)
-	a.AddLogMsg("[TRADE_COVERAGE] " + msg)
+	a.AddLogMsg(fmt.Sprintf("[TRADE_COVERAGE] %s", msg))
 	log.Printf("[TRADE_COVERAGE] %s", msg)
-	ext.Send(out.SHOUT, msg)
 
-	if notice != underfundedTradeMonitorNotice {
-		startUnderfundedTradeMonitor(a, notice)
-	}
+	go func() {
+		time.Sleep(450 * time.Millisecond)
+		ext.Send(out.SHOUT, msg)
+	}()
 }
 
 func (a *App) getTradeCoverageShortages() []tradeShortage {
+	// Ensure we have a frozen hand snapshot to compare against.
+	handItemsMu.Lock()
+	ready := tradeHandSnapshotReady
+	if !ready {
+		handItemsMu.Unlock()
+		return nil
+	}
+	// copy snapshot
+	handSnapshot := make([]TradeItem, len(tradeHandSnapshot))
+	copy(handSnapshot, tradeHandSnapshot)
+	handItemsMu.Unlock()
+
+	// copy current partner trade items
 	tradeItemsMu.Lock()
 	partnerItems := make([]TradeItem, len(currentTradeItems))
 	copy(partnerItems, currentTradeItems)
 	tradeItemsMu.Unlock()
 
-	handItemsMu.Lock()
-	handItems := make([]TradeItem, len(currentHandItems))
-	copy(handItems, currentHandItems)
-	handItemsMu.Unlock()
-
 	if len(partnerItems) == 0 {
 		return nil
 	}
 
-	haveByName := map[string]int{}
-	for _, item := range handItems {
-		haveByName[item.Name] += item.Quantity
+	// required payout quantities (uses existing logic: bet*2)
+	required := payoutRequirementsFromBetItems(partnerItems)
+	if len(required) == 0 {
+		return nil
 	}
 
-	incomingByName := map[string]int{}
-	for _, item := range partnerItems {
-		incomingByName[item.Name] += item.Quantity
+	// map hand counts
+	handMap := map[string]int{}
+	for _, it := range handSnapshot {
+		handMap[it.Name] += it.Quantity
+	}
+
+	// map incoming counts
+	incomingMap := map[string]int{}
+	for _, it := range partnerItems {
+		incomingMap[it.Name] += it.Quantity
 	}
 
 	shortages := make([]tradeShortage, 0)
-	for _, item := range partnerItems {
-		required := item.Quantity
-		payoutTotal := item.Quantity * 2
-		// Enforce coverage using dealer hand only (exclude partner incoming items).
-		haveHand := haveByName[item.Name]
-		incoming := incomingByName[item.Name]
-		if haveHand < payoutTotal {
+	for name, req := range required {
+		haveHand := handMap[name]
+		incoming := incomingMap[name]
+		if haveHand < req {
 			shortages = append(shortages, tradeShortage{
-				Name:        item.Name,
-				Required:    required,
+				Name:        name,
+				Required:    req,
 				Have:        haveHand,
-				PayoutTotal: payoutTotal,
+				PayoutTotal: req,
 				HaveHand:    haveHand,
 				Incoming:    incoming,
 			})
 		}
 	}
+
 	return shortages
 }
 
 func formatTradeShortages(shortages []tradeShortage) string {
 	parts := make([]string, 0, len(shortages))
 	for _, shortage := range shortages {
-		parts = append(parts, fmt.Sprintf("%s available %d (hand %d + incoming %d) need %d (payout %d)", formatTradeItemName(shortage.Name), shortage.HaveHand, shortage.HaveHand, shortage.Incoming, shortage.Required, shortage.PayoutTotal))
+		parts = append(parts, fmt.Sprintf(
+			"%s hand %d traded %d",
+			formatTradeItemName(shortage.Name),
+			shortage.HaveHand,
+			shortage.Required,
+		))
 	}
 	return strings.Join(parts, ", ")
 }

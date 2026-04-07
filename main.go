@@ -157,20 +157,22 @@ var (
 	// lastAllTradeItems stores the last full TRADE_ITEMS (all items) packet
 	// so we can compute deltas between successive full-state packets. This
 	// helps reliably attribute the first added item to the correct side.
-	lastAllTradeItems         []TradeItem
-	gameBetItems              []TradeItem
-	stripScanMu               sync.Mutex
-	stripScanActive           bool
-	stripScanSessionID        = 0
-	stripScanPageCount        = 0
-	stripScanSeenItemIDs      = map[int]struct{}{}
-	stripScanCounts           = map[string]int{}
-	stripScanItemIDs          = map[string][]int{}
-	knownDiceIDs              = map[int]struct{}{}
-	fakeDiceTestingMode       bool
-	dealerOpenHeartbeatID     int
-	dealerOpenHeartbeatActive bool
-	dealerResyncInProgress    bool
+	lastAllTradeItems          []TradeItem
+	gameBetItems               []TradeItem
+	stripScanMu                sync.Mutex
+	stripScanActive            bool
+	stripScanSessionID         = 0
+	stripScanPageCount         = 0
+	stripScanSeenItemIDs       = map[int]struct{}{}
+	stripScanCounts            = map[string]int{}
+	stripScanItemIDs           = map[string][]int{}
+	knownDiceIDs               = map[int]struct{}{}
+	fakeDiceTestingMode        bool
+	dealerOpenHeartbeatID      int
+	dealerOpenHeartbeatActive  bool
+	gameChoiceTimeoutMonitorID int
+	gameChoiceTimeoutActive    bool
+	dealerResyncInProgress     bool
 	// When true, the UI has enabled dice setup mode and incoming dice IDs
 	// should be recorded for the bot setup. Must be enabled by the Start Casino
 	// button in the frontend.
@@ -1992,6 +1994,76 @@ func stopTradeWindowTimeoutMonitor() {
 	tradeWindowTimeoutActive = false
 }
 
+func stopGameChoiceTimeoutMonitor() {
+	gameChoiceTimeoutMonitorID++
+	gameChoiceTimeoutActive = false
+}
+
+func (a *App) startGameChoiceTimeoutMonitor() {
+	stopGameChoiceTimeoutMonitor()
+
+	gameChoiceTimeoutMonitorID++
+	monitorID := gameChoiceTimeoutMonitorID
+	gameChoiceTimeoutActive = true
+
+	playerName := strings.TrimSpace(awaitingGameChoicePartnerName)
+	if playerName == "" {
+		playerName = strings.TrimSpace(lastTradePartnerName)
+	}
+	if playerName == "" {
+		playerName = "Player"
+	}
+
+	go func(id int, player string) {
+		// First 30 seconds
+		time.Sleep(30 * time.Second)
+
+		if id != gameChoiceTimeoutMonitorID || !gameChoiceTimeoutActive || !awaitingGameChoice {
+			return
+		}
+
+		reminder := "Say Poker, 21, 13 or Tri"
+		a.AddLogMsg(fmt.Sprintf("[GAME_CHOICE_TIMEOUT] 30s no response, repeating prompt for %s", player))
+		log.Printf("[GAME_CHOICE_TIMEOUT] 30s no response, repeating prompt for %s", player)
+		ext.Send(out.SHOUT, reminder)
+
+		// Another 30 seconds
+		time.Sleep(30 * time.Second)
+
+		if id != gameChoiceTimeoutMonitorID || !gameChoiceTimeoutActive || !awaitingGameChoice {
+			return
+		}
+
+		// Final timeout hit
+		awaitingGameChoice = false
+		awaitingGameChoicePartnerID = 0
+		awaitingGameChoicePartnerName = ""
+		gameChoiceTimeoutActive = false
+
+		closeMsg := fmt.Sprintf("Closing trade no response from %q", player)
+		flagMsg := "We have flagged this game, please advise us on discord"
+
+		a.AddLogMsg(fmt.Sprintf("[GAME_CHOICE_TIMEOUT] final timeout for %s", player))
+		log.Printf("[GAME_CHOICE_TIMEOUT] final timeout for %s", player)
+
+		ext.Send(out.SHOUT, closeMsg)
+		time.Sleep(1200 * time.Millisecond)
+
+		ext.Send(out.SHOUT, flagMsg)
+
+		a.markCurrentGameHistoryIssue(
+			fmt.Sprintf("No game choice response from %s after 60 seconds", player),
+			true,
+		)
+
+		time.Sleep(1200 * time.Millisecond)
+		ext.Send(out.TRADE_CLOSE)
+
+		time.Sleep(1500 * time.Millisecond)
+		go a.reopenDealerIdle("game choice timeout")
+	}(monitorID, playerName)
+}
+
 func startUnderfundedTradeMonitor(a *App, notice string) {
 	// Underfunded trade monitor disabled per user request.
 	underfundedTradeMonitorID++
@@ -2504,6 +2576,10 @@ func clearRoomUserCaches(a *App) {
 
 func (a *App) resetDealerSessionState(reason string) {
 	a.markCurrentGameHistoryIssue(fmt.Sprintf("Dealer session reset before round fully resolved (%s)", reason), true)
+
+	// Stop any active game-choice timeout when resetting the dealer session.
+	stopGameChoiceTimeoutMonitor()
+
 	awaitingTradeOpen = false
 	dealerTradeWindowOpen = false
 	awaitingGameChoice = false
@@ -3176,6 +3252,8 @@ func (a *App) resyncHandThenOpenDealer() {
 // dice and restarts the dealer-open heartbeat safely.
 func (a *App) reopenDealerIdle(reason string) {
 	stopDealerOpenHeartbeat()
+	// Ensure any pending game-choice timer is stopped when reopening dealer.
+	stopGameChoiceTimeoutMonitor()
 
 	stopTradeWindowTimeoutMonitor()
 	stopShortageMonitor()
@@ -3911,6 +3989,9 @@ func (a *App) sendTradeCompletionMessage() {
 	} else {
 		awaitingGameChoicePartnerID = lastTradePartnerID
 	}
+
+	// Start the game-choice timeout monitor to handle non-responsive partners.
+	a.startGameChoiceTimeoutMonitor()
 
 	a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE] shouting: %q", first))
 	log.Printf("[TRADE_MESSAGE] shouting: %q", first)
@@ -4922,6 +5003,8 @@ func resetDiceState() {
 	awaitingTradeOpen = false
 	dealerTradeWindowOpen = false
 	stopTradeWindowTimeoutMonitor()
+	// Ensure any pending game-choice timeout is stopped when resetting dice.
+	stopGameChoiceTimeoutMonitor()
 	resetPokerSequence()
 	resetBlackjackSequence()
 	fakeDiceTestingMode = false
@@ -6117,6 +6200,8 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 		return
 	}
 
+	// Stop the game choice timeout monitor — player has responded.
+	stopGameChoiceTimeoutMonitor()
 	awaitingGameChoice = false
 	awaitingGameChoicePartnerID = 0
 	awaitingGameChoicePartnerName = ""

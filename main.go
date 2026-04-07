@@ -2558,9 +2558,8 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 			log.Printf("[TRADE_ACCEPT] skipped auto-accept due to insufficient payout stock")
 			return
 		}
-		// If snapshot not ready (getTradeCoverageShortages returns nil) we
-		// cannot reliably auto-accept immediately — fall through and let the
-		// deferred goroutine wait briefly for a snapshot before sending.
+		// If snapshot not ready (s == nil) allow scheduling and perform a
+		// short wait inside the confirm loop before sending each confirm.
 	}
 
 	tradeAutoAcceptPending = true
@@ -4131,9 +4130,7 @@ func (a *App) sendLiveDealerSnapshot(items []TradeItem) {
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
-		if secret := os.Getenv("LIVE_SYNC_SECRET"); secret != "" {
-			req.Header.Set("Authorization", "Bearer "+secret)
-		}
+		req.Header.Set("Authorization", "Bearer s3cUr3-r4nd0m_v4lu3-6f2b8a")
 
 		client := &http.Client{Timeout: 5 * time.Second}
 		resp, err := client.Do(req)
@@ -4180,9 +4177,7 @@ func (a *App) sendLiveDealerStatus(open bool, dealerName string) {
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
-		if secret := os.Getenv("LIVE_SYNC_SECRET"); secret != "" {
-			req.Header.Set("Authorization", "Bearer "+secret)
-		}
+		req.Header.Set("Authorization", "Bearer s3cUr3-r4nd0m_v4lu3-6f2b8a")
 
 		client := &http.Client{Timeout: 5 * time.Second}
 		resp, err := client.Do(req)
@@ -4292,7 +4287,6 @@ func (a *App) notifyTradeQuantityCoverage() {
 		parts = append(parts, fmt.Sprintf("%s x %d", display, s.HaveHand))
 	}
 	msg := fmt.Sprintf("I only have %s", strings.Join(parts, ", "))
-
 	// Only shout when the message changed since the last notice.
 	changed := msg != lastTradeCoverageNotice
 	lastTradeCoverageNotice = msg
@@ -5576,10 +5570,11 @@ func (a *App) StopCasinoSetup() {
 	lastTradePartnerID = 0
 	lastTradePartnerName = ""
 	lastTradePartnerToken = ""
-	mutex.Unlock()
+	gameBetItems = nil
+	lastAddItemWasOurs = false
+	lastTradeCoverageNotice = ""
+	lastTradeBlockNotice = ""
 
-	// Ensure any active trade state is fully cleared so the addon is inert.
-	a.ClearTradeItems()
 	stopTradeWindowTimeoutMonitor()
 	stopUnderfundedTradeMonitor()
 	stopDealerOpenHeartbeat()
@@ -5840,7 +5835,12 @@ func (a *App) handleDiceResult(e *g.Intercept) {
 func (a *App) closeAllDice() {
 	if fakeDiceTestingMode {
 		mutex.Lock()
-		isClosing = true
+		if len(diceList) < 5 {
+			mutex.Unlock()
+			log.Println("Not enough dice to roll")
+			isClosing = false
+			return
+		}
 		for _, dice := range diceList {
 			dice.IsClosed = true
 			dice.Value = 0
@@ -6919,8 +6919,12 @@ func gameChoiceDisplay(choice string) string {
 		return "13"
 	case "tri":
 		return "Tri"
+	case "trih":
+		return "TriH"
 	case "trihigh":
 		return "TriH"
+	case "tril":
+		return "TriL"
 	case "trilow":
 		return "TriL"
 	default:

@@ -1041,6 +1041,10 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				if !allowed {
 					a.AddLogMsg("[TRADE_BLOCK] incoming trade blocked during active round")
 					log.Printf("[TRADE_BLOCK] incoming trade blocked during active round")
+
+					// Detailed guard state for diagnostics
+					a.AddLogMsg(fmt.Sprintf("[TRADE_GUARD] block reason=%s awaitingTradeOpen=%t dealerTradeWindowOpen=%t dealerGameActive=%t dealerResyncInProgress=%t", "incoming blocked during active round", awaitingTradeOpen, dealerTradeWindowOpen, dealerGameActive(), dealerResyncInProgress))
+					log.Printf("[TRADE_GUARD] block reason=%s awaitingTradeOpen=%t dealerTradeWindowOpen=%t dealerGameActive=%t dealerResyncInProgress=%t", "incoming blocked during active round", awaitingTradeOpen, dealerTradeWindowOpen, dealerGameActive(), dealerResyncInProgress)
 					hiddenBlockedTradeCleanupPending = true
 					ignoreNextGuardCloseRecovery = true
 					suppressNextTradeCloseAnnouncement = true
@@ -1087,6 +1091,10 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				// Someone else opened a trade with us during payout — block it
 				a.AddLogMsg(fmt.Sprintf("[PAYOUT] incoming trade blocked during payout to %s, closing", payoutTargetName))
 				log.Printf("[PAYOUT] incoming trade blocked during payout to %s, closing", payoutTargetName)
+
+				// Detailed guard state for diagnostics
+				a.AddLogMsg(fmt.Sprintf("[TRADE_GUARD] block reason=%s awaitingTradeOpen=%t dealerTradeWindowOpen=%t dealerGameActive=%t dealerResyncInProgress=%t", "incoming blocked during payout", awaitingTradeOpen, dealerTradeWindowOpen, dealerGameActive(), dealerResyncInProgress))
+				log.Printf("[TRADE_GUARD] block reason=%s awaitingTradeOpen=%t dealerTradeWindowOpen=%t dealerGameActive=%t dealerResyncInProgress=%t", "incoming blocked during payout", awaitingTradeOpen, dealerTradeWindowOpen, dealerGameActive(), dealerResyncInProgress)
 				hiddenBlockedTradeCleanupPending = true
 				ignoreNextGuardCloseRecovery = true
 				suppressNextTradeCloseAnnouncement = true
@@ -1110,6 +1118,10 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 			a.AddLogMsg(fmt.Sprintf("[TRADE_GUARD] blocking incoming trade open: %s", reason))
 			log.Printf("[TRADE_GUARD] blocking incoming trade open: %s", reason)
+
+			// Detailed guard state for diagnostics
+			a.AddLogMsg(fmt.Sprintf("[TRADE_GUARD] block reason=%s awaitingTradeOpen=%t dealerTradeWindowOpen=%t dealerGameActive=%t dealerResyncInProgress=%t", reason, awaitingTradeOpen, dealerTradeWindowOpen, dealerGameActive(), dealerResyncInProgress))
+			log.Printf("[TRADE_GUARD] block reason=%s awaitingTradeOpen=%t dealerTradeWindowOpen=%t dealerGameActive=%t dealerResyncInProgress=%t", reason, awaitingTradeOpen, dealerTradeWindowOpen, dealerGameActive(), dealerResyncInProgress)
 			hiddenBlockedTradeCleanupPending = true
 			ignoreNextGuardCloseRecovery = true
 			suppressNextTradeCloseAnnouncement = true
@@ -1333,22 +1345,15 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		resetTradeAutoFlow()
 		lastTradePartnerToken = ""
 
-		// Clear trade items when trade closes. Capture previous open state
-		// so we can ensure the client/server trade window is closed too.
-		wasTradeOpen := tradeOpen
+		// Clear trade items when trade closes. Ensure client/server trade
+		// window state is cleared too.
 		a.ClearTradeItems()
 
-		// If a trade was open, ensure we push an outgoing TRADE_CLOSE to
-		// help clear any stuck client UI or server-side state. Send from a
-		// goroutine with a short delay to avoid racing packet handling.
-		if wasTradeOpen {
-			go func() {
-				time.Sleep(150 * time.Millisecond)
-				a.AddLogMsg("[TRADE_CLOSE] sending outgoing TRADE_CLOSE to ensure UI cleared")
-				log.Printf("[TRADE_CLOSE] sending outgoing TRADE_CLOSE to ensure UI cleared")
-				ext.Send(out.TRADE_CLOSE)
-			}()
-		}
+		// If a trade was open, we previously sent a delayed outgoing
+		// TRADE_CLOSE to ensure UI cleared. That can race with a new
+		// incoming trade-open; avoid sending a stray delayed close here.
+		// The code paths that intentionally block trades (hidden/guard)
+		// already send an immediate outgoing TRADE_CLOSE when needed.
 
 		if !wasCompleted {
 			if payoutTradeActive {
@@ -1361,9 +1366,9 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				a.noteCurrentGameHistory("Payout trade closed before completion; retrying payout")
 				startPayout(a, retryTargetID, retryTargetName)
 			} else {
-				a.AddLogMsg("[TRADE_REOPEN] trade closed before completion, performing full dealer reset")
-				log.Printf("[TRADE_REOPEN] trade closed before completion, performing full dealer reset")
-				go a.resyncHandThenOpenDealer()
+				a.AddLogMsg("[TRADE_REOPEN] trade closed before completion, reopening dealer (idle recovery)")
+				log.Printf("[TRADE_REOPEN] trade closed before completion, reopening dealer (idle recovery)")
+				go a.reopenDealerIdle("incomplete trade close")
 			}
 		} else if payoutTradeActive {
 			// Payout trade completed normally — clear active flag
@@ -1975,7 +1980,7 @@ func startShortageMonitor(a *App, timeout time.Duration) {
 	shortageMonitorDeadline = time.Now().Add(timeout)
 
 	go func(monitor int) {
-		ticker := time.NewTicker(1 * time.Second)
+		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
 
 		for range ticker.C {
@@ -3065,7 +3070,13 @@ func waitForStripScanCompletion(sessionID int, timeout time.Duration) bool {
 }
 
 func (a *App) resyncHandThenOpenDealer() {
+	// Preserve dice across this full reset path to avoid losing assigned dice.
+	snap := snapshotDice()
 	a.resetDealerSessionState("reopen")
+	if snap != nil {
+		restoreDice(snap)
+	}
+
 	dealerResyncInProgress = true
 
 	a.AddLogMsg("[TRADE_REOPEN] full reset complete; syncing room users and hand before reopening trades")
@@ -3097,6 +3108,79 @@ func (a *App) resyncHandThenOpenDealer() {
 		log.Printf("User is muted. Dealer open announcement skipped; incoming trades will be blocked.")
 	}
 	startDealerOpenHeartbeat(a)
+}
+
+// reopenDealerIdle performs a lightweight reopen after an ordinary failed trade
+// without performing a full destructive dealer reset. It preserves assigned
+// dice and restarts the dealer-open heartbeat safely.
+func (a *App) reopenDealerIdle(reason string) {
+	stopDealerOpenHeartbeat()
+
+	stopTradeWindowTimeoutMonitor()
+	stopShortageMonitor()
+	stopUnderfundedTradeMonitor()
+
+	resetTradeAutoFlow()
+	a.ClearTradeItems()
+
+	awaitingGameChoice = false
+	awaitingGameChoicePartnerID = 0
+	awaitingGameChoicePartnerName = ""
+	lastTradePartnerID = 0
+	lastTradePartnerName = ""
+	lastTradePartnerToken = ""
+	gameBetItems = nil
+	a.emitActiveGameBetItemsUpdate()
+
+	awaitingTradeOpen = true
+	if canAnnounceDealerOpen() {
+		dealerTradeWindowOpen = true
+		go sendMessageWithDelay(a.dealerOpenMessage())
+	} else {
+		dealerTradeWindowOpen = false
+	}
+
+	startDealerOpenHeartbeat(a)
+	a.AddLogMsg(fmt.Sprintf("[TRADE_REOPEN] reopened idle dealer (%s)", reason))
+	log.Printf("[TRADE_REOPEN] reopened idle dealer (%s)", reason)
+}
+
+// snapshotDice returns a shallow copy of the current diceList for safe
+// preservation across destructive resets.
+func snapshotDice() []*Dice {
+	mutex.Lock()
+	defer mutex.Unlock()
+	if len(diceList) == 0 {
+		return nil
+	}
+	snap := make([]*Dice, 0, len(diceList))
+	for _, d := range diceList {
+		if d == nil {
+			snap = append(snap, nil)
+			continue
+		}
+		cp := *d
+		snap = append(snap, &cp)
+	}
+	return snap
+}
+
+// restoreDice restores a previously captured dice snapshot into diceList.
+func restoreDice(snap []*Dice) {
+	if snap == nil {
+		return
+	}
+	mutex.Lock()
+	defer mutex.Unlock()
+	diceList = make([]*Dice, 0, len(snap))
+	for _, d := range snap {
+		if d == nil {
+			diceList = append(diceList, nil)
+			continue
+		}
+		cp := *d
+		diceList = append(diceList, &cp)
+	}
 }
 
 // openDealerAfterRound syncs the hand and reopens dealer trades after a clean game result.
@@ -3557,22 +3641,26 @@ func (a *App) notifyTradeQuantityCoverage() {
 		parts = append(parts, fmt.Sprintf("%s x %d", display, s.HaveHand))
 	}
 	msg := fmt.Sprintf("I only have %s", strings.Join(parts, ", "))
+
+	// Only shout when the message changed since the last notice.
+	changed := msg != lastTradeCoverageNotice
 	lastTradeCoverageNotice = msg
 	lastTradeBlockNotice = msg
 
 	a.AddLogMsg(fmt.Sprintf("[TRADE_COVERAGE] %s", msg))
 	log.Printf("[TRADE_COVERAGE] %s", msg)
 
-	// Announce shortages and then force-close the trade so the booth frees.
-	go func() {
-		time.Sleep(450 * time.Millisecond)
-		ext.Send(out.SHOUT, msg)
-		time.Sleep(300 * time.Millisecond)
-		ext.Send(out.TRADE_CLOSE)
-	}()
+	if changed {
+		go func(m string) {
+			time.Sleep(350 * time.Millisecond)
+			ext.Send(out.SHOUT, m)
+		}(msg)
+	}
 
-	// Ensure any active shortage monitor is stopped since we're forcing close.
-	stopShortageMonitor()
+	// Start or refresh a short-lived grace timer instead of closing immediately.
+	// This gives partners time to correct their offered items; repeated calls
+	// refresh the deadline via shortageMonitorID semantics.
+	startShortageMonitor(a, 12*time.Second)
 }
 
 func (a *App) getTradeCoverageShortages() []tradeShortage {

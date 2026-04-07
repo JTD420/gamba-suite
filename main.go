@@ -3861,9 +3861,6 @@ func (a *App) finalizeStripScan(sessionID int, reason string) {
 		log.Printf("[STRIP] hand[%d] name=%q qty=%d", i, item.Name, item.Quantity)
 	}
 	a.emitHandItemsUpdate()
-	// Also push the latest hand snapshot to the live-dealer webhook so the
-	// dashboard stays up-to-date on every finalized scan.
-	a.sendLiveDealerSnapshot(items)
 
 	// If a trade is open, refresh the frozen hand snapshot so coverage
 	// checks reflect recent hand removals/additions, then re-run coverage.
@@ -4100,6 +4097,9 @@ func (a *App) emitHandItemsUpdate() {
 		return
 	}
 	runtime.EventsEmit(a.ctx, "handItemsUpdate", string(jsonData))
+	// Also notify the configured live-dealer webhook so external dashboards
+	// remain in sync whenever the frontend receives a hand update.
+	a.sendLiveDealerSnapshot(items)
 }
 
 // sendLiveDealerSnapshot posts a hand snapshot to the configured live-dealer webhook.
@@ -4122,7 +4122,7 @@ func (a *App) sendLiveDealerSnapshot(items []TradeItem) {
 
 		url := os.Getenv("LIVE_SYNC_URL")
 		if url == "" {
-			url = "http://localhost:3000/api/live-dealer"
+			url = "http://rollorigins.club/api/live-dealer"
 		}
 
 		req, err := http.NewRequest("POST", url, bytes.NewReader(jb))
@@ -4171,7 +4171,7 @@ func (a *App) sendLiveDealerStatus(open bool, dealerName string) {
 
 		url := os.Getenv("LIVE_SYNC_URL")
 		if url == "" {
-			url = "http://localhost:3000/api/live-dealer"
+			url = "http://rollorigins.club/api/live-dealer"
 		}
 
 		req, err := http.NewRequest("POST", url, bytes.NewReader(jb))

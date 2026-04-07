@@ -4119,7 +4119,7 @@ func (a *App) sendTradeCompletionMessage() {
 	a.beginGameHistory(partnerName, gameBetItems)
 
 	first := fmt.Sprintf("%s what game do you want to play?", partnerName)
-	second := "Shout Poker, 21, 13, Tri"
+	second := "Shout Poker, 21, 13, TriH, TriL"
 	awaitingGameChoice = true
 	gameChoiceUnreadableWarned = false
 	awaitingGameChoicePartnerName = strings.TrimSpace(lastTradePartnerName)
@@ -4972,9 +4972,9 @@ func (a *App) beginTriRound(mode string) {
 	triMode = strings.ToLower(strings.TrimSpace(mode))
 	triPlayerName = playerName
 
-	gameLabel := "Tri High"
+	gameLabel := "TriH"
 	if triMode == "low" {
-		gameLabel = "Tri Low"
+		gameLabel = "TriL"
 	}
 	a.setCurrentGameHistoryGame(gameLabel)
 
@@ -5086,9 +5086,9 @@ func (a *App) finalizeTriRound() {
 		winnerName = playerName
 	}
 
-	gameLabel := "Tri High"
+	gameLabel := "TriH"
 	if triMode == "low" {
-		gameLabel = "Tri Low"
+		gameLabel = "TriL"
 	}
 
 	winnerMsg := fmt.Sprintf("%s Wins - %s: %s | Dealer: %s", winnerName, playerName, playerHand, dealerHand)
@@ -5983,8 +5983,9 @@ func (a *App) ShowCommands() {
 			"Dealer plays automatically. \n" +
 			"------------------------------------\n" +
 			"------------------------------------\n" +
-			":tri \n" +
+			":tri (quick roll)\n" +
 			"Auto rolls 3 dice in Tri Formation \nif chat is enabled says the \nresults in chat. \n" +
+			"Use TriH or TriL after a trade to pick Tri High or Tri Low in one shout.\n" +
 			"------------------------------------\n" +
 			":verify \n" +
 			"Will say the previous result in\nchat. Use if you were muted and\ndont know the results of 21/13.\n" +
@@ -6408,13 +6409,13 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 		a.beginTriChoiceSequence()
 	case "trihigh":
 		// Direct Tri High selection
-		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected Tri High; starting round", index))
-		log.Printf("[GAME_SELECT] %d selected Tri High; starting round", index)
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected TriH; starting round", index))
+		log.Printf("[GAME_SELECT] %d selected TriH; starting round", index)
 		a.beginTriRound("high")
 	case "trilow":
 		// Direct Tri Low selection
-		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected Tri Low; starting round", index))
-		log.Printf("[GAME_SELECT] %d selected Tri Low; starting round", index)
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected TriL; starting round", index))
+		log.Printf("[GAME_SELECT] %d selected TriL; starting round", index)
 		a.beginTriRound("low")
 	}
 }
@@ -6431,8 +6432,12 @@ func normalizeIncomingGameChoice(msg string) (string, bool) {
 		return "13", true
 	case "tri":
 		return "tri", true
+	case "trih":
+		return "trihigh", true
 	case "trihigh":
 		return "trihigh", true
+	case "tril":
+		return "trilow", true
 	case "trilow":
 		return "trilow", true
 	default:
@@ -6464,8 +6469,12 @@ func normalizeLooseGameChoice(msg string) (string, bool) {
 		return "13", true
 	case "tri":
 		return "tri", true
+	case "trih":
+		return "trihigh", true
 	case "trihigh":
 		return "trihigh", true
+	case "tril":
+		return "trilow", true
 	case "trilow":
 		return "trilow", true
 	default:
@@ -6543,9 +6552,9 @@ func gameChoiceDisplay(choice string) string {
 	case "tri":
 		return "Tri"
 	case "trihigh":
-		return "Tri High"
+		return "TriH"
 	case "trilow":
-		return "Tri Low"
+		return "TriL"
 	default:
 		return choice
 	}

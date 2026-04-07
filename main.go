@@ -1535,15 +1535,14 @@ func resumeDealerAfterPayoutIssue(a *App, reason string) {
 	a.AddLogMsg(fmt.Sprintf("[PAYOUT] resuming dealer after payout issue: %s", reason))
 	log.Printf("[PAYOUT] resuming dealer after payout issue: %s", reason)
 
+	// Clear payout state and retry counters first.
 	stopPayout()
-	stopPayoutResponseTimeoutMonitor()
+	resetPayoutRetryState()
 
-	awaitingTradeOpen = true
-	if canAnnounceDealerOpen() {
-		dealerTradeWindowOpen = true
-		go sendMessageWithDelay(a.dealerOpenMessage())
-	}
-	startDealerOpenHeartbeat(a)
+	// Use the safe reopen path which performs the required resync/snapshot
+	// refresh before announcing dealer open. reopenDealerIdle already stops
+	// heartbeats/monitors, clears trade state and forces a hand snapshot.
+	go a.reopenDealerIdle("payout issue: " + reason)
 }
 
 func (a *App) startPayoutResponseTimeoutMonitor(playerName string, targetID int, targetName string) {

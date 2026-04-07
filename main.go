@@ -100,51 +100,51 @@ var (
 	payoutActualAddCount         int
 
 	// Payout retry/monitor state
-	payoutAcceptTimeoutMonitorID  int
-	payoutAcceptTimeoutActive     bool
-	payoutAcceptTimeoutAttempts   int
-	payoutCancelCount             int
-	underfundedTradeMonitorID     int
-	underfundedTradeMonitorNotice string
-	shortageMonitorID             int
-	shortageMonitorActive         bool
-	shortageMonitorDeadline       time.Time
-	lastTradeOpenData             string
-	lastTradeOpen                 string
-	tradeOpen                     bool
-	isPokerRolling                bool
-	isTriRolling                  bool
-	isBJRolling                   bool
-	is13Rolling                   bool
-	is13Hitting                   bool
-	isHitting                     bool
-	isClosing                     bool
-	ChatIsDisabled                bool
-	mutex                         sync.Mutex
-	resultsWaitGroup              sync.WaitGroup
-	rollDelay                     = 550 * time.Millisecond
-	stripNextDelay                = 2250 * time.Millisecond
-	stripGetNewPayload            = "new"
-	stripGetNextPayload           = "next"
-	tradeUserPattern              = regexp.MustCompile(`\[(\d+)\]`)
-	stripItemNameRe               = regexp.MustCompile(`(?:CF_\d+_[a-z][a-z_]*|[a-z][a-z0-9_]*_[a-z0-9_]+)(?:\*\d+)?`)
-	gameChoiceCleanupRe           = regexp.MustCompile(`[^a-z0-9]+`)
-	roomEntities                  = map[int]room.Entity{}
-	roomMu                        sync.Mutex
-	lastRoomUsersRequestAt        time.Time
-	roomUsersReqMu                sync.Mutex
-	users28ByToken                = map[string]string{}
-	users28ByIndex                = map[int]string{} // roomIndex -> name
-	users28ByShortToken           = map[string]string{}
-	roomIdentityByShortToken      = map[string]RoomIdentityEntry{}
-	users28Mu                     sync.Mutex
-	headerSniffUntil              time.Time
-	headerSniffSeen               = map[uint16]bool{}
-	headerSniffMu                 sync.Mutex
-	currentTradeItems             []TradeItem
-	currentOwnTradeItems          []TradeItem
-	tradeItemsMu                  sync.Mutex
-	lastAddItemWasOurs            bool
+	payoutResponseTimeoutMonitorID int
+	payoutResponseTimeoutActive    bool
+	payoutResponseTimeoutAttempts  int
+	payoutCancelCount              int
+	underfundedTradeMonitorID      int
+	underfundedTradeMonitorNotice  string
+	shortageMonitorID              int
+	shortageMonitorActive          bool
+	shortageMonitorDeadline        time.Time
+	lastTradeOpenData              string
+	lastTradeOpen                  string
+	tradeOpen                      bool
+	isPokerRolling                 bool
+	isTriRolling                   bool
+	isBJRolling                    bool
+	is13Rolling                    bool
+	is13Hitting                    bool
+	isHitting                      bool
+	isClosing                      bool
+	ChatIsDisabled                 bool
+	mutex                          sync.Mutex
+	resultsWaitGroup               sync.WaitGroup
+	rollDelay                      = 550 * time.Millisecond
+	stripNextDelay                 = 2250 * time.Millisecond
+	stripGetNewPayload             = "new"
+	stripGetNextPayload            = "next"
+	tradeUserPattern               = regexp.MustCompile(`\[(\d+)\]`)
+	stripItemNameRe                = regexp.MustCompile(`(?:CF_\d+_[a-z][a-z_]*|[a-z][a-z0-9_]*_[a-z0-9_]+)(?:\*\d+)?`)
+	gameChoiceCleanupRe            = regexp.MustCompile(`[^a-z0-9]+`)
+	roomEntities                   = map[int]room.Entity{}
+	roomMu                         sync.Mutex
+	lastRoomUsersRequestAt         time.Time
+	roomUsersReqMu                 sync.Mutex
+	users28ByToken                 = map[string]string{}
+	users28ByIndex                 = map[int]string{} // roomIndex -> name
+	users28ByShortToken            = map[string]string{}
+	roomIdentityByShortToken       = map[string]RoomIdentityEntry{}
+	users28Mu                      sync.Mutex
+	headerSniffUntil               time.Time
+	headerSniffSeen                = map[uint16]bool{}
+	headerSniffMu                  sync.Mutex
+	currentTradeItems              []TradeItem
+	currentOwnTradeItems           []TradeItem
+	tradeItemsMu                   sync.Mutex
+	lastAddItemWasOurs             bool
 	// lastAddItemByUsAt records when we observed an outgoing TRADE_ADDITEM
 	// packet. Use this timestamp in debugging to detect races between the
 	// outgoing add and the subsequent server TRADE_ITEMS update.
@@ -841,9 +841,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 	// TRADE_CONFIRM incoming 111 - wait 4 seconds then send TRADE_CONFIRM_ACCEPT (402)
 	if e.Packet.Header.Value == 111 {
-		if payoutTradeActive {
-			stopPayoutAcceptTimeoutMonitor()
-		}
 		scheduleAutoTradeConfirm(a, string(e.Packet.Data))
 		return
 	}
@@ -1004,7 +1001,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		tradeAutoConfirmed = true
 		tradeAutoConfirmPending = false
 		if payoutTradeActive {
-			stopPayoutAcceptTimeoutMonitor()
+			stopPayoutResponseTimeoutMonitor()
 			resetPayoutRetryState()
 			tradeItemsMu.Lock()
 			payoutItems := cloneTradeItems(currentOwnTradeItems)
@@ -1114,7 +1111,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				log.Printf("[PAYOUT] trade opened successfully with %s, proceeding", savedPayoutTargetName)
 				// Fall through to normal trade-open handling below
 				go a.autoAddPayoutItems()
-				go a.startPayoutAcceptTimeoutMonitor(savedPayoutTargetName, savedPayoutTargetID, savedPayoutTargetName)
+				go a.startPayoutResponseTimeoutMonitor(savedPayoutTargetName, savedPayoutTargetID, savedPayoutTargetName)
 			} else {
 				// Someone else opened a trade with us during payout — block it
 				a.AddLogMsg(fmt.Sprintf("[PAYOUT] incoming trade blocked during payout to %s, closing", payoutTargetName))
@@ -1403,7 +1400,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				retryTargetID := payoutTargetID
 				retryTargetName := payoutTargetName
 				payoutTradeActive = false
-				stopPayoutAcceptTimeoutMonitor()
+				stopPayoutResponseTimeoutMonitor()
 
 				payoutCancelCount++
 
@@ -1436,7 +1433,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			payoutTradeActive = false
 			a.AddLogMsg("[PAYOUT] payout trade completed successfully")
 			log.Printf("[PAYOUT] payout trade completed successfully")
-			stopPayoutAcceptTimeoutMonitor()
+			stopPayoutResponseTimeoutMonitor()
 			resetPayoutRetryState()
 			a.noteCurrentGameHistory("Dealer payout flow finished successfully")
 
@@ -1523,14 +1520,14 @@ func stopPayout() {
 	payoutActualAddCount = 0
 }
 
-func stopPayoutAcceptTimeoutMonitor() {
-	payoutAcceptTimeoutMonitorID++
-	payoutAcceptTimeoutActive = false
+func stopPayoutResponseTimeoutMonitor() {
+	payoutResponseTimeoutMonitorID++
+	payoutResponseTimeoutActive = false
 }
 
 func resetPayoutRetryState() {
-	stopPayoutAcceptTimeoutMonitor()
-	payoutAcceptTimeoutAttempts = 0
+	stopPayoutResponseTimeoutMonitor()
+	payoutResponseTimeoutAttempts = 0
 	payoutCancelCount = 0
 }
 
@@ -1539,7 +1536,7 @@ func resumeDealerAfterPayoutIssue(a *App, reason string) {
 	log.Printf("[PAYOUT] resuming dealer after payout issue: %s", reason)
 
 	stopPayout()
-	stopPayoutAcceptTimeoutMonitor()
+	stopPayoutResponseTimeoutMonitor()
 
 	awaitingTradeOpen = true
 	if canAnnounceDealerOpen() {
@@ -1549,25 +1546,25 @@ func resumeDealerAfterPayoutIssue(a *App, reason string) {
 	startDealerOpenHeartbeat(a)
 }
 
-func (a *App) startPayoutAcceptTimeoutMonitor(playerName string, targetID int, targetName string) {
-	stopPayoutAcceptTimeoutMonitor()
+func (a *App) startPayoutResponseTimeoutMonitor(playerName string, targetID int, targetName string) {
+	stopPayoutResponseTimeoutMonitor()
 
-	payoutAcceptTimeoutMonitorID++
-	monitorID := payoutAcceptTimeoutMonitorID
-	payoutAcceptTimeoutActive = true
+	payoutResponseTimeoutMonitorID++
+	monitorID := payoutResponseTimeoutMonitorID
+	payoutResponseTimeoutActive = true
 
 	go func(id int, player string, retryTargetID int, retryTargetName string) {
 		time.Sleep(30 * time.Second)
 
-		if id != payoutAcceptTimeoutMonitorID || !payoutAcceptTimeoutActive || !payoutTradeActive {
+		if id != payoutResponseTimeoutMonitorID || !payoutResponseTimeoutActive || !payoutTradeActive {
 			return
 		}
 
-		payoutAcceptTimeoutActive = false
-		payoutAcceptTimeoutAttempts++
+		payoutResponseTimeoutActive = false
+		payoutResponseTimeoutAttempts++
 
-		a.AddLogMsg(fmt.Sprintf("[PAYOUT_TIMEOUT] payout accept timeout %d/3 for %s", payoutAcceptTimeoutAttempts, player))
-		log.Printf("[PAYOUT_TIMEOUT] payout accept timeout %d/3 for %s", payoutAcceptTimeoutAttempts, player)
+		a.AddLogMsg(fmt.Sprintf("[PAYOUT_TIMEOUT] payout response timeout %d/3 for %s", payoutResponseTimeoutAttempts, player))
+		log.Printf("[PAYOUT_TIMEOUT] payout response timeout %d/3 for %s", payoutResponseTimeoutAttempts, player)
 
 		timeoutMsg := fmt.Sprintf("%q did not accept trade", player)
 		ext.Send(out.SHOUT, timeoutMsg)
@@ -1575,7 +1572,7 @@ func (a *App) startPayoutAcceptTimeoutMonitor(playerName string, targetID int, t
 		time.Sleep(1200 * time.Millisecond)
 		ext.Send(out.TRADE_CLOSE)
 
-		if payoutAcceptTimeoutAttempts >= 3 {
+		if payoutResponseTimeoutAttempts >= 3 {
 			flagMsg := "We have flagged the issues, Please go to our discord to resolve."
 			time.Sleep(1200 * time.Millisecond)
 			ext.Send(out.SHOUT, flagMsg)
@@ -1585,7 +1582,7 @@ func (a *App) startPayoutAcceptTimeoutMonitor(playerName string, targetID int, t
 				true,
 			)
 
-			resumeDealerAfterPayoutIssue(a, "payout accept timeout")
+			resumeDealerAfterPayoutIssue(a, "payout response timeout")
 			return
 		}
 

@@ -172,6 +172,7 @@ var (
 	dealerOpenHeartbeatActive  bool
 	gameChoiceTimeoutMonitorID int
 	gameChoiceTimeoutActive    bool
+	gameChoiceUnreadableWarned bool
 	dealerResyncInProgress     bool
 	// When true, the UI has enabled dice setup mode and incoming dice IDs
 	// should be recorded for the bot setup. Must be enabled by the Start Casino
@@ -1165,6 +1166,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		}
 
 		awaitingGameChoice = false
+		gameChoiceUnreadableWarned = false
 		awaitingGameChoicePartnerID = 0
 		awaitingGameChoicePartnerName = ""
 		pokerSequenceStage = 0
@@ -2022,7 +2024,7 @@ func (a *App) startGameChoiceTimeoutMonitor() {
 			return
 		}
 
-		reminder := "Say Poker, 21, 13 or Tri"
+		reminder := "Shout Poker, 21, 13, Tri"
 		a.AddLogMsg(fmt.Sprintf("[GAME_CHOICE_TIMEOUT] 30s no response, repeating prompt for %s", player))
 		log.Printf("[GAME_CHOICE_TIMEOUT] 30s no response, repeating prompt for %s", player)
 		ext.Send(out.SHOUT, reminder)
@@ -2036,6 +2038,7 @@ func (a *App) startGameChoiceTimeoutMonitor() {
 
 		// Final timeout hit
 		awaitingGameChoice = false
+		gameChoiceUnreadableWarned = false
 		awaitingGameChoicePartnerID = 0
 		awaitingGameChoicePartnerName = ""
 		gameChoiceTimeoutActive = false
@@ -2583,6 +2586,7 @@ func (a *App) resetDealerSessionState(reason string) {
 	awaitingTradeOpen = false
 	dealerTradeWindowOpen = false
 	awaitingGameChoice = false
+	gameChoiceUnreadableWarned = false
 	awaitingGameChoicePartnerID = 0
 	awaitingGameChoicePartnerName = ""
 	lastTradePartnerID = 0
@@ -3263,6 +3267,7 @@ func (a *App) reopenDealerIdle(reason string) {
 	a.ClearTradeItems()
 
 	awaitingGameChoice = false
+	gameChoiceUnreadableWarned = false
 	awaitingGameChoicePartnerID = 0
 	awaitingGameChoicePartnerName = ""
 	lastTradePartnerID = 0
@@ -3977,8 +3982,9 @@ func (a *App) sendTradeCompletionMessage() {
 	a.beginGameHistory(partnerName, gameBetItems)
 
 	first := fmt.Sprintf("%s what game do you want to play?", partnerName)
-	second := "Say Poker, 21, 13 or Tri"
+	second := "Shout Poker, 21, 13, Tri"
 	awaitingGameChoice = true
+	gameChoiceUnreadableWarned = false
 	awaitingGameChoicePartnerName = strings.TrimSpace(lastTradePartnerName)
 	// Prefer the live room entity index for chat sender matching.
 	// USERS28 indices are often larger room ids and can differ from chat indices.
@@ -5062,6 +5068,7 @@ func (a *App) StopCasinoSetup() {
 
 	// Clear any awaiting game choice and last partner info so app behaves like fresh start
 	awaitingGameChoice = false
+	gameChoiceUnreadableWarned = false
 	awaitingGameChoicePartnerID = 0
 	awaitingGameChoicePartnerName = ""
 	lastTradePartnerID = 0
@@ -6125,6 +6132,27 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 
 	choice, ok := normalizeIncomingGameChoice(msg)
 	if !ok {
+		// If the message is still readable despite punctuation/spaces, accept it.
+		if looseChoice, looseOK := normalizeLooseGameChoice(msg); looseOK {
+			choice = looseChoice
+			ok = true
+		} else if looksLikeUnreadableGameChoiceAttempt(msg) {
+			playerName := strings.TrimSpace(awaitingGameChoicePartnerName)
+			if playerName == "" {
+				playerName = strings.TrimSpace(lastTradePartnerName)
+			}
+			if playerName == "" {
+				playerName = "Player"
+			}
+
+			if !gameChoiceUnreadableWarned {
+				gameChoiceUnreadableWarned = true
+				warn := fmt.Sprintf("%q Please shout, I can not hear you.", playerName)
+				a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] unreadable game choice from %s: %q", playerName, msg))
+				log.Printf("[GAME_SELECT] unreadable game choice from %s: %q", playerName, msg)
+				ext.Send(out.SHOUT, warn)
+			}
+		}
 		return
 	}
 
@@ -6203,6 +6231,7 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 	// Stop the game choice timeout monitor — player has responded.
 	stopGameChoiceTimeoutMonitor()
 	awaitingGameChoice = false
+	gameChoiceUnreadableWarned = false
 	awaitingGameChoicePartnerID = 0
 	awaitingGameChoicePartnerName = ""
 
@@ -6270,6 +6299,85 @@ func normalizeIncomingGameChoice(msg string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func normalizeLooseGameChoice(msg string) (string, bool) {
+	cleaned := strings.ToLower(strings.TrimSpace(msg))
+	if cleaned == "" {
+		return "", false
+	}
+
+	// keep only letters and digits
+	var compact strings.Builder
+	for _, r := range cleaned {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			compact.WriteRune(r)
+		}
+	}
+	value := compact.String()
+
+	switch value {
+	case "poker":
+		return "poker", true
+	case "21":
+		return "21", true
+	case "13":
+		return "13", true
+	case "tri":
+		return "tri", true
+	case "trihigh":
+		return "trihigh", true
+	case "trilow":
+		return "trilow", true
+	default:
+		return "", false
+	}
+}
+
+func looksLikeUnreadableGameChoiceAttempt(msg string) bool {
+	cleaned := strings.ToLower(strings.TrimSpace(msg))
+	if cleaned == "" {
+		return false
+	}
+
+	// If the normal parser already understands it, do not warn.
+	if _, ok := normalizeIncomingGameChoice(cleaned); ok {
+		return false
+	}
+
+	// If the loose parser understands it, it means the text is still readable enough.
+	// Example: "p.o.k.e.r" or "t r i" should still be accepted, not warned.
+	if _, ok := normalizeLooseGameChoice(cleaned); ok {
+		return false
+	}
+
+	// Detect broken whisper-like fragments such as p..k..r or t..i
+	hasDots := strings.Contains(cleaned, ".")
+	hasGameHints :=
+		strings.Contains(cleaned, "p") ||
+			strings.Contains(cleaned, "k") ||
+			strings.Contains(cleaned, "r") ||
+			strings.Contains(cleaned, "t") ||
+			strings.Contains(cleaned, "i") ||
+			strings.Contains(cleaned, "2") ||
+			strings.Contains(cleaned, "1")
+
+	if hasDots && hasGameHints {
+		return true
+	}
+
+	// Broken short fragments that are clearly attempts but unreadable
+	compact := gameChoiceCleanupRe.ReplaceAllString(cleaned, "")
+	if compact == "" {
+		return false
+	}
+	if len(compact) <= 4 {
+		if strings.ContainsAny(compact, "pkrti") || compact == "2" || compact == "1" {
+			return true
+		}
+	}
+
+	return false
 }
 
 func normalizeBlackjackDecision(msg string) (string, bool) {

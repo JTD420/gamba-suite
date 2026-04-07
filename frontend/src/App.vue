@@ -54,7 +54,24 @@
         </div>
       </div>
 
-      <div class="game-guide-modal-backdrop" v-if="activeGameGuide" @click="closeGameGuide">
+        <div class="dealer-name-modal-backdrop" v-if="showDealerNameModal" @click="showDealerNameModal = false">
+          <div class="game-guide-modal dealer-name-modal" @click.stop>
+            <div class="game-guide-header">
+              <h3 class="section-title game-guide-title">Enter your Habbo name</h3>
+              <button type="button" class="copy-btn" @click="cancelDealerName">Close</button>
+            </div>
+            <p class="game-guide-text">This name will be shown on the live dashboard as the dealer. Please enter your Habbo username.</p>
+            <div class="game-guide-block">
+              <input v-model="dealerNameInput" type="text" placeholder="Your Habbo username" style="width:100%;padding:8px;border-radius:4px;border:1px solid #ccc;" />
+            </div>
+            <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px;">
+              <button class="copy-btn" @click="cancelDealerName">Cancel</button>
+              <button class="copy-btn" @click="confirmDealerName">Start</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="game-guide-modal-backdrop" v-if="activeGameGuide" @click="closeGameGuide">
         <div class="game-guide-modal" @click.stop>
           <div class="game-guide-header">
             <h3 class="section-title game-guide-title">{{ activeGameGuide.title }}</h3>
@@ -622,6 +639,8 @@ export default {
       selectedHistory: null,
       showClearHistoryConfirm: false,
       showDiceSetupModal: false,
+      showDealerNameModal: false,
+      dealerNameInput: '',
       diceSetup: [],
       casinoStatus: 'Stopped',
       casinoStatusKey: 'stopped',
@@ -744,19 +763,42 @@ export default {
       async startCasino() {
         try {
           if (this.casinoStatusKey === 'stopped') {
-            await window.go.main.App.StartCasinoSetup();
-            this.diceSetup = Array.from({ length: 5 }).map(() => ({ rolled: false, id: 0, value: 0 }));
-            this.showDiceSetupModal = true;
-            this.casinoStatus = 'Awaiting dice rolls';
-            this.casinoStatusKey = 'awaiting';
-            this.addLogMsg('[UI] Dice setup started; roll all 5 dice');
-          } else {
-            this.addLogMsg('[UI] Casino already started');
+            this.dealerNameInput = '';
+            this.showDealerNameModal = true;
+            return;
           }
+          this.addLogMsg('[UI] Casino already started');
         } catch (err) {
           this.addLogMsg('[UI] Failed to start dice setup');
           console.error(err);
         }
+      },
+
+      async confirmDealerName() {
+        try {
+          const name = (this.dealerNameInput || '').trim();
+          if (!name) {
+            this.addLogMsg('[UI] Start cancelled: no dealer name provided');
+            this.showDealerNameModal = false;
+            return;
+          }
+          await window.go.main.App.StartCasinoSetup(name);
+          this.showDealerNameModal = false;
+          this.diceSetup = Array.from({ length: 5 }).map(() => ({ rolled: false, id: 0, value: 0 }));
+          this.showDiceSetupModal = true;
+          this.casinoStatus = 'Awaiting dice rolls';
+          this.casinoStatusKey = 'awaiting';
+          this.addLogMsg('[UI] Dice setup started; roll all 5 dice');
+        } catch (err) {
+          this.addLogMsg('[UI] Failed to start dice setup');
+          console.error(err);
+          this.showDealerNameModal = false;
+        }
+      },
+
+      cancelDealerName() {
+        this.showDealerNameModal = false;
+        this.addLogMsg('[UI] Start cancelled by user');
       },
 
       // pause/resume removed — simplified start/stop control
@@ -1257,6 +1299,38 @@ input[type="text"]::placeholder {
   border: 1px solid #444;
   border-radius: 10px;
   padding: 18px;
+}
+
+/* Dealer name modal overrides to ensure it fits small windows */
+.dealer-name-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  z-index: 1000;
+  overflow: auto;
+}
+
+.dealer-name-modal {
+  width: min(560px, 100%);
+  max-width: 96vw;
+  max-height: calc(100vh - 48px);
+  background: #141414;
+  border: 1px solid #444;
+  border-radius: 10px;
+  padding: 16px;
+  box-sizing: border-box;
+  overflow-y: auto;
+}
+
+/* Ensure general modals don't overflow viewport */
+.game-guide-modal, .dice-setup-modal {
+  max-height: calc(100vh - 48px);
+  box-sizing: border-box;
+  overflow-y: auto;
 }
 
 .dice-setup-modal {

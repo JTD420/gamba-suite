@@ -253,6 +253,7 @@ type App struct {
 	gameHistoryMu        sync.Mutex
 	currentGameHistoryID string
 	ctx                  context.Context
+	currentDealerName    string
 }
 
 type PokerDisplayConfig struct {
@@ -272,6 +273,24 @@ func NewApp(ext *g.Ext, assets embed.FS) *App {
 		ext:    ext,
 		assets: assets,
 	}
+}
+
+// getCurrentDealerName returns the configured dealer name, preferring an
+// explicitly set value on the App instance, then environment overrides,
+// then a sensible default.
+func (a *App) getCurrentDealerName() string {
+	if a != nil {
+		if n := strings.TrimSpace(a.currentDealerName); n != "" {
+			return n
+		}
+	}
+	if v := os.Getenv("LIVE_SYNC_DEALER_NAME"); v != "" {
+		return v
+	}
+	if v := os.Getenv("USERNAME"); v != "" {
+		return v
+	}
+	return "Dealer"
 }
 
 func (a *App) startup(ctx context.Context) {
@@ -513,22 +532,37 @@ func (a *App) emitGameHistoryUpdate() {
 	runtime.EventsEmit(a.ctx, "gameHistoryUpdate", string(jsonData))
 }
 
-func (a *App) syncGameHistoryLocked() {
-	a.saveGameHistoryLocked()
+func (a *App) syncGameHistory() {
+	a.AddLogMsg("[GAME_HISTORY] syncGameHistory start")
+
+	// Save a copy of the history to disk without holding the mutex while
+	// performing heavier work (like emitting stats which may re-lock).
+	a.gameHistoryMu.Lock()
+	jsonData, err := json.MarshalIndent(a.gameHistory, "", "  ")
+	a.gameHistoryMu.Unlock()
+	if err == nil {
+		_ = os.WriteFile(getGameHistoryFilePath(), jsonData, 0600)
+	}
+
 	if a.ctx == nil {
+		a.AddLogMsg("[GAME_HISTORY] syncGameHistory no runtime context, done")
 		return
 	}
-	jsonData, err := json.Marshal(a.gameHistory)
-	if err != nil {
-		return
+
+	a.gameHistoryMu.Lock()
+	historyJSON, err := json.Marshal(a.gameHistory)
+	a.gameHistoryMu.Unlock()
+	if err == nil {
+		runtime.EventsEmit(a.ctx, "gameHistoryUpdate", string(historyJSON))
+		a.AddLogMsg("[GAME_HISTORY] syncGameHistory emitted history update")
 	}
-	runtime.EventsEmit(a.ctx, "gameHistoryUpdate", string(jsonData))
-	// Emit computed casino stats for UI convenience
-	// All-time stats
+
+	// Emit computed casino stats for UI convenience. These functions lock
+	// gameHistoryMu internally, so ensure we are not holding it here.
 	if stats := a.GetCasinoStatsJSON("all_time"); stats != "{}" {
 		runtime.EventsEmit(a.ctx, "casinoStatsUpdate", stats)
+		a.AddLogMsg("[GAME_HISTORY] syncGameHistory emitted stats update")
 	}
-	// Today stats (useful for live dashboard)
 	if statsT := a.GetCasinoStatsJSON("today"); statsT != "{}" {
 		runtime.EventsEmit(a.ctx, "casinoStatsUpdateToday", statsT)
 	}
@@ -557,8 +591,8 @@ func (a *App) updateCurrentGameHistoryLocked(update func(entry *GameHistoryEntry
 }
 
 func (a *App) beginGameHistory(playerName string, betItems []TradeItem) {
+	a.AddLogMsg("[GAME_HISTORY] beginGameHistory start")
 	a.gameHistoryMu.Lock()
-	defer a.gameHistoryMu.Unlock()
 
 	if a.updateCurrentGameHistoryLocked(func(entry *GameHistoryEntry) {
 		if entry.CompletedAt == "" {
@@ -590,36 +624,47 @@ func (a *App) beginGameHistory(playerName string, betItems []TradeItem) {
 
 	a.gameHistory = append([]GameHistoryEntry{entry}, a.gameHistory...)
 	a.currentGameHistoryID = entry.ID
-	a.syncGameHistoryLocked()
+	a.AddLogMsg("[GAME_HISTORY] beginGameHistory mutation complete")
+	a.gameHistoryMu.Unlock()
+	a.AddLogMsg("[GAME_HISTORY] beginGameHistory unlocked, syncing")
+	a.syncGameHistory()
 }
 
 func (a *App) noteCurrentGameHistory(note string) {
+	a.AddLogMsg("[GAME_HISTORY] noteCurrentGameHistory start")
 	a.gameHistoryMu.Lock()
-	defer a.gameHistoryMu.Unlock()
 	if !a.updateCurrentGameHistoryLocked(func(entry *GameHistoryEntry) {
 		entry.Notes = append(entry.Notes, note)
 	}) {
+		a.gameHistoryMu.Unlock()
 		return
 	}
-	a.syncGameHistoryLocked()
+	a.AddLogMsg("[GAME_HISTORY] noteCurrentGameHistory mutation complete")
+	a.gameHistoryMu.Unlock()
+	a.AddLogMsg("[GAME_HISTORY] noteCurrentGameHistory unlocked, syncing")
+	a.syncGameHistory()
 }
 
 func (a *App) setCurrentGameHistoryGame(game string) {
+	a.AddLogMsg("[GAME_HISTORY] setCurrentGameHistoryGame start")
 	a.gameHistoryMu.Lock()
-	defer a.gameHistoryMu.Unlock()
 	if !a.updateCurrentGameHistoryLocked(func(entry *GameHistoryEntry) {
 		entry.Game = game
 		entry.Status = "In Progress"
 		entry.Notes = append(entry.Notes, fmt.Sprintf("Game selected: %s", game))
 	}) {
+		a.gameHistoryMu.Unlock()
 		return
 	}
-	a.syncGameHistoryLocked()
+	a.AddLogMsg("[GAME_HISTORY] setCurrentGameHistoryGame mutation complete")
+	a.gameHistoryMu.Unlock()
+	a.AddLogMsg("[GAME_HISTORY] setCurrentGameHistoryGame unlocked, syncing")
+	a.syncGameHistory()
 }
 
 func (a *App) setCurrentGameHistoryResults(playerResult string, dealerResult string, winner string, status string, complete bool) {
+	a.AddLogMsg("[GAME_HISTORY] setCurrentGameHistoryResults start")
 	a.gameHistoryMu.Lock()
-	defer a.gameHistoryMu.Unlock()
 	if !a.updateCurrentGameHistoryLocked(func(entry *GameHistoryEntry) {
 		if strings.TrimSpace(playerResult) != "" {
 			entry.PlayerResult = playerResult
@@ -637,17 +682,21 @@ func (a *App) setCurrentGameHistoryResults(playerResult string, dealerResult str
 			entry.CompletedAt = gameHistoryTimestamp()
 		}
 	}) {
+		a.gameHistoryMu.Unlock()
 		return
 	}
 	if complete {
 		a.currentGameHistoryID = ""
 	}
-	a.syncGameHistoryLocked()
+	a.AddLogMsg("[GAME_HISTORY] setCurrentGameHistoryResults mutation complete")
+	a.gameHistoryMu.Unlock()
+	a.AddLogMsg("[GAME_HISTORY] setCurrentGameHistoryResults unlocked, syncing")
+	a.syncGameHistory()
 }
 
 func (a *App) markCurrentGameHistoryIssue(reason string, complete bool) {
+	a.AddLogMsg("[GAME_HISTORY] markCurrentGameHistoryIssue start")
 	a.gameHistoryMu.Lock()
-	defer a.gameHistoryMu.Unlock()
 	if !a.updateCurrentGameHistoryLocked(func(entry *GameHistoryEntry) {
 		entry.Issue = true
 		entry.IssueReason = reason
@@ -657,17 +706,21 @@ func (a *App) markCurrentGameHistoryIssue(reason string, complete bool) {
 			entry.CompletedAt = gameHistoryTimestamp()
 		}
 	}) {
+		a.gameHistoryMu.Unlock()
 		return
 	}
 	if complete {
 		a.currentGameHistoryID = ""
 	}
-	a.syncGameHistoryLocked()
+	a.AddLogMsg("[GAME_HISTORY] markCurrentGameHistoryIssue mutation complete")
+	a.gameHistoryMu.Unlock()
+	a.AddLogMsg("[GAME_HISTORY] markCurrentGameHistoryIssue unlocked, syncing")
+	a.syncGameHistory()
 }
 
 func (a *App) captureCurrentGameHistoryPayoutItems(items []TradeItem, note string, complete bool) {
+	a.AddLogMsg("[GAME_HISTORY] captureCurrentGameHistoryPayoutItems start")
 	a.gameHistoryMu.Lock()
-	defer a.gameHistoryMu.Unlock()
 	if !a.updateCurrentGameHistoryLocked(func(entry *GameHistoryEntry) {
 		entry.PayoutItems = cloneTradeItems(items)
 		if strings.TrimSpace(note) != "" {
@@ -678,12 +731,16 @@ func (a *App) captureCurrentGameHistoryPayoutItems(items []TradeItem, note strin
 			entry.CompletedAt = gameHistoryTimestamp()
 		}
 	}) {
+		a.gameHistoryMu.Unlock()
 		return
 	}
 	if complete {
 		a.currentGameHistoryID = ""
 	}
-	a.syncGameHistoryLocked()
+	a.AddLogMsg("[GAME_HISTORY] captureCurrentGameHistoryPayoutItems mutation complete")
+	a.gameHistoryMu.Unlock()
+	a.AddLogMsg("[GAME_HISTORY] captureCurrentGameHistoryPayoutItems unlocked, syncing")
+	a.syncGameHistory()
 }
 
 func (a *App) setupExt() {
@@ -1321,6 +1378,9 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		if !strictTradeSnapshotLifecycle {
 			tradeHandSnapshot = []TradeItem{}
 			tradeHandSnapshotReady = false
+			// Diagnostic: explicit log when non-strict lifecycle clears snapshot
+			a.AddLogMsg("[TRADE_HAND_SNAPSHOT] cleared snapshot due to non-strict lifecycle on TRADE_OPEN")
+			log.Printf("[TRADE_HAND_SNAPSHOT] cleared snapshot due to non-strict lifecycle on TRADE_OPEN")
 		}
 		handItemsMu.Unlock()
 
@@ -3243,13 +3303,11 @@ func (a *App) ClearTradeItems() {
 	tradeItemsMu.Unlock()
 
 	handItemsMu.Lock()
-	// Always clear any frozen trade-hand snapshot when trades are cleared.
-	// Keeping stale snapshots across rounds was causing reopened dealer
-	// sessions to operate on old hand state. Reset snapshot unconditionally
-	// so the next reopen must build a fresh one.
-	tradeHandSnapshot = nil
-	tradeHandSnapshotReady = false
-	// Mark trade as closed so periodic/rescans may resume normally.
+	// Keep the last frozen hand snapshot alive. The trade-open guard
+	// requires a dealer snapshot to be present while reopening dealer.
+	// Only mark the live trade as closed; do NOT clear
+	// tradeHandSnapshot or tradeHandSnapshotReady here to avoid a race
+	// where a quick TRADE_OPEN arrives before a fresh snapshot is built.
 	tradeOpen = false
 	handItemsMu.Unlock()
 
@@ -3338,6 +3396,7 @@ func (a *App) requestPlayerStrip(force bool) int {
 }
 
 func waitForStripScanCompletion(sessionID int, timeout time.Duration) bool {
+	log.Printf("[STRIP_WAIT] waiting for strip scan completion session=%d timeout=%s", sessionID, timeout)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		stripScanMu.Lock()
@@ -3346,14 +3405,22 @@ func waitForStripScanCompletion(sessionID int, timeout time.Duration) bool {
 		stripScanMu.Unlock()
 
 		if current > sessionID {
+			log.Printf("[STRIP_WAIT] session=%d complete: scan advanced current=%d", sessionID, current)
 			return true
 		}
 		if current == sessionID && !active {
+			log.Printf("[STRIP_WAIT] session=%d complete: scan finished (active=false)", sessionID)
 			return true
 		}
 
 		time.Sleep(150 * time.Millisecond)
 	}
+
+	stripScanMu.Lock()
+	active := stripScanActive
+	current := stripScanSessionID
+	stripScanMu.Unlock()
+	log.Printf("[STRIP_WAIT] timeout waiting for session=%d (current=%d active=%t)", sessionID, current, active)
 	return false
 }
 
@@ -3501,6 +3568,31 @@ func restoreDice(snap []*Dice) {
 // openDealerAfterRound syncs the hand and reopens dealer trades after a clean game result.
 // Unlike resyncHandThenOpenDealer it does NOT mark a game-history issue.
 func (a *App) openDealerAfterRound() {
+	// Stop background monitors and heartbeats first so reopen runs on a
+	// clean slate.
+	stopDealerOpenHeartbeat()
+	stopGameChoiceTimeoutMonitor()
+	stopTradeWindowTimeoutMonitor()
+	stopShortageMonitor()
+	stopUnderfundedTradeMonitor()
+
+	// Reset all auto-flow and per-game sequences so dealerGameActive()
+	// will reliably report inactive.
+	resetTradeAutoFlow()
+	resetPokerSequence()
+	resetBlackjackSequence()
+	reset13Sequence()
+	resetTriSequence()
+
+	// Clear any incoming game-choice state.
+	awaitingGameChoice = false
+	gameChoiceUnreadableWarned = false
+	awaitingGameChoicePartnerID = 0
+	awaitingGameChoicePartnerName = ""
+
+	// Optional: clear visible trade items (but keep frozen snapshot).
+	a.ClearTradeItems()
+
 	dealerResyncInProgress = true
 	requestRoomUsers(a)
 
@@ -3883,6 +3975,7 @@ func (a *App) sendLiveDealerSnapshot(items []TradeItem) {
 			"snapshot":      snapshot,
 			"tradeOpen":     tradeOpen,
 			"snapshotReady": tradeHandSnapshotReady,
+			"currentPlayer": a.getCurrentDealerName(),
 		}
 
 		jb, err := json.Marshal(payload)
@@ -3921,6 +4014,55 @@ func (a *App) sendLiveDealerSnapshot(items []TradeItem) {
 	}(items)
 }
 
+// sendLiveDealerStatus posts a compact status update (dealer open, dealer name)
+// to the configured live-dealer webhook. Runs asynchronously and logs status.
+func (a *App) sendLiveDealerStatus(open bool, dealerName string) {
+	go func(dealerOpen bool, name string) {
+		payload := map[string]interface{}{
+			"dealerOpen":    dealerOpen,
+			"tradeOpen":     tradeOpen,
+			"gameActive":    dealerGameActive(),
+			"snapshotReady": tradeHandSnapshotReady,
+			"updatedAt":     time.Now().UTC().Format(time.RFC3339),
+			"currentPlayer": strings.TrimSpace(name),
+		}
+
+		jb, err := json.Marshal(payload)
+		if err != nil {
+			a.AddLogMsg("[LIVE_DEALER_STATUS] webhook marshal error: " + err.Error())
+			return
+		}
+
+		url := os.Getenv("LIVE_SYNC_URL")
+		if url == "" {
+			url = "http://localhost:3000/api/live-dealer"
+		}
+
+		req, err := http.NewRequest("POST", url, bytes.NewReader(jb))
+		if err != nil {
+			a.AddLogMsg("[LIVE_DEALER_STATUS] webhook request error: " + err.Error())
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if secret := os.Getenv("LIVE_SYNC_SECRET"); secret != "" {
+			req.Header.Set("Authorization", "Bearer "+secret)
+		}
+
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			a.AddLogMsg("[LIVE_DEALER_STATUS] webhook POST error: " + err.Error())
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			a.AddLogMsg(fmt.Sprintf("[LIVE_DEALER_STATUS] webhook responded: %s %d", url, resp.StatusCode))
+		} else {
+			a.AddLogMsg("[LIVE_DEALER_STATUS] webhook sent to " + url)
+		}
+	}(open, dealerName)
+}
+
 func (a *App) captureTradeHandSnapshot() {
 	handItemsMu.Lock()
 	tradeHandSnapshot = make([]TradeItem, len(currentHandItems))
@@ -3938,6 +4080,8 @@ func (a *App) captureTradeHandSnapshot() {
 	joined := strings.Join(parts, ",")
 	a.AddLogMsg("[TRADE_HAND_SNAPSHOT] captured: " + joined)
 	log.Printf("[TRADE_HAND_SNAPSHOT] captured: %s", joined)
+	a.AddLogMsg(fmt.Sprintf("[TRADE_HAND_SNAPSHOT] ready=true (items=%d)", len(snapshot)))
+	log.Printf("[TRADE_HAND_SNAPSHOT] ready=true (items=%d)", len(snapshot))
 	// Send snapshot to configured live-dealer webhook (non-blocking)
 	a.sendLiveDealerSnapshot(snapshot)
 }
@@ -3950,12 +4094,16 @@ func (a *App) invalidateTradeHandSnapshot(reason string) {
 
 	a.AddLogMsg(fmt.Sprintf("[TRADE_HAND_SNAPSHOT] invalidated: %s", reason))
 	log.Printf("[TRADE_HAND_SNAPSHOT] invalidated: %s", reason)
+	a.AddLogMsg("[TRADE_HAND_SNAPSHOT] ready=false")
+	log.Printf("[TRADE_HAND_SNAPSHOT] ready=false")
 }
 
 func (a *App) forceRefreshHandSnapshot(reason string) bool {
 	a.invalidateTradeHandSnapshot(reason)
 
 	scanID := a.requestPlayerStrip(true)
+	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] forced strip requested session=%d reason=%s", scanID, reason))
+	log.Printf("[STRIP_DEBUG] forced strip requested session=%d reason=%s", scanID, reason)
 	if ok := waitForStripScanCompletion(scanID, 20*time.Second); !ok {
 		a.AddLogMsg(fmt.Sprintf("[TRADE_HAND_SNAPSHOT] forced hand sync timeout (session=%d reason=%s)", scanID, reason))
 		log.Printf("[TRADE_HAND_SNAPSHOT] forced hand sync timeout (session=%d reason=%s)", scanID, reason)
@@ -4178,7 +4326,9 @@ func (a *App) sendTradeCompletionMessage() {
 	if partnerName == "" || strings.EqualFold(partnerName, "Unknown") {
 		partnerName = "Player"
 	}
+	a.AddLogMsg("[TRADE_FLOW] calling beginGameHistory")
 	a.beginGameHistory(partnerName, gameBetItems)
+	a.AddLogMsg("[TRADE_FLOW] beginGameHistory returned")
 
 	first := fmt.Sprintf("%s what game do you want to play?", partnerName)
 	second := "Shout Poker, 21, 13, TriH, TriL"
@@ -5221,7 +5371,7 @@ func resetDiceState() {
 // StartCasinoSetup enables dice setup recording. This must be called from the frontend
 // when the user clicks the "Start Casino" button. It resets any existing dice and
 // enables recording of incoming dice IDs.
-func (a *App) StartCasinoSetup() {
+func (a *App) StartCasinoSetup(dealerName string) {
 	// Reset state first (this will lock/unlock internally)
 	resetDiceState()
 
@@ -5231,8 +5381,23 @@ func (a *App) StartCasinoSetup() {
 	casinoReady = false
 	mutex.Unlock()
 
+	// Resolve dealer name: prefer provided value, then env, then username.
+	name := strings.TrimSpace(dealerName)
+	if name == "" {
+		name = os.Getenv("LIVE_SYNC_DEALER_NAME")
+		if name == "" {
+			name = os.Getenv("USERNAME")
+			if name == "" {
+				name = "Dealer"
+			}
+		}
+	}
+	a.currentDealerName = name
+
 	a.AddLogMsg("[DICE_SETUP] Dice setup mode enabled - roll all 5 dice now")
 	a.emitDiceSetupUpdate()
+	// Notify dashboard that dealer (casino) is open.
+	a.sendLiveDealerStatus(true, name)
 }
 
 // PauseCasinoSetup temporarily disables dice setup recording without clearing
@@ -5286,6 +5451,11 @@ func (a *App) StopCasinoSetup() {
 
 	a.AddLogMsg("[DICE_SETUP] Dice setup stopped and application state cleared via UI")
 	a.emitDiceSetupUpdate()
+	// Notify dashboard that dealer (casino) is closed using stored name.
+	name := a.getCurrentDealerName()
+	a.sendLiveDealerStatus(false, name)
+	// Clear stored dealer name
+	a.currentDealerName = ""
 }
 
 // emitDiceSetupUpdate sends the current dice setup state to the frontend.

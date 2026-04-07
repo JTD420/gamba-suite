@@ -77,27 +77,33 @@ var (
 	thirteenHitInFlight           bool
 	thirteenNextHitIndex          int
 	// Tri (High / Low) state
-	awaitingTriChoice             bool
-	awaitingTriChoicePartnerID    int
-	awaitingTriChoicePartnerName  string
-	triRoundActive                bool
-	triPlayerTurn                 bool
-	triMode                       string // "high" or "low"
-	triPlayerTotal                int
-	triDealerTotal                int
-	triPlayerName                 string
-	pokerSequencePlayerName       string
-	pokerSequencePlayerResult     PokerHandResult
-	pokerSequencePlayerHand       string
-	payoutActive                  bool
-	payoutTradeActive             bool
-	payoutTargetID                int
-	payoutTargetName              string
-	payoutAttempts                int
-	payoutSessionID               int
-	payoutTradeSent               bool
-	payoutExpectedAddCount        int
-	payoutActualAddCount          int
+	awaitingTriChoice            bool
+	awaitingTriChoicePartnerID   int
+	awaitingTriChoicePartnerName string
+	triRoundActive               bool
+	triPlayerTurn                bool
+	triMode                      string // "high" or "low"
+	triPlayerTotal               int
+	triDealerTotal               int
+	triPlayerName                string
+	pokerSequencePlayerName      string
+	pokerSequencePlayerResult    PokerHandResult
+	pokerSequencePlayerHand      string
+	payoutActive                 bool
+	payoutTradeActive            bool
+	payoutTargetID               int
+	payoutTargetName             string
+	payoutAttempts               int
+	payoutSessionID              int
+	payoutTradeSent              bool
+	payoutExpectedAddCount       int
+	payoutActualAddCount         int
+
+	// Payout retry/monitor state
+	payoutAcceptTimeoutMonitorID  int
+	payoutAcceptTimeoutActive     bool
+	payoutAcceptTimeoutAttempts   int
+	payoutCancelCount             int
 	underfundedTradeMonitorID     int
 	underfundedTradeMonitorNotice string
 	shortageMonitorID             int
@@ -835,6 +841,9 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 	// TRADE_CONFIRM incoming 111 - wait 4 seconds then send TRADE_CONFIRM_ACCEPT (402)
 	if e.Packet.Header.Value == 111 {
+		if payoutTradeActive {
+			stopPayoutAcceptTimeoutMonitor()
+		}
 		scheduleAutoTradeConfirm(a, string(e.Packet.Data))
 		return
 	}
@@ -995,6 +1004,8 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		tradeAutoConfirmed = true
 		tradeAutoConfirmPending = false
 		if payoutTradeActive {
+			stopPayoutAcceptTimeoutMonitor()
+			resetPayoutRetryState()
 			tradeItemsMu.Lock()
 			payoutItems := cloneTradeItems(currentOwnTradeItems)
 			tradeItemsMu.Unlock()
@@ -1103,6 +1114,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				log.Printf("[PAYOUT] trade opened successfully with %s, proceeding", savedPayoutTargetName)
 				// Fall through to normal trade-open handling below
 				go a.autoAddPayoutItems()
+				go a.startPayoutAcceptTimeoutMonitor(savedPayoutTargetName, savedPayoutTargetID, savedPayoutTargetName)
 			} else {
 				// Someone else opened a trade with us during payout — block it
 				a.AddLogMsg(fmt.Sprintf("[PAYOUT] incoming trade blocked during payout to %s, closing", payoutTargetName))
@@ -1388,14 +1400,32 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 		if !wasCompleted {
 			if payoutTradeActive {
-				// Payout trade was cancelled by player — retry the payout
 				retryTargetID := payoutTargetID
 				retryTargetName := payoutTargetName
 				payoutTradeActive = false
-				a.AddLogMsg(fmt.Sprintf("[PAYOUT] payout trade cancelled by %s, retrying", retryTargetName))
-				log.Printf("[PAYOUT] payout trade cancelled by %s, retrying", retryTargetName)
-				a.noteCurrentGameHistory("Payout trade closed before completion; retrying payout")
+				stopPayoutAcceptTimeoutMonitor()
+
+				payoutCancelCount++
+
+				a.AddLogMsg(fmt.Sprintf("[PAYOUT] payout trade cancelled by %s, cancel count %d/5", retryTargetName, payoutCancelCount))
+				log.Printf("[PAYOUT] payout trade cancelled by %s, cancel count %d/5", retryTargetName, payoutCancelCount)
+				a.noteCurrentGameHistory(fmt.Sprintf("Payout trade closed before completion; retry %d/5", payoutCancelCount))
+
+				if payoutCancelCount >= 5 {
+					flagMsg := "User have cancelled trade too many times, flagged issue please go to our discord."
+					ext.Send(out.SHOUT, flagMsg)
+
+					a.markCurrentGameHistoryIssue(
+						fmt.Sprintf("Payout trade cancelled too many times by %s", retryTargetName),
+						true,
+					)
+
+					resumeDealerAfterPayoutIssue(a, "too many payout cancellations")
+					return
+				}
+
 				startPayout(a, retryTargetID, retryTargetName)
+				return
 			} else {
 				a.AddLogMsg("[TRADE_REOPEN] trade closed before completion, reopening dealer (idle recovery)")
 				log.Printf("[TRADE_REOPEN] trade closed before completion, reopening dealer (idle recovery)")
@@ -1406,6 +1436,8 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			payoutTradeActive = false
 			a.AddLogMsg("[PAYOUT] payout trade completed successfully")
 			log.Printf("[PAYOUT] payout trade completed successfully")
+			stopPayoutAcceptTimeoutMonitor()
+			resetPayoutRetryState()
 			a.noteCurrentGameHistory("Dealer payout flow finished successfully")
 
 			// Resync hand before reopening dealer trades.
@@ -1489,6 +1521,79 @@ func stopPayout() {
 	payoutTradeSent = false
 	payoutExpectedAddCount = 0
 	payoutActualAddCount = 0
+}
+
+func stopPayoutAcceptTimeoutMonitor() {
+	payoutAcceptTimeoutMonitorID++
+	payoutAcceptTimeoutActive = false
+}
+
+func resetPayoutRetryState() {
+	stopPayoutAcceptTimeoutMonitor()
+	payoutAcceptTimeoutAttempts = 0
+	payoutCancelCount = 0
+}
+
+func resumeDealerAfterPayoutIssue(a *App, reason string) {
+	a.AddLogMsg(fmt.Sprintf("[PAYOUT] resuming dealer after payout issue: %s", reason))
+	log.Printf("[PAYOUT] resuming dealer after payout issue: %s", reason)
+
+	stopPayout()
+	stopPayoutAcceptTimeoutMonitor()
+
+	awaitingTradeOpen = true
+	if canAnnounceDealerOpen() {
+		dealerTradeWindowOpen = true
+		go sendMessageWithDelay(a.dealerOpenMessage())
+	}
+	startDealerOpenHeartbeat(a)
+}
+
+func (a *App) startPayoutAcceptTimeoutMonitor(playerName string, targetID int, targetName string) {
+	stopPayoutAcceptTimeoutMonitor()
+
+	payoutAcceptTimeoutMonitorID++
+	monitorID := payoutAcceptTimeoutMonitorID
+	payoutAcceptTimeoutActive = true
+
+	go func(id int, player string, retryTargetID int, retryTargetName string) {
+		time.Sleep(30 * time.Second)
+
+		if id != payoutAcceptTimeoutMonitorID || !payoutAcceptTimeoutActive || !payoutTradeActive {
+			return
+		}
+
+		payoutAcceptTimeoutActive = false
+		payoutAcceptTimeoutAttempts++
+
+		a.AddLogMsg(fmt.Sprintf("[PAYOUT_TIMEOUT] payout accept timeout %d/3 for %s", payoutAcceptTimeoutAttempts, player))
+		log.Printf("[PAYOUT_TIMEOUT] payout accept timeout %d/3 for %s", payoutAcceptTimeoutAttempts, player)
+
+		timeoutMsg := fmt.Sprintf("%q did not accept trade", player)
+		ext.Send(out.SHOUT, timeoutMsg)
+
+		time.Sleep(1200 * time.Millisecond)
+		ext.Send(out.TRADE_CLOSE)
+
+		if payoutAcceptTimeoutAttempts >= 3 {
+			flagMsg := "We have flagged the issues, Please go to our discord to resolve."
+			time.Sleep(1200 * time.Millisecond)
+			ext.Send(out.SHOUT, flagMsg)
+
+			a.markCurrentGameHistoryIssue(
+				fmt.Sprintf("Payout trade timed out 3 times waiting for %s to accept", player),
+				true,
+			)
+
+			resumeDealerAfterPayoutIssue(a, "payout accept timeout")
+			return
+		}
+
+		// Retry payout open again
+		time.Sleep(1500 * time.Millisecond)
+		payoutTradeActive = false
+		startPayout(a, retryTargetID, retryTargetName)
+	}(monitorID, playerName, targetID, targetName)
 }
 
 func waitForHiddenBlockedTradeCleanup(timeout time.Duration) bool {
@@ -4912,6 +5017,7 @@ func (a *App) finalize13Round(playerWins bool, reason string) {
 		a.noteCurrentGameHistory(winnerMsg)
 		a.AddLogMsg(fmt.Sprintf("[PAYOUT] 13 player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID))
 		log.Printf("[PAYOUT] 13 player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID)
+		resetPayoutRetryState()
 		startPayout(a, payoutTargetID, payoutTargetName)
 		return
 	}
@@ -4990,6 +5096,7 @@ func (a *App) finalizeTriRound() {
 		a.noteCurrentGameHistory(winnerMsg)
 		a.AddLogMsg(fmt.Sprintf("[PAYOUT] tri player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID))
 		log.Printf("[PAYOUT] tri player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID)
+		resetPayoutRetryState()
 		startPayout(a, payoutTargetID, payoutTargetName)
 		return
 	}

@@ -1360,6 +1360,9 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		}
 
 		suppressCloseAnnouncement := suppressNextTradeCloseAnnouncement
+		if payoutTradeActive && !wasCompleted {
+			suppressCloseAnnouncement = true
+		}
 		suppressNextTradeCloseAnnouncement = false
 
 		if !tradeCompleted && !tradeCloseAnnounced && !suppressCloseAnnouncement {
@@ -1666,12 +1669,8 @@ func startPayout(a *App, targetID int, targetName string) {
 			ext.Send(g.Out.Id("TRADE_OPEN"), []byte(rawPayload))
 
 			if attempt > 1 {
-				msg := fmt.Sprintf("Tried to open trade %d times", attempt)
-				time.Sleep(800 * time.Millisecond)
-				if sessionID != payoutSessionID {
-					return
-				}
-				sendMessageWithDelay(msg)
+				a.AddLogMsg(fmt.Sprintf("[PAYOUT] retry trade open attempt %d/5 for %s", attempt, targetName))
+				log.Printf("[PAYOUT] retry trade open attempt %d/5 for %s", attempt, targetName)
 			}
 
 			// Wait up to 5 seconds for the trade to open (header 104 will call stopPayout)

@@ -522,6 +522,15 @@ func (a *App) syncGameHistoryLocked() {
 		return
 	}
 	runtime.EventsEmit(a.ctx, "gameHistoryUpdate", string(jsonData))
+	// Emit computed casino stats for UI convenience
+	// All-time stats
+	if stats := a.GetCasinoStatsJSON("all_time"); stats != "{}" {
+		runtime.EventsEmit(a.ctx, "casinoStatsUpdate", stats)
+	}
+	// Today stats (useful for live dashboard)
+	if statsT := a.GetCasinoStatsJSON("today"); statsT != "{}" {
+		runtime.EventsEmit(a.ctx, "casinoStatsUpdateToday", statsT)
+	}
 }
 
 func (a *App) findCurrentGameHistoryIndexLocked() int {

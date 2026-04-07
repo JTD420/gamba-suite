@@ -2,9 +2,9 @@
   <div class="poker-config-section">
 
     <!-- Tab bar -->
-    <div class="tab-bar">
+      <div class="tab-bar">
       <button
-        v-for="tab in ['Home', 'Trade', 'Game History', 'Logs', 'Utility']"
+        v-for="tab in ['Home', 'Trade', 'Game History', 'Stats', 'Logs', 'Utility']"
         :key="tab"
         :class="['tab-btn', { active: activeTab === tab }]"
         @click="activeTab = tab"
@@ -308,6 +308,71 @@
     </div>
 
     <!-- Logs tab -->
+    <div v-if="activeTab === 'Stats'">
+      <h2 class="section-title">Casino Stats</h2>
+      <p class="config-intro">Summary computed from saved game history (game_history.json).</p>
+
+      <div v-if="!casinoStats">
+        Loading stats...
+      </div>
+
+      <div v-else>
+        <div class="stats-summary-grid">
+          <div class="stat-card">
+            <div class="game-card-title">Total Rounds</div>
+            <div class="game-card-summary">{{ casinoStats.overall.totalRounds || 0 }}</div>
+          </div>
+          <div class="stat-card">
+            <div class="game-card-title">Completed</div>
+            <div class="game-card-summary">{{ casinoStats.overall.completedRounds || 0 }}</div>
+          </div>
+          <div class="stat-card">
+            <div class="game-card-title">Net Total</div>
+            <div class="game-card-summary">{{ casinoStats.overall.netItems || 0 }}</div>
+          </div>
+          <div class="stat-card">
+            <div class="game-card-title">RTP %</div>
+            <div class="game-card-summary">{{ formatNumber(casinoStats.overall.rtpPercent || 0, 2) }}</div>
+          </div>
+        </div>
+
+        <h3 class="section-title">Per-Game</h3>
+        <div class="game-card-grid">
+          <div v-for="g in ['Poker','21','13','Tri']" :key="g" class="game-card small">
+            <div class="game-card-title">{{ g }}</div>
+            <div class="game-card-summary">Rounds: {{ (casinoStats.byGame && casinoStats.byGame[g]) ? casinoStats.byGame[g].totalRounds : 0 }}</div>
+            <div class="game-card-summary">Net: {{ (casinoStats.byGame && casinoStats.byGame[g]) ? casinoStats.byGame[g].netItems : 0 }}</div>
+            <div class="game-card-summary">Player Wins: {{ (casinoStats.byGame && casinoStats.byGame[g]) ? casinoStats.byGame[g].playerWins : 0 }}</div>
+          </div>
+        </div>
+
+        <h3 class="section-title">Top Items (by net)</h3>
+        <table class="catalog-table">
+          <thead><tr><th>Item</th><th>Bet In</th><th>Payout Out</th><th>Net</th></tr></thead>
+          <tbody>
+            <tr v-for="(it, idx) in (casinoStats.byItem || []).slice(0,20)" :key="it.name + '-' + idx">
+              <td>{{ formatItemName(it.name) }}</td>
+              <td>{{ it.betIn }}</td>
+              <td>{{ it.payoutOut }}</td>
+              <td>{{ it.net }}</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3 class="section-title">Top Players</h3>
+        <table class="catalog-table">
+          <thead><tr><th>Player</th><th>Rounds</th><th>Net</th></tr></thead>
+          <tbody>
+            <tr v-for="(p, idx) in (casinoStats.byPlayer || []).slice(0,20)" :key="p.playerName + '-' + idx">
+              <td>{{ p.playerName }}</td>
+              <td>{{ p.totalRounds }}</td>
+              <td>{{ p.netAgainstCasino }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
     <div v-if="activeTab === 'Logs'">
       <div class="log-grid">
         <div>
@@ -420,6 +485,8 @@ export default {
       diceSetup: [],
       casinoStatus: 'Stopped',
       casinoStatusKey: 'stopped',
+      casinoStats: null,
+      casinoStatsToday: null,
       roomIdentity: [],
       log: [],
       debugLog: [],
@@ -734,6 +801,12 @@ export default {
         .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
         .join(' ');
     },
+    formatNumber(value, decimals = 2) {
+      if (value === null || value === undefined) return '';
+      const n = Number(value);
+      if (Number.isNaN(n)) return String(value);
+      return n.toFixed(decimals);
+    },
     scrollBox(refName) {
       this.$nextTick(() => {
         const box = this.$refs[refName];
@@ -745,6 +818,19 @@ export default {
   },
   async mounted() {
     await this.refreshGameHistory();
+      // initial fetch of stats
+      try {
+        const s = await window.go.main.App.GetCasinoStatsJSON("all_time");
+        this.casinoStats = JSON.parse(s || '{}') || {};
+      } catch (e) {
+        this.casinoStats = {};
+      }
+      try {
+        const s2 = await window.go.main.App.GetCasinoStatsJSON("today");
+        this.casinoStatsToday = JSON.parse(s2 || '{}') || {};
+      } catch (e) {
+        this.casinoStatsToday = {};
+      }
     window.runtime.EventsOn("logUpdate", (message) => {
       this.log = message.split('\n');
       this.scrollBox('logbox');
@@ -814,6 +900,22 @@ export default {
         this.gameHistory = JSON.parse(jsonStr) || [];
       } catch (_) {
         this.gameHistory = [];
+      }
+    });
+
+    window.runtime.EventsOn("casinoStatsUpdate", (jsonStr) => {
+      try {
+        this.casinoStats = JSON.parse(jsonStr || '{}') || {};
+      } catch (_) {
+        this.casinoStats = {};
+      }
+    });
+
+    window.runtime.EventsOn("casinoStatsUpdateToday", (jsonStr) => {
+      try {
+        this.casinoStatsToday = JSON.parse(jsonStr || '{}') || {};
+      } catch (_) {
+        this.casinoStatsToday = {};
       }
     });
 

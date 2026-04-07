@@ -10,12 +10,20 @@ export function AddLogMsg(arg1) {
   return window['go']['main']['App']['AddLogMsg'](arg1);
 }
 
+export function BuildCasinoStats(arg1) {
+  return window['go']['main']['App']['BuildCasinoStats'](arg1);
+}
+
 export function ClearGameHistory() {
   return window['go']['main']['App']['ClearGameHistory']();
 }
 
 export function ClearTradeItems() {
   return window['go']['main']['App']['ClearTradeItems']();
+}
+
+export function GetCasinoStatsJSON(arg1) {
+  return window['go']['main']['App']['GetCasinoStatsJSON'](arg1);
 }
 
 export function GetCatalogItemValue(arg1) {

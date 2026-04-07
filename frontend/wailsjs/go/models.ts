@@ -1,5 +1,21 @@
 export namespace main {
 	
+	export class AutoShoutConfig {
+	    enabled: boolean;
+	    phrase: string;
+	    seconds: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new AutoShoutConfig(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.enabled = source["enabled"];
+	        this.phrase = source["phrase"];
+	        this.seconds = source["seconds"];
+	    }
+	}
 	export class DailyStatsPoint {
 	    day: string;
 	    totalRounds: number;

@@ -198,6 +198,12 @@ var (
 	tradeWindowDeadline         time.Time
 	tradeWindowTimeoutActive    bool
 	blockAllTrades              = true
+	// Auto shout configuration
+	autoShoutEnabled  bool
+	autoShoutPhrase   string
+	autoShoutSeconds  int = 30
+	autoShoutStopChan chan struct{}
+	autoShoutMu       sync.Mutex
 )
 
 type TradeItem struct {
@@ -266,6 +272,13 @@ type PokerDisplayConfig struct {
 	TwoPair      string `json:"two_pair"`
 	OnePair      string `json:"one_pair"`
 	Nothing      string `json:"nothing"`
+}
+
+// AutoShoutConfig holds frontend-friendly auto shout settings.
+type AutoShoutConfig struct {
+	Enabled bool   `json:"enabled"`
+	Phrase  string `json:"phrase"`
+	Seconds int    `json:"seconds"`
 }
 
 func NewApp(ext *g.Ext, assets embed.FS) *App {
@@ -382,6 +395,129 @@ func (a *App) SaveConfig(config *PokerDisplayConfig) {
 	}
 
 	a.AddLogMsg("Config file saved successfully")
+}
+
+// GetAutoShoutConfig returns the current auto-shout configuration.
+func (a *App) GetAutoShoutConfig() AutoShoutConfig {
+	autoShoutMu.Lock()
+	defer autoShoutMu.Unlock()
+
+	return AutoShoutConfig{
+		Enabled: autoShoutEnabled,
+		Phrase:  autoShoutPhrase,
+		Seconds: autoShoutSeconds,
+	}
+}
+
+// SaveAutoShoutConfig updates phrase and seconds. If auto-shout is
+// currently enabled, the loop is restarted to apply interval changes.
+func (a *App) SaveAutoShoutConfig(phrase string, seconds int) AutoShoutConfig {
+	autoShoutMu.Lock()
+	autoShoutPhrase = strings.TrimSpace(phrase)
+	if seconds < 1 {
+		seconds = 1
+	}
+	autoShoutSeconds = seconds
+	wasEnabled := autoShoutEnabled
+	autoShoutMu.Unlock()
+
+	// If enabled, restart loop so interval changes apply immediately.
+	if wasEnabled {
+		// Toggle off then on to restart
+		a.ToggleAutoShout(false)
+		return a.ToggleAutoShout(true)
+	}
+
+	cfg := AutoShoutConfig{
+		Enabled: wasEnabled,
+		Phrase:  autoShoutPhrase,
+		Seconds: autoShoutSeconds,
+	}
+
+	if a.ctx != nil {
+		b, _ := json.Marshal(cfg)
+		runtime.EventsEmit(a.ctx, "autoShoutUpdate", string(b))
+	}
+
+	return cfg
+}
+
+// ToggleAutoShout enables or disables the auto shout loop and returns
+// the current configuration.
+func (a *App) ToggleAutoShout(enabled bool) AutoShoutConfig {
+	autoShoutMu.Lock()
+
+	autoShoutEnabled = enabled
+
+	if autoShoutStopChan != nil {
+		close(autoShoutStopChan)
+		autoShoutStopChan = nil
+	}
+
+	if enabled {
+		autoShoutStopChan = make(chan struct{})
+		stopChan := autoShoutStopChan
+		phrase := autoShoutPhrase
+		seconds := autoShoutSeconds
+		if seconds < 1 {
+			seconds = 1
+			autoShoutSeconds = 1
+		}
+
+		go a.runAutoShoutLoop(stopChan, phrase, seconds)
+	}
+
+	cfg := AutoShoutConfig{
+		Enabled: autoShoutEnabled,
+		Phrase:  autoShoutPhrase,
+		Seconds: autoShoutSeconds,
+	}
+	autoShoutMu.Unlock()
+
+	if a.ctx != nil {
+		b, _ := json.Marshal(cfg)
+		runtime.EventsEmit(a.ctx, "autoShoutUpdate", string(b))
+	}
+
+	return cfg
+}
+
+// runAutoShoutLoop runs the ticker that shouts the configured phrase.
+func (a *App) runAutoShoutLoop(stopChan chan struct{}, phrase string, seconds int) {
+	ticker := time.NewTicker(time.Duration(seconds) * time.Second)
+	defer ticker.Stop()
+
+	a.AddLogMsg(fmt.Sprintf("[AUTO_SHOUT] started: every %ds -> %q", seconds, phrase))
+
+	for {
+		select {
+		case <-stopChan:
+			a.AddLogMsg("[AUTO_SHOUT] stopped")
+			return
+
+		case <-ticker.C:
+			autoShoutMu.Lock()
+			enabled := autoShoutEnabled
+			currentPhrase := strings.TrimSpace(autoShoutPhrase)
+			autoShoutMu.Unlock()
+
+			if !enabled || currentPhrase == "" {
+				continue
+			}
+
+			if ChatIsDisabled {
+				a.AddLogMsg("[AUTO_SHOUT] skipped because chat is disabled")
+				continue
+			}
+
+			if isMuted {
+				a.AddLogMsg("[AUTO_SHOUT] skipped because muted")
+				continue
+			}
+
+			sendMessageWithDelay(currentPhrase)
+		}
+	}
 }
 
 func (a *App) dealerOpenMessage() string {

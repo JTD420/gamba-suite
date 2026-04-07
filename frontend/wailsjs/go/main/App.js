@@ -22,6 +22,10 @@ export function ClearTradeItems() {
   return window['go']['main']['App']['ClearTradeItems']();
 }
 
+export function GetAutoShoutConfig() {
+  return window['go']['main']['App']['GetAutoShoutConfig']();
+}
+
 export function GetCasinoStatsJSON(arg1) {
   return window['go']['main']['App']['GetCasinoStatsJSON'](arg1);
 }
@@ -74,6 +78,10 @@ export function ResumeCasinoSetup() {
   return window['go']['main']['App']['ResumeCasinoSetup']();
 }
 
+export function SaveAutoShoutConfig(arg1, arg2) {
+  return window['go']['main']['App']['SaveAutoShoutConfig'](arg1, arg2);
+}
+
 export function SaveCatalog(arg1) {
   return window['go']['main']['App']['SaveCatalog'](arg1);
 }
@@ -100,4 +108,8 @@ export function StartCasinoSetup(arg1) {
 
 export function StopCasinoSetup() {
   return window['go']['main']['App']['StopCasinoSetup']();
+}
+
+export function ToggleAutoShout(arg1) {
+  return window['go']['main']['App']['ToggleAutoShout'](arg1);
 }

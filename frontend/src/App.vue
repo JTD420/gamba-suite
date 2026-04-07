@@ -94,8 +94,25 @@
       </div>
 
     <div v-if="activeTab === 'Utility'">
-      <h2 class="section-title">Utilities</h2>
-      <p class="config-intro">Utility actions are disabled for now.</p>
+      <h2 class="section-title">Auto Shout</h2>
+      <p class="config-intro">Configure an automatic periodic shout message.</p>
+
+      <div class="auto-shout-panel">
+        <div class="form-group">
+          <label>Phrase</label>
+          <input type="text" v-model="autoShoutPhrase" placeholder="Enter phrase to shout" />
+        </div>
+
+        <div class="form-group">
+          <label>Seconds</label>
+          <input type="number" min="1" v-model.number="autoShoutSeconds" />
+        </div>
+
+        <div style="display:flex;gap:8px;justify-content:center;align-items:center;">
+          <button class="save-button" @click="saveAutoShout">Save</button>
+          <button class="save-button" @click="toggleAutoShout">{{ autoShoutEnabled ? 'Stop Auto Shout' : 'Start Auto Shout' }}</button>
+        </div>
+      </div>
     </div>
 
     <!-- Trade tab -->
@@ -654,6 +671,10 @@ export default {
       chatLog: [],
       showNameSuggestions: false,
       showFlaggedOnly: false,
+      // Auto shout UI state
+      autoShoutPhrase: '',
+      autoShoutSeconds: 30,
+      autoShoutEnabled: false,
     };
   },
   computed: {
@@ -1017,6 +1038,37 @@ export default {
         }
       });
     },
+    async saveAutoShout() {
+      try {
+        await window.go.main.App.SaveAutoShoutConfig(this.autoShoutPhrase || '', Number(this.autoShoutSeconds || 30));
+        this.addLogMsg('[UI] AutoShout config saved');
+      } catch (e) {
+        this.addLogMsg('[UI] Failed to save autoShout config');
+        console.error(e);
+      }
+    },
+    async toggleAutoShout() {
+      try {
+        const next = !this.autoShoutEnabled;
+        const cfg = await window.go.main.App.ToggleAutoShout(next);
+        if (typeof cfg === 'string') {
+          try {
+            const parsed = JSON.parse(cfg || '{}') || {};
+            this.autoShoutEnabled = !!parsed.enabled;
+            this.autoShoutPhrase = parsed.phrase || '';
+            this.autoShoutSeconds = parsed.seconds || 30;
+          } catch (e) {}
+        } else if (cfg) {
+          this.autoShoutEnabled = !!cfg.enabled;
+          this.autoShoutPhrase = cfg.phrase || '';
+          this.autoShoutSeconds = cfg.seconds || 30;
+        }
+        this.addLogMsg('[UI] AutoShout toggled');
+      } catch (e) {
+        this.addLogMsg('[UI] Failed to toggle autoShout');
+        console.error(e);
+      }
+    },
   },
   async mounted() {
     await this.refreshGameHistory();
@@ -1159,6 +1211,33 @@ export default {
       } catch (e) {
         console.error('diceSetupUpdate parse', e);
       }
+    });
+    // AutoShout initial fetch and subscription
+    try {
+      const cfg = await window.go.main.App.GetAutoShoutConfig();
+      if (typeof cfg === 'string') {
+        try {
+          const parsed = JSON.parse(cfg || '{}') || {};
+          this.autoShoutEnabled = !!parsed.enabled;
+          this.autoShoutPhrase = parsed.phrase || '';
+          this.autoShoutSeconds = parsed.seconds || 30;
+        } catch (e) {}
+      } else if (cfg) {
+        this.autoShoutEnabled = !!cfg.enabled;
+        this.autoShoutPhrase = cfg.phrase || '';
+        this.autoShoutSeconds = cfg.seconds || 30;
+      }
+    } catch (e) {
+      console.error('autoShout init', e);
+    }
+
+    window.runtime.EventsOn("autoShoutUpdate", (jsonStr) => {
+      try {
+        const parsed = JSON.parse(jsonStr || '{}') || {};
+        this.autoShoutEnabled = !!parsed.enabled;
+        this.autoShoutPhrase = parsed.phrase || '';
+        this.autoShoutSeconds = parsed.seconds || 30;
+      } catch (e) {}
     });
   },
   beforeUnmount() {}

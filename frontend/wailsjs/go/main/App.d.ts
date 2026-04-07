@@ -12,6 +12,8 @@ export function ClearGameHistory():Promise<void>;
 
 export function ClearTradeItems():Promise<void>;
 
+export function GetAutoShoutConfig():Promise<main.AutoShoutConfig>;
+
 export function GetCasinoStatsJSON(arg1:string):Promise<string>;
 
 export function GetCatalogItemValue(arg1:string):Promise<number|boolean>;
@@ -38,6 +40,8 @@ export function PauseCasinoSetup():Promise<void>;
 
 export function ResumeCasinoSetup():Promise<void>;
 
+export function SaveAutoShoutConfig(arg1:string,arg2:number):Promise<main.AutoShoutConfig>;
+
 export function SaveCatalog(arg1:Array<main.CatalogItem>):Promise<void>;
 
 export function SaveConfig(arg1:main.PokerDisplayConfig):Promise<void>;
@@ -51,3 +55,5 @@ export function SkipDiceSetupForTesting():Promise<void>;
 export function StartCasinoSetup(arg1:string):Promise<void>;
 
 export function StopCasinoSetup():Promise<void>;
+
+export function ToggleAutoShout(arg1:boolean):Promise<main.AutoShoutConfig>;

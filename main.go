@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -3632,6 +3633,9 @@ func (a *App) finalizeStripScan(sessionID int, reason string) {
 		log.Printf("[STRIP] hand[%d] name=%q qty=%d", i, item.Name, item.Quantity)
 	}
 	a.emitHandItemsUpdate()
+	// Also push the latest hand snapshot to the live-dealer webhook so the
+	// dashboard stays up-to-date on every finalized scan.
+	a.sendLiveDealerSnapshot(items)
 
 	// If a trade is open, refresh the frozen hand snapshot so coverage
 	// checks reflect recent hand removals/additions, then re-run coverage.
@@ -3870,6 +3874,53 @@ func (a *App) emitHandItemsUpdate() {
 	runtime.EventsEmit(a.ctx, "handItemsUpdate", string(jsonData))
 }
 
+// sendLiveDealerSnapshot posts a hand snapshot to the configured live-dealer webhook.
+// Runs asynchronously and logs status via `AddLogMsg`.
+func (a *App) sendLiveDealerSnapshot(items []TradeItem) {
+	go func(snapshot []TradeItem) {
+		payload := map[string]interface{}{
+			"timestamp":     time.Now().UTC().Format(time.RFC3339),
+			"snapshot":      snapshot,
+			"tradeOpen":     tradeOpen,
+			"snapshotReady": tradeHandSnapshotReady,
+		}
+
+		jb, err := json.Marshal(payload)
+		if err != nil {
+			a.AddLogMsg("[TRADE_HAND_SNAPSHOT] webhook marshal error: " + err.Error())
+			return
+		}
+
+		url := os.Getenv("LIVE_SYNC_URL")
+		if url == "" {
+			url = "http://localhost:3000/api/live-dealer"
+		}
+
+		req, err := http.NewRequest("POST", url, bytes.NewReader(jb))
+		if err != nil {
+			a.AddLogMsg("[TRADE_HAND_SNAPSHOT] webhook request error: " + err.Error())
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if secret := os.Getenv("LIVE_SYNC_SECRET"); secret != "" {
+			req.Header.Set("Authorization", "Bearer "+secret)
+		}
+
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			a.AddLogMsg("[TRADE_HAND_SNAPSHOT] webhook POST error: " + err.Error())
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			a.AddLogMsg(fmt.Sprintf("[TRADE_HAND_SNAPSHOT] webhook responded: %s %d", url, resp.StatusCode))
+		} else {
+			a.AddLogMsg("[TRADE_HAND_SNAPSHOT] webhook sent to " + url)
+		}
+	}(items)
+}
+
 func (a *App) captureTradeHandSnapshot() {
 	handItemsMu.Lock()
 	tradeHandSnapshot = make([]TradeItem, len(currentHandItems))
@@ -3887,6 +3938,8 @@ func (a *App) captureTradeHandSnapshot() {
 	joined := strings.Join(parts, ",")
 	a.AddLogMsg("[TRADE_HAND_SNAPSHOT] captured: " + joined)
 	log.Printf("[TRADE_HAND_SNAPSHOT] captured: %s", joined)
+	// Send snapshot to configured live-dealer webhook (non-blocking)
+	a.sendLiveDealerSnapshot(snapshot)
 }
 
 func (a *App) invalidateTradeHandSnapshot(reason string) {

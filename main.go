@@ -377,7 +377,20 @@ func dealerGameActive() bool {
 }
 
 func dealerReadyForNewTrade() bool {
-	return awaitingTradeOpen && dealerTradeWindowOpen && !dealerGameActive() && !dealerResyncInProgress
+	return awaitingTradeOpen &&
+		dealerTradeWindowOpen &&
+		!dealerGameActive() &&
+		!dealerResyncInProgress &&
+		dealerSnapshotReady()
+}
+
+// dealerSnapshotReady reports whether a frozen trade-hand snapshot is present
+// and ready for validating incoming trades. It locks the hand-items mutex
+// to read the shared flag safely.
+func dealerSnapshotReady() bool {
+	handItemsMu.Lock()
+	defer handItemsMu.Unlock()
+	return tradeHandSnapshotReady
 }
 
 func dealerDiceReadyLocked() bool {
@@ -1133,6 +1146,20 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		if matchedRecentOutgoing {
 			a.AddLogMsg(fmt.Sprintf("[TRADE_GUARD] allowing incoming trade open because it matches recent outgoing target %d", recentTargetID))
 			log.Printf("[TRADE_GUARD] allowing incoming trade open because it matches recent outgoing target %d", recentTargetID)
+		}
+
+		// Defensive guard: do not allow incoming trade to proceed if we don't
+		// yet have a ready frozen hand snapshot. This prevents the race where
+		// ClearTradeItems() wiped the snapshot and the dealer reopens immediately.
+		if !isPayoutTradeOpen && !matchedRecentOutgoing && !dealerSnapshotReady() {
+			a.AddLogMsg("[TRADE_GUARD] blocking incoming trade open: hand snapshot not ready")
+			log.Printf("[TRADE_GUARD] blocking incoming trade open: hand snapshot not ready")
+			hiddenBlockedTradeCleanupPending = true
+			ignoreNextGuardCloseRecovery = true
+			suppressNextTradeCloseAnnouncement = true
+			e.Block()
+			ext.Send(out.TRADE_CLOSE)
+			return
 		}
 
 		awaitingGameChoice = false
@@ -3166,10 +3193,34 @@ func (a *App) reopenDealerIdle(reason string) {
 	gameBetItems = nil
 	a.emitActiveGameBetItemsUpdate()
 
+	// Ensure we rebuild the frozen trade-hand snapshot before announcing
+	// the dealer open. This matches the sync-first pattern used elsewhere
+	// and prevents incoming trades from opening before inventory is ready.
+	dealerResyncInProgress = true
+	requestRoomUsers(a)
+
+	ok := a.forceRefreshHandSnapshot("reopenDealerIdle")
+
+	dealerResyncInProgress = false
+	if shouldRefreshRoomUsers() {
+		requestRoomUsers(a)
+	}
+
+	if !ok {
+		awaitingTradeOpen = false
+		dealerTradeWindowOpen = false
+		a.AddLogMsg(fmt.Sprintf("[TRADE_REOPEN] refusing to announce dealer open because forced hand refresh failed (%s)", reason))
+		log.Printf("[TRADE_REOPEN] refusing to announce dealer open because forced hand refresh failed (%s)", reason)
+		return
+	}
+
 	awaitingTradeOpen = true
 	if canAnnounceDealerOpen() {
 		dealerTradeWindowOpen = true
-		go sendMessageWithDelay(a.dealerOpenMessage())
+		openMsg := a.dealerOpenMessage()
+		a.AddLogMsg(fmt.Sprintf("[TRADE_REOPEN] shouting: %q (%s)", openMsg, reason))
+		log.Printf("[TRADE_REOPEN] shouting: %q (%s)", openMsg, reason)
+		go sendMessageWithDelay(openMsg)
 	} else {
 		dealerTradeWindowOpen = false
 	}

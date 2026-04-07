@@ -2028,34 +2028,68 @@ func stopShortageMonitor() {
 
 func startDealerOpenHeartbeat(a *App) {
 	dealerOpenHeartbeatID++
-	heartbeatID := dealerOpenHeartbeatID
+	id := dealerOpenHeartbeatID
 	dealerOpenHeartbeatActive = true
 
 	go func(id int) {
-		ticker := time.NewTicker(15 * time.Second)
-		defer ticker.Stop()
+		// Initial 15s delay for the first re-announcement.
+		timer := time.NewTimer(15 * time.Second)
+		defer timer.Stop()
 
-		for range ticker.C {
+		select {
+		case <-timer.C:
 			if id != dealerOpenHeartbeatID {
+				dealerOpenHeartbeatActive = false
 				return
 			}
-
 			if !awaitingTradeOpen || !dealerTradeWindowOpen {
 				dealerOpenHeartbeatActive = false
 				return
 			}
-
-			a.AddLogMsg("[TRADE_REOPEN] no new trade yet, re-announcing dealer open")
-			log.Printf("[TRADE_REOPEN] no new trade yet, re-announcing dealer open")
-			if canAnnounceDealerOpen() {
-				sendMessageWithDelay(a.dealerOpenMessage())
-			} else {
+			if !dealerDiceReady() {
+				a.AddLogMsg("[TRADE_REOPEN] dice not ready; stopping reopen heartbeat (initial)")
+				log.Printf("[TRADE_REOPEN] dice not ready; stopping reopen heartbeat (initial)")
 				dealerTradeWindowOpen = false
 				dealerOpenHeartbeatActive = false
 				return
 			}
+			// First shout: only if not muted.
+			if isMuted {
+				a.AddLogMsg("[TRADE_REOPEN] initial 15s announcer skipped due to mute")
+				log.Printf("[TRADE_REOPEN] initial 15s announcer skipped due to mute")
+			} else {
+				a.AddLogMsg("[TRADE_REOPEN] initial 15s re-announcing dealer open")
+				log.Printf("[TRADE_REOPEN] initial 15s re-announcing dealer open")
+				sendMessageWithDelay(a.dealerOpenMessage())
+			}
 		}
-	}(heartbeatID)
+
+		// After the first attempt, run a steady 30s announcer that fires for everyone.
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			if id != dealerOpenHeartbeatID {
+				dealerOpenHeartbeatActive = false
+				return
+			}
+			if !awaitingTradeOpen || !dealerTradeWindowOpen {
+				dealerOpenHeartbeatActive = false
+				return
+			}
+			if !dealerDiceReady() {
+				a.AddLogMsg("[TRADE_REOPEN] dice not ready; stopping 45s announcer")
+				log.Printf("[TRADE_REOPEN] dice not ready; stopping 45s announcer")
+				dealerTradeWindowOpen = false
+				dealerOpenHeartbeatActive = false
+				return
+			}
+
+			a.AddLogMsg("[TRADE_REOPEN] 30s periodic dealer-open announcer firing")
+			log.Printf("[TRADE_REOPEN] 30s periodic dealer-open announcer firing")
+			sendMessageWithDelay(a.dealerOpenMessage())
+		}
+	}(id)
 }
 
 func stopDealerOpenHeartbeat() {

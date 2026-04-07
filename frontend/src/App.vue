@@ -310,66 +310,206 @@
     <!-- Logs tab -->
     <div v-if="activeTab === 'Stats'">
       <h2 class="section-title">Casino Stats</h2>
-      <p class="config-intro">Summary computed from saved game history (game_history.json).</p>
+      <p class="config-intro">Summary computed from saved game history (game_history.json). Toggle time range to view.</p>
 
-      <div v-if="!casinoStats">
-        Loading stats...
+      <div class="stats-range-controls">
+        <button :class="['tab-btn', { active: statsRangeKey === 'all_time' }]" @click="loadStats('all_time')">All time</button>
+        <button :class="['tab-btn', { active: statsRangeKey === 'today' }]" @click="loadStats('today')">Today</button>
+        <button :class="['tab-btn', { active: statsRangeKey === 'last_7_days' }]" @click="loadStats('last_7_days')">7 days</button>
+        <button :class="['tab-btn', { active: statsRangeKey === 'last_30_days' }]" @click="loadStats('last_30_days')">30 days</button>
+      </div>
+
+      <div v-if="!activeStats || Object.keys(activeStats).length === 0">
+        <div class="trade-empty">Loading stats...</div>
       </div>
 
       <div v-else>
+        <!-- KPI Row -->
         <div class="stats-summary-grid">
           <div class="stat-card">
-            <div class="game-card-title">Total Rounds</div>
-            <div class="game-card-summary">{{ casinoStats.overall.totalRounds || 0 }}</div>
+            <div class="stat-icon">🔢</div>
+            <div class="stat-label">Total Rounds</div>
+            <div class="stat-value">{{ activeStats.overall.totalRounds || 0 }}</div>
           </div>
           <div class="stat-card">
-            <div class="game-card-title">Completed</div>
-            <div class="game-card-summary">{{ casinoStats.overall.completedRounds || 0 }}</div>
+            <div class="stat-icon">✅</div>
+            <div class="stat-label">Completed %</div>
+            <div class="stat-value">{{ formatNumber(activeStats.overall.completedRoundPercent || 0, 2) }}%</div>
           </div>
           <div class="stat-card">
-            <div class="game-card-title">Net Total</div>
-            <div class="game-card-summary">{{ casinoStats.overall.netItems || 0 }}</div>
+            <div class="stat-icon">💰</div>
+            <div class="stat-label">Net Total</div>
+            <div :class="['stat-value', (activeStats.overall.netItems || 0) >= 0 ? 'positive' : 'negative']">
+              <span class="stat-num">{{ formatSigned(activeStats.overall.netItems || 0) }}</span>
+            </div>
           </div>
           <div class="stat-card">
-            <div class="game-card-title">RTP %</div>
-            <div class="game-card-summary">{{ formatNumber(casinoStats.overall.rtpPercent || 0, 2) }}</div>
+            <div class="stat-icon">🎯</div>
+            <div class="stat-label">RTP %</div>
+            <div class="stat-value">{{ formatNumber(activeStats.overall.rtpPercent || 0, 2) }}</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon">📈</div>
+            <div class="stat-label">Profit Margin %</div>
+            <div class="stat-value">{{ formatNumber(activeStats.overall.profitMarginPercent || 0, 2) }}%</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon">👥</div>
+            <div class="stat-label">Unique Players</div>
+            <div class="stat-value">{{ activeStats.overall.uniquePlayers || 0 }}</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon">🎲</div>
+            <div class="stat-label">Avg Bet</div>
+            <div class="stat-value">{{ formatNumber(activeStats.overall.averageBetSize || 0, 2) }}</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon">🏷️</div>
+            <div class="stat-label">Avg Payout</div>
+            <div class="stat-value">{{ formatNumber(activeStats.overall.averagePayoutSize || 0, 2) }}</div>
           </div>
         </div>
 
+        <!-- Performance Row -->
+        <h3 class="section-title">Performance</h3>
+        <div class="stats-performance-grid">
+          <div class="stat-card small">
+            <div class="stat-label">Dealer Win %</div>
+            <div class="stat-value">{{ formatNumber(activeStats.overall.dealerWinRate || 0, 2) }}%</div>
+          </div>
+          <div class="stat-card small">
+            <div class="stat-label">Player Win %</div>
+            <div class="stat-value">{{ formatNumber(activeStats.overall.playerWinRate || 0, 2) }}%</div>
+          </div>
+          <div class="stat-card small">
+            <div class="stat-label">Payout Success %</div>
+            <div class="stat-value">{{ formatNumber(activeStats.overall.payoutSuccessPercent || 0, 2) }}%</div>
+          </div>
+          <div class="stat-card small">
+            <div class="stat-label">Payout Failure %</div>
+            <div class="stat-value">{{ formatNumber(activeStats.overall.payoutFailurePercent || 0, 2) }}%</div>
+          </div>
+          <div class="stat-card small">
+            <div class="stat-label">Avg Net / Round</div>
+            <div class="stat-value">{{ formatNumber(activeStats.overall.averageNetPerRound || 0, 2) }}</div>
+          </div>
+          <div class="stat-card small">
+            <div class="stat-label">Avg Rounds / Day</div>
+            <div class="stat-value">{{ formatNumber(activeStats.overall.averageRoundsPerDay || 0, 2) }}</div>
+          </div>
+        </div>
+
+        <!-- Per-Game Cards -->
         <h3 class="section-title">Per-Game</h3>
-        <div class="game-card-grid">
-          <div v-for="g in ['Poker','21','13','Tri']" :key="g" class="game-card small">
+        <div class="game-card-grid stats-game-grid">
+          <div v-for="g in ['Poker','21','13','Tri']" :key="g" class="game-card small stats-game-card">
             <div class="game-card-title">{{ g }}</div>
-            <div class="game-card-summary">Rounds: {{ (casinoStats.byGame && casinoStats.byGame[g]) ? casinoStats.byGame[g].totalRounds : 0 }}</div>
-            <div class="game-card-summary">Net: {{ (casinoStats.byGame && casinoStats.byGame[g]) ? casinoStats.byGame[g].netItems : 0 }}</div>
-            <div class="game-card-summary">Player Wins: {{ (casinoStats.byGame && casinoStats.byGame[g]) ? casinoStats.byGame[g].playerWins : 0 }}</div>
+            <div class="game-card-summary">Rounds: {{ (activeStats.byGame && activeStats.byGame[g]) ? activeStats.byGame[g].totalRounds : 0 }}</div>
+            <div class="game-card-summary">Player %: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].playerWinRate || 0,2) + '%' : '0%' }}</div>
+            <div class="game-card-summary">Dealer %: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].dealerWinRate || 0,2) + '%' : '0%' }}</div>
+            <div class="game-card-summary">Issue %: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].issueRatePercent || 0,2) + '%' : '0%' }}</div>
+            <div class="game-card-summary">RTP %: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].rtpPercent || 0,2) + '%' : '0%' }}</div>
+            <div class="game-card-summary net-badge" :class="(activeStats.byGame && activeStats.byGame[g] && activeStats.byGame[g].netItems >= 0) ? 'positive' : 'negative'">
+              <span>{{ (activeStats.byGame && activeStats.byGame[g]) ? formatSigned(activeStats.byGame[g].netItems) : '0' }}</span>
+            </div>
+            <div class="game-card-summary">Avg Bet: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].averageBetSize || 0,2) : '0' }}</div>
+            <div class="game-card-summary">Avg Payout: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].averagePayoutSize || 0,2) : '0' }}</div>
+            <div class="game-card-summary">Health: {{ (activeStats.byGame && activeStats.byGame[g]) ? (activeStats.byGame[g].healthLabel || 'Neutral') : 'Neutral' }}</div>
           </div>
         </div>
 
-        <h3 class="section-title">Top Items (by net)</h3>
-        <table class="catalog-table">
-          <thead><tr><th>Item</th><th>Bet In</th><th>Payout Out</th><th>Net</th></tr></thead>
+        <!-- Item Performance Table -->
+        <h3 class="section-title">Item Performance</h3>
+        <table class="catalog-table stats-table">
+          <thead><tr><th>Item</th><th>Bet In</th><th>Payout Out</th><th>Net</th><th>Net %</th><th>Poker</th><th>21</th><th>13</th><th>Tri</th></tr></thead>
           <tbody>
-            <tr v-for="(it, idx) in (casinoStats.byItem || []).slice(0,20)" :key="it.name + '-' + idx">
+            <tr v-for="(it, idx) in (activeStats.byItem || []).slice(0,50)" :key="it.name + '-' + idx">
               <td>{{ formatItemName(it.name) }}</td>
               <td>{{ it.betIn }}</td>
               <td>{{ it.payoutOut }}</td>
-              <td>{{ it.net }}</td>
+              <td :class="it.net >= 0 ? 'positive' : 'negative'">{{ formatSigned(it.net) }}</td>
+              <td>{{ formatNumber(it.netSharePercent || 0,2) }}%</td>
+              <td>{{ (it.byGameNet && it.byGameNet.Poker) ? it.byGameNet.Poker : 0 }}</td>
+              <td>{{ (it.byGameNet && it.byGameNet['21']) ? it.byGameNet['21'] : 0 }}</td>
+              <td>{{ (it.byGameNet && it.byGameNet['13']) ? it.byGameNet['13'] : 0 }}</td>
+              <td>{{ (it.byGameNet && it.byGameNet.Tri) ? it.byGameNet.Tri : 0 }}</td>
             </tr>
           </tbody>
         </table>
 
-        <h3 class="section-title">Top Players</h3>
-        <table class="catalog-table">
-          <thead><tr><th>Player</th><th>Rounds</th><th>Net</th></tr></thead>
+        <!-- Player Performance Table -->
+        <h3 class="section-title">Player Performance</h3>
+        <table class="catalog-table stats-table">
+          <thead><tr><th>Player</th><th>Rounds</th><th>Win %</th><th>Issue %</th><th>Bet In</th><th>Payout Out</th><th>Net</th><th>Net %</th></tr></thead>
           <tbody>
-            <tr v-for="(p, idx) in (casinoStats.byPlayer || []).slice(0,20)" :key="p.playerName + '-' + idx">
+            <tr v-for="(p, idx) in (activeStats.byPlayer || []).slice(0,50)" :key="p.playerName + '-' + idx">
               <td>{{ p.playerName }}</td>
               <td>{{ p.totalRounds }}</td>
-              <td>{{ p.netAgainstCasino }}</td>
+              <td>{{ formatNumber(p.playerWinRate || 0,2) }}%</td>
+              <td>{{ formatNumber(p.issueRatePercent || 0,2) }}%</td>
+              <td>{{ p.betItemsIn }}</td>
+              <td>{{ p.payoutItemsOut }}</td>
+              <td :class="p.netAgainstCasino >= 0 ? 'positive' : 'negative'">{{ formatSigned(p.netAgainstCasino) }}</td>
+              <td>{{ formatNumber(p.netSharePercent || 0,2) }}%</td>
             </tr>
           </tbody>
         </table>
+
+        <!-- Issues / Operational Stats -->
+        <h3 class="section-title">Issues</h3>
+        <table class="catalog-table stats-table">
+          <thead><tr><th>Issue Type</th><th>Count</th><th>% of Issues</th><th>% of Rounds</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Total Issues</td>
+              <td>{{ activeStats.issues.totalIssues || 0 }}</td>
+              <td>100%</td>
+              <td>{{ formatNumber(((activeStats.issues.totalIssues || 0) / Math.max(1, (activeStats.overall.totalRounds || 0))) * 100,2) }}%</td>
+            </tr>
+            <tr>
+              <td>Game Choice Timeouts</td>
+              <td>{{ activeStats.issues.gameChoiceTimeouts || 0 }}</td>
+              <td>{{ formatNumber(((activeStats.issues.gameChoiceTimeouts || 0) / Math.max(1, (activeStats.issues.totalIssues || 0))) * 100,2) }}%</td>
+              <td>{{ formatNumber(((activeStats.issues.gameChoiceTimeouts || 0) / Math.max(1, (activeStats.overall.totalRounds || 0))) * 100,2) }}%</td>
+            </tr>
+            <tr>
+              <td>Payout Timeouts</td>
+              <td>{{ activeStats.issues.payoutTimeouts || 0 }}</td>
+              <td>{{ formatNumber(((activeStats.issues.payoutTimeouts || 0) / Math.max(1, (activeStats.issues.totalIssues || 0))) * 100,2) }}%</td>
+              <td>{{ formatNumber(((activeStats.issues.payoutTimeouts || 0) / Math.max(1, (activeStats.overall.totalRounds || 0))) * 100,2) }}%</td>
+            </tr>
+            <tr>
+              <td>Payout Cancels</td>
+              <td>{{ activeStats.issues.payoutCancelFlags || 0 }}</td>
+              <td>{{ formatNumber(((activeStats.issues.payoutCancelFlags || 0) / Math.max(1, (activeStats.issues.totalIssues || 0))) * 100,2) }}%</td>
+              <td>{{ formatNumber(((activeStats.issues.payoutCancelFlags || 0) / Math.max(1, (activeStats.overall.totalRounds || 0))) * 100,2) }}%</td>
+            </tr>
+            <tr v-for="(count, reason) in (activeStats.issues.byReason || {})" :key="reason">
+              <td>{{ reason }}</td>
+              <td>{{ count }}</td>
+              <td>{{ formatNumber((count / Math.max(1, (activeStats.issues.totalIssues || 0))) * 100,2) }}%</td>
+              <td>{{ formatNumber((count / Math.max(1, (activeStats.overall.totalRounds || 0))) * 100,2) }}%</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <!-- Trends -->
+        <h3 class="section-title">Daily Trends</h3>
+        <table class="catalog-table stats-table">
+          <thead><tr><th>Day</th><th>Rounds</th><th>Net</th><th>Issues</th><th>RTP %</th></tr></thead>
+          <tbody>
+            <tr v-for="(d, idx) in (activeStats.trends && activeStats.trends.daily) || []" :key="d.day + '-' + idx">
+              <td>{{ d.day }}</td>
+              <td>{{ d.totalRounds }}</td>
+              <td :class="d.netItems >= 0 ? 'positive' : 'negative'">{{ formatSigned(d.netItems) }}</td>
+              <td>{{ d.issueRounds }}</td>
+              <td>{{ formatNumber(d.rtpPercent || 0,2) }}%</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3 class="section-title">Raw Stats (debug)</h3>
+        <pre style="max-height:300px;overflow:auto;background:#111;color:#dcdcdc;padding:8px;border-radius:6px">{{ JSON.stringify(activeStats, null, 2) }}</pre>
       </div>
     </div>
 
@@ -487,6 +627,8 @@ export default {
       casinoStatusKey: 'stopped',
       casinoStats: null,
       casinoStatsToday: null,
+      casinoStatsMap: {},
+      statsRangeKey: 'all_time',
       roomIdentity: [],
       log: [],
       debugLog: [],
@@ -587,6 +729,9 @@ export default {
         return names.slice(0, 10);
       }
       return names.filter(n => n.toLowerCase().includes(q)).slice(0, 10);
+    },
+    activeStats() {
+      return this.casinoStatsMap[this.statsRangeKey] || {};
     },
   },
   methods: {
@@ -807,6 +952,21 @@ export default {
       if (Number.isNaN(n)) return String(value);
       return n.toFixed(decimals);
     },
+    formatSigned(value) {
+      const n = Number(value || 0);
+      if (Number.isNaN(n)) return String(value || '');
+      return (n > 0 ? '+' : '') + String(n);
+    },
+    async loadStats(rangeKey) {
+      this.statsRangeKey = rangeKey;
+      if (this.casinoStatsMap[rangeKey]) return;
+      try {
+        const s = await window.go.main.App.GetCasinoStatsJSON(rangeKey);
+        this.casinoStatsMap[rangeKey] = JSON.parse(s || '{}') || {};
+      } catch (e) {
+        this.casinoStatsMap[rangeKey] = {};
+      }
+    },
     scrollBox(refName) {
       this.$nextTick(() => {
         const box = this.$refs[refName];
@@ -822,14 +982,18 @@ export default {
       try {
         const s = await window.go.main.App.GetCasinoStatsJSON("all_time");
         this.casinoStats = JSON.parse(s || '{}') || {};
+        this.casinoStatsMap['all_time'] = this.casinoStats;
       } catch (e) {
         this.casinoStats = {};
+        this.casinoStatsMap['all_time'] = {};
       }
       try {
         const s2 = await window.go.main.App.GetCasinoStatsJSON("today");
         this.casinoStatsToday = JSON.parse(s2 || '{}') || {};
+        this.casinoStatsMap['today'] = this.casinoStatsToday;
       } catch (e) {
         this.casinoStatsToday = {};
+        this.casinoStatsMap['today'] = {};
       }
     window.runtime.EventsOn("logUpdate", (message) => {
       this.log = message.split('\n');
@@ -905,17 +1069,23 @@ export default {
 
     window.runtime.EventsOn("casinoStatsUpdate", (jsonStr) => {
       try {
-        this.casinoStats = JSON.parse(jsonStr || '{}') || {};
+        const parsed = JSON.parse(jsonStr || '{}') || {};
+        this.casinoStats = parsed;
+        this.casinoStatsMap['all_time'] = parsed;
       } catch (_) {
         this.casinoStats = {};
+        this.casinoStatsMap['all_time'] = {};
       }
     });
 
     window.runtime.EventsOn("casinoStatsUpdateToday", (jsonStr) => {
       try {
-        this.casinoStatsToday = JSON.parse(jsonStr || '{}') || {};
+        const parsed = JSON.parse(jsonStr || '{}') || {};
+        this.casinoStatsToday = parsed;
+        this.casinoStatsMap['today'] = parsed;
       } catch (_) {
         this.casinoStatsToday = {};
+        this.casinoStatsMap['today'] = {};
       }
     });
 
@@ -1543,6 +1713,66 @@ input[type="text"]::placeholder {
   margin-top: 10px;
   text-align: center;
 }
+
+/* Stats styles */
+.stats-range-controls {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  margin-bottom: 12px;
+}
+.stats-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.stat-card {
+  background: linear-gradient(180deg, #171717, #141414);
+  border: 1px solid #2f2f2f;
+  padding: 12px;
+  border-radius: 8px;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.stat-icon {
+  font-size: 18px;
+}
+.stat-label {
+  color: #cfcfcf;
+  font-weight: 700;
+  font-size: 12px;
+}
+.stat-value {
+  font-size: 20px;
+  font-weight: 800;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.stat-value.positive { color: #2ecc71; }
+.stat-value.negative { color: #e74c3c; }
+.stat-num { font-weight: 800; }
+
+.stats-game-grid { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+.stats-game-card { position: relative; }
+.net-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 14px;
+  font-weight: 700;
+  margin-top: 8px;
+}
+.net-badge.positive { background: rgba(46,204,113,0.08); color: #2ecc71; border: 1px solid rgba(46,204,113,0.15); }
+.net-badge.negative { background: rgba(231,76,60,0.06); color: #e74c3c; border: 1px solid rgba(231,76,60,0.12); }
+
+.stats-table td.positive { color: #2ecc71; font-weight: 700; }
+.stats-table td.negative { color: #e74c3c; font-weight: 700; }
 
 .game-settings-box {
   border: 1px solid #333;

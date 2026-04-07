@@ -98,6 +98,7 @@ var (
 	payoutTradeSent              bool
 	payoutExpectedAddCount       int
 	payoutActualAddCount         int
+	lastPayoutCancelNoticeAt     time.Time
 
 	// Payout retry/monitor state
 	payoutResponseTimeoutMonitorID int
@@ -1290,9 +1291,18 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			partnerName = "Unknown"
 		}
 		openMsg := fmt.Sprintf("Trade Opened: \"%s\"", partnerName)
-		a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] shouting: %q", openMsg))
-		log.Printf("[TRADE_OPEN] shouting: %q", openMsg)
-		ext.Send(out.SHOUT, openMsg)
+		shouldAnnounceTradeOpen := true
+		if payoutActive || payoutTradeSent || payoutTradeActive {
+			shouldAnnounceTradeOpen = false
+		}
+		if shouldAnnounceTradeOpen {
+			a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] shouting: %q", openMsg))
+			log.Printf("[TRADE_OPEN] shouting: %q", openMsg)
+			ext.Send(out.SHOUT, openMsg)
+		} else {
+			a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] suppressed public shout during payout flow: %q", openMsg))
+			log.Printf("[TRADE_OPEN] suppressed public shout during payout flow: %q", openMsg)
+		}
 
 		handItemsMu.Lock()
 		// Under strict lifecycle we keep the snapshot taken before Dealer Open
@@ -1411,7 +1421,24 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				log.Printf("[PAYOUT] payout trade cancelled by %s, cancel count %d/5", retryTargetName, payoutCancelCount)
 				a.noteCurrentGameHistory(fmt.Sprintf("Payout trade closed before completion; retry %d/5", payoutCancelCount))
 
+				playerName := strings.TrimSpace(retryTargetName)
+				if playerName == "" {
+					playerName = "Player"
+				}
+
+				// Public notice at most once every 45 seconds
+				if canAnnouncePayoutCancelNotice() {
+					msg := fmt.Sprintf("%q closed trade", playerName)
+					ext.Send(out.SHOUT, msg)
+					markPayoutCancelNoticeSent()
+				}
+
 				if payoutCancelCount >= 5 {
+					stopPayoutResponseTimeoutMonitor()
+					stopPayout()
+					resetPayoutRetryState()
+					resetTradeAutoFlow()
+
 					flagMsg := "User have cancelled trade too many times, flagged issue please go to our discord."
 					ext.Send(out.SHOUT, flagMsg)
 
@@ -1420,7 +1447,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 						true,
 					)
 
-					resumeDealerAfterPayoutIssue(a, "too many payout cancellations")
+					go a.reopenDealerIdle("payout issue: too many payout cancellations")
 					return
 				}
 
@@ -1532,6 +1559,15 @@ func resetPayoutRetryState() {
 	stopPayoutResponseTimeoutMonitor()
 	payoutResponseTimeoutAttempts = 0
 	payoutCancelCount = 0
+	lastPayoutCancelNoticeAt = time.Time{}
+}
+
+func canAnnouncePayoutCancelNotice() bool {
+	return time.Since(lastPayoutCancelNoticeAt) >= 45*time.Second
+}
+
+func markPayoutCancelNoticeSent() {
+	lastPayoutCancelNoticeAt = time.Now()
 }
 
 func resumeDealerAfterPayoutIssue(a *App, reason string) {
@@ -1541,6 +1577,7 @@ func resumeDealerAfterPayoutIssue(a *App, reason string) {
 	// Clear payout state and retry counters first.
 	stopPayout()
 	resetPayoutRetryState()
+	resetTradeAutoFlow()
 
 	// Use the safe reopen path which performs the required resync/snapshot
 	// refresh before announcing dealer open. reopenDealerIdle already stops

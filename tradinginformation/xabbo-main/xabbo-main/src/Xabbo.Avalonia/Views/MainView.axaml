@@ -1,0 +1,75 @@
+<UserControl
+  xmlns="https://github.com/avaloniaui"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+  xmlns:ui="using:FluentAvalonia.UI.Controls"
+  xmlns:v="using:Xabbo.Avalonia.Views"
+  xmlns:vm="using:Xabbo.ViewModels"
+  mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
+  x:Class="Xabbo.Avalonia.Views.MainView"
+  x:DataType="vm:MainViewModel"
+  Classes.isPrivate="{Binding Config.General.PrivacyMode}"
+>
+  <ui:NavigationView
+    Grid.Row="1"
+    Name="NavView"
+    PaneDisplayMode="LeftCompact"
+    IsPaneOpen="False"
+    IsSettingsVisible="False"
+    MenuItemsSource="{Binding Pages}"
+    FooterMenuItemsSource="{Binding FooterPages}"
+    SelectedItem="{Binding SelectedPage}"
+    Content="{Binding SelectedPage, Mode=OneWay}"
+  >
+    <ui:NavigationView.DataTemplates>
+      <DataTemplate DataType="vm:GeneralPageViewModel">
+        <v:GeneralPage />
+      </DataTemplate>
+      <DataTemplate DataType="vm:FriendsPageViewModel">
+        <v:FriendsPage />
+      </DataTemplate>
+      <DataTemplate DataType="vm:WardrobePageViewModel">
+        <v:WardrobePageView />
+      </DataTemplate>
+      <DataTemplate DataType="vm:InventoryPageViewModel">
+        <v:InventoryPageView />
+      </DataTemplate>
+      <DataTemplate DataType="vm:ChatPageViewModel">
+        <v:ChatPage />
+      </DataTemplate>
+      <DataTemplate DataType="vm:RoomPageViewModel">
+        <v:RoomPage />
+      </DataTemplate>
+      <DataTemplate DataType="vm:GameDataPageViewModel">
+        <v:GameDataPage />
+      </DataTemplate>
+      <DataTemplate DataType="vm:InfoPageViewModel">
+        <v:InfoPageView />
+      </DataTemplate>
+      <DataTemplate DataType="vm:SettingsPageViewModel">
+        <v:SettingsPageView />
+      </DataTemplate>
+    </ui:NavigationView.DataTemplates>
+    <ui:NavigationView.MenuItemTemplate>
+      <DataTemplate DataType="vm:PageViewModel">
+        <ui:NavigationViewItem
+          IconSource="{Binding Icon}"
+          Content="{Binding Header}"
+        />
+      </DataTemplate>
+    </ui:NavigationView.MenuItemTemplate>
+    <ui:NavigationView.ContentTemplate>
+      <DataTemplate DataType="vm:PageViewModel">
+        <Grid RowDefinitions="Auto,*">
+          <TextBlock
+            Grid.Row="0" Margin="15,10,0,0"
+            FontSize="18" FontWeight="Bold"
+            Text="{Binding Header}"
+          />
+          <ContentControl Grid.Row="1" Content="{Binding}" />
+        </Grid>
+      </DataTemplate>
+    </ui:NavigationView.ContentTemplate>
+  </ui:NavigationView>
+</UserControl>

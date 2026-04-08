@@ -3605,6 +3605,34 @@ func (a *App) extractTradeItemAndQuantity(field string) (string, int, bool) {
 		log.Printf("[TRADE_PARSE_DEBUG] fallback found no candidates in %q", field)
 	}
 
+	// Relaxed fallback: some server payloads include recognizable single-word
+	// class names that don't match the strict furni regex (no underscore)
+	// but are still meaningful (examples: "giftflowers", "hologram").
+	// Try to match any single-word class that appears in the dealer's
+	// scanned hand snapshot as a substring of the raw field payload.
+	low := strings.ToLower(field)
+	handItemsMu.Lock()
+	for _, it := range currentHandItems {
+		name := strings.ToLower(it.Name)
+		if name == "" {
+			continue
+		}
+		// Skip very short names to avoid false positives
+		if len(name) < 3 {
+			continue
+		}
+		if strings.Contains(low, name) {
+			normalized, ok := normalizeClassKeyWithVariant(name)
+			if ok {
+				a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS_PARSE_RELAXED] accepted %q inside %q", normalized, field))
+				log.Printf("[TRADE_ITEMS_PARSE_RELAXED] accepted %q inside %q", normalized, field)
+				handItemsMu.Unlock()
+				return normalized, 1, true
+			}
+		}
+	}
+	handItemsMu.Unlock()
+
 	return "", 0, false
 }
 

@@ -52,7 +52,7 @@ export function ShowWindow():Promise<void>;
 
 export function SkipDiceSetupForTesting():Promise<void>;
 
-export function StartCasinoSetup(arg1:string):Promise<void>;
+export function StartCasinoSetup(arg1:string,arg2:number,arg3:number):Promise<void>;
 
 export function StopCasinoSetup():Promise<void>;
 

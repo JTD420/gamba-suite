@@ -33,6 +33,7 @@
             <button v-if="casinoStatusKey !== 'stopped'" type="button" class="copy-btn history-danger-btn" @click="stopCasino">Stop</button>
           </div>
         </div>
+        <div v-if="casinoStatusKey !== 'stopped'" class="trade-limits-home">Trade limits: max {{ maxUniqueItemsInput }} unique items, max {{ maxQuantityPerItemInput }} per item</div>
       </div>
 
     </div>
@@ -62,7 +63,20 @@
             </div>
             <p class="game-guide-text">This name will be shown on the live dashboard as the dealer. Please enter your Habbo username.</p>
             <div class="game-guide-block">
-              <input v-model="dealerNameInput" type="text" placeholder="Your Habbo username" style="width:100%;padding:8px;border-radius:4px;border:1px solid #ccc;" />
+              <input v-model="dealerNameInput" type="text" placeholder="Your Habbo username" style="width:100%;padding:8px;border-radius:4px;border:1px solid #ccc;max-width:420px;" />
+            </div>
+            <div class="game-guide-block dealer-limits-grid">
+              <div class="dealer-limit-field">
+                <div class="game-guide-label">Max Unique Items</div>
+                <input v-model.number="maxUniqueItemsInput" type="number" min="1" class="modal-number" />
+              </div>
+              <div class="dealer-limit-field">
+                <div class="game-guide-label">Max Quantity Per Item</div>
+                <input v-model.number="maxQuantityPerItemInput" type="number" min="1" class="modal-number" />
+              </div>
+            </div>
+            <div style="font-size:12px;color:#bdbdbd;margin-top:8px;">
+              Max Unique Items = how many different item types the player may offer. Max Quantity Per Item = max allowed amount for any one item type.
             </div>
             <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px;">
               <button class="copy-btn" @click="cancelDealerName">Cancel</button>
@@ -165,6 +179,7 @@
       <hr class="trade-divider" />
 
       <!-- Player's Offer -->
+      <div v-if="casinoStatusKey !== 'stopped'" class="trade-hint">Trade limits: max {{ maxUniqueItemsInput }} unique items, max {{ maxQuantityPerItemInput }} per item</div>
       <h2 class="section-title">Player Offer</h2>
       <div v-if="tradeItems.length === 0" class="trade-empty">
         No active trade items detected.<br />
@@ -658,6 +673,8 @@ export default {
       showDiceSetupModal: false,
       showDealerNameModal: false,
       dealerNameInput: '',
+      maxUniqueItemsInput: 5,
+      maxQuantityPerItemInput: 50,
       diceSetup: [],
       casinoStatus: 'Stopped',
       casinoStatusKey: 'stopped',
@@ -784,8 +801,12 @@ export default {
       async startCasino() {
         try {
           if (this.casinoStatusKey === 'stopped') {
-            this.dealerNameInput = '';
-            this.showDealerNameModal = true;
+              // preserve previously entered dealer name and limits if present,
+              // otherwise ensure sane defaults are set before showing modal
+              if (!this.dealerNameInput) this.dealerNameInput = '';
+              if (!this.maxUniqueItemsInput || this.maxUniqueItemsInput < 1) this.maxUniqueItemsInput = 5;
+              if (!this.maxQuantityPerItemInput || this.maxQuantityPerItemInput < 1) this.maxQuantityPerItemInput = 50;
+              this.showDealerNameModal = true;
             return;
           }
           this.addLogMsg('[UI] Casino already started');
@@ -798,12 +819,21 @@ export default {
       async confirmDealerName() {
         try {
           const name = (this.dealerNameInput || '').trim();
+          const maxUnique = Number(this.maxUniqueItemsInput || 0);
+          const maxPer = Number(this.maxQuantityPerItemInput || 0);
           if (!name) {
             this.addLogMsg('[UI] Start cancelled: no dealer name provided');
-            this.showDealerNameModal = false;
             return;
           }
-          await window.go.main.App.StartCasinoSetup(name);
+          if (!Number.isInteger(maxUnique) || maxUnique < 1) {
+            this.addLogMsg('[UI] Start cancelled: max unique items must be a positive integer');
+            return;
+          }
+          if (!Number.isInteger(maxPer) || maxPer < 1) {
+            this.addLogMsg('[UI] Start cancelled: max quantity per item must be a positive integer');
+            return;
+          }
+          await window.go.main.App.StartCasinoSetup(name, maxUnique, maxPer);
           this.showDealerNameModal = false;
           this.diceSetup = Array.from({ length: 5 }).map(() => ({ rolled: false, id: 0, value: 0 }));
           this.showDiceSetupModal = true;
@@ -1542,6 +1572,29 @@ input[type="text"]::placeholder {
   color: #d0d0d0;
   font-size: 14px;
   line-height: 1.6;
+}
+
+.dealer-limits-grid {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+.dealer-limit-field {
+  flex: 1 1 0;
+}
+.modal-number {
+  width: 160px;
+  padding: 8px;
+  border-radius: 4px;
+  border: 1px solid #444;
+  background-color: #2e2e2e;
+  color: #fff;
+}
+.trade-limits-home {
+  margin-top: 8px;
+  font-size: 13px;
+  color: #c0c0c0;
+  text-align: center;
 }
 
 .history-search {

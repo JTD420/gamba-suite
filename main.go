@@ -111,42 +111,47 @@ var (
 	shortageMonitorID              int
 	shortageMonitorActive          bool
 	shortageMonitorDeadline        time.Time
-	lastTradeOpenData              string
-	lastTradeOpen                  string
-	tradeOpen                      bool
-	isPokerRolling                 bool
-	isTriRolling                   bool
-	isBJRolling                    bool
-	is13Rolling                    bool
-	is13Hitting                    bool
-	isHitting                      bool
-	isClosing                      bool
-	ChatIsDisabled                 bool
-	mutex                          sync.Mutex
-	resultsWaitGroup               sync.WaitGroup
-	rollDelay                      = 550 * time.Millisecond
-	stripNextDelay                 = 2250 * time.Millisecond
-	stripGetNewPayload             = "new"
-	stripGetNextPayload            = "next"
-	tradeUserPattern               = regexp.MustCompile(`\[(\d+)\]`)
-	stripItemNameRe                = regexp.MustCompile(`(?:CF_\d+_[a-z][a-z_]*|[a-z][a-z0-9_]*_[a-z0-9_]+)(?:\*\d+)?`)
-	gameChoiceCleanupRe            = regexp.MustCompile(`[^a-z0-9]+`)
-	roomEntities                   = map[int]room.Entity{}
-	roomMu                         sync.Mutex
-	lastRoomUsersRequestAt         time.Time
-	roomUsersReqMu                 sync.Mutex
-	users28ByToken                 = map[string]string{}
-	users28ByIndex                 = map[int]string{} // roomIndex -> name
-	users28ByShortToken            = map[string]string{}
-	roomIdentityByShortToken       = map[string]RoomIdentityEntry{}
-	users28Mu                      sync.Mutex
-	headerSniffUntil               time.Time
-	headerSniffSeen                = map[uint16]bool{}
-	headerSniffMu                  sync.Mutex
-	currentTradeItems              []TradeItem
-	currentOwnTradeItems           []TradeItem
-	tradeItemsMu                   sync.Mutex
-	lastAddItemWasOurs             bool
+	// Trade limit monitor state (gives partner time to correct invalid offer)
+	tradeLimitMonitorID       int
+	tradeLimitMonitorActive   bool
+	tradeLimitMonitorDeadline time.Time
+	lastTradeLimitNotice      string
+	lastTradeOpenData         string
+	lastTradeOpen             string
+	tradeOpen                 bool
+	isPokerRolling            bool
+	isTriRolling              bool
+	isBJRolling               bool
+	is13Rolling               bool
+	is13Hitting               bool
+	isHitting                 bool
+	isClosing                 bool
+	ChatIsDisabled            bool
+	mutex                     sync.Mutex
+	resultsWaitGroup          sync.WaitGroup
+	rollDelay                 = 550 * time.Millisecond
+	stripNextDelay            = 2250 * time.Millisecond
+	stripGetNewPayload        = "new"
+	stripGetNextPayload       = "next"
+	tradeUserPattern          = regexp.MustCompile(`\[(\d+)\]`)
+	stripItemNameRe           = regexp.MustCompile(`(?:CF_\d+_[a-z][a-z_]*|[a-z][a-z0-9_]*_[a-z0-9_]+)(?:\*\d+)?`)
+	gameChoiceCleanupRe       = regexp.MustCompile(`[^a-z0-9]+`)
+	roomEntities              = map[int]room.Entity{}
+	roomMu                    sync.Mutex
+	lastRoomUsersRequestAt    time.Time
+	roomUsersReqMu            sync.Mutex
+	users28ByToken            = map[string]string{}
+	users28ByIndex            = map[int]string{} // roomIndex -> name
+	users28ByShortToken       = map[string]string{}
+	roomIdentityByShortToken  = map[string]RoomIdentityEntry{}
+	users28Mu                 sync.Mutex
+	headerSniffUntil          time.Time
+	headerSniffSeen           = map[uint16]bool{}
+	headerSniffMu             sync.Mutex
+	currentTradeItems         []TradeItem
+	currentOwnTradeItems      []TradeItem
+	tradeItemsMu              sync.Mutex
+	lastAddItemWasOurs        bool
 	// lastAddItemByUsAt records when we observed an outgoing TRADE_ADDITEM
 	// packet. Use this timestamp in debugging to detect races between the
 	// outgoing add and the subsequent server TRADE_ITEMS update.
@@ -199,9 +204,14 @@ var (
 	tradeWindowTimeoutActive    bool
 	blockAllTrades              = true
 	// Auto shout configuration
-	autoShoutEnabled  bool
-	autoShoutPhrase   string
-	autoShoutSeconds  int = 30
+	autoShoutEnabled bool
+	autoShoutPhrase  string
+	autoShoutSeconds int = 30
+
+	// Incoming trade limits (configured at startup)
+	maxTradeUniqueItems     int = 5
+	maxTradeQuantityPerItem int = 50
+
 	autoShoutStopChan chan struct{}
 	autoShoutMu       sync.Mutex
 )
@@ -213,13 +223,103 @@ type TradeItem struct {
 }
 
 type LiveDealerStatusPayload struct {
-	LastSeenAt    string      `json:"lastSeenAt"`
-	DealerOpen    bool        `json:"dealerOpen"`
-	TradeOpen     bool        `json:"tradeOpen"`
-	GameActive    bool        `json:"gameActive"`
-	SnapshotReady bool        `json:"snapshotReady"`
-	DealerName    string      `json:"dealerName"`
-	Snapshot      []TradeItem `json:"snapshot,omitempty"`
+	LastSeenAt         string      `json:"lastSeenAt"`
+	DealerOpen         bool        `json:"dealerOpen"`
+	TradeOpen          bool        `json:"tradeOpen"`
+	GameActive         bool        `json:"gameActive"`
+	SnapshotReady      bool        `json:"snapshotReady"`
+	DealerName         string      `json:"dealerName"`
+	MaxUniqueItems     int         `json:"maxUniqueItems"`
+	MaxQuantityPerItem int         `json:"maxQuantityPerItem"`
+	Snapshot           []TradeItem `json:"snapshot,omitempty"`
+}
+
+type tradeLimitViolation struct {
+	TooManyUniqueItems bool
+	TooMuchQuantity    bool
+	UniqueCount        int
+	MaxUnique          int
+	MaxPerItem         int
+	OverLimitItems     []TradeItem
+}
+
+// getTradeLimitViolation inspects the parsed list of trade items and returns
+// a violation struct if limits are exceeded, or nil otherwise.
+func getTradeLimitViolation(items []TradeItem) *tradeLimitViolation {
+	if len(items) == 0 {
+		return nil
+	}
+	v := &tradeLimitViolation{
+		UniqueCount: len(items),
+		MaxUnique:   maxTradeUniqueItems,
+		MaxPerItem:  maxTradeQuantityPerItem,
+	}
+	if v.UniqueCount > v.MaxUnique {
+		v.TooManyUniqueItems = true
+	}
+	for _, it := range items {
+		if it.Quantity > v.MaxPerItem {
+			v.OverLimitItems = append(v.OverLimitItems, it)
+		}
+	}
+	if len(v.OverLimitItems) > 0 {
+		v.TooMuchQuantity = true
+	}
+	if !v.TooManyUniqueItems && !v.TooMuchQuantity {
+		return nil
+	}
+	return v
+}
+
+func formatTradeLimitViolationMessage(v *tradeLimitViolation) string {
+	if v == nil {
+		return ""
+	}
+	// Only unique-items violation
+	if v.TooManyUniqueItems && !v.TooMuchQuantity {
+		return fmt.Sprintf("Too many unique items. Max %d different item types per trade.", v.MaxUnique)
+	}
+	// Only per-item quantity violation
+	if v.TooMuchQuantity && !v.TooManyUniqueItems {
+		names := make([]string, 0, len(v.OverLimitItems))
+		for _, it := range v.OverLimitItems {
+			names = append(names, fmt.Sprintf("%s x %d", it.Name, it.Quantity))
+		}
+		return fmt.Sprintf("Quantity too high for: %s. Max %d per item.", strings.Join(names, ", "), v.MaxPerItem)
+	}
+	// Both violations
+	names := make([]string, 0, len(v.OverLimitItems))
+	for _, it := range v.OverLimitItems {
+		names = append(names, fmt.Sprintf("%s x %d", it.Name, it.Quantity))
+	}
+	if len(names) > 0 {
+		return fmt.Sprintf("Too many unique items and too much quantity. Max %d different item types and max %d per item. Quantity too high for: %s.", v.MaxUnique, v.MaxPerItem, strings.Join(names, ", "))
+	}
+	return fmt.Sprintf("Too many unique items. Max %d different item types and max %d per item.", v.MaxUnique, v.MaxPerItem)
+}
+
+// rejectTradeForLimitViolation announces the reason, closes the trade and reopens the dealer.
+func (a *App) rejectTradeForLimitViolation(v *tradeLimitViolation) {
+	if v == nil {
+		return
+	}
+	msg := formatTradeLimitViolationMessage(v)
+	a.AddLogMsg("[TRADE_LIMIT] " + msg)
+	log.Printf("[TRADE_LIMIT] %s", msg)
+	// Only shout when the message changed since the last notice.
+	changed := msg != lastTradeLimitNotice
+	lastTradeLimitNotice = msg
+
+	if changed {
+		go func(m string) {
+			time.Sleep(350 * time.Millisecond)
+			ext.Send(out.SHOUT, m)
+		}(msg)
+	}
+
+	// Start a short-lived grace timer instead of closing immediately so the
+	// partner has a chance to remove offending items (similar to shortage flow).
+	startTradeLimitMonitor(a, 12*time.Second)
 }
 
 type RoomIdentityEntry struct {
@@ -1104,6 +1204,16 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 			if len(allItems) > 0 {
 				extendTradeWindowTimeoutForPartnerActivity(a)
+			}
+
+			// Validate incoming partner offer against configured trade limits.
+			tradeItemsMu.Lock()
+			itemsCopy := make([]TradeItem, len(currentTradeItems))
+			copy(itemsCopy, currentTradeItems)
+			tradeItemsMu.Unlock()
+			if violation := getTradeLimitViolation(itemsCopy); violation != nil {
+				a.rejectTradeForLimitViolation(violation)
+				return
 			}
 
 			handItemsMu.Lock()
@@ -2494,6 +2604,65 @@ func stopShortageMonitor() {
 	shortageMonitorDeadline = time.Time{}
 }
 
+// startTradeLimitMonitor begins a short-lived monitor that will force-close
+// a trade if a trade-limit violation remains unresolved for the given timeout.
+func startTradeLimitMonitor(a *App, timeout time.Duration) {
+	tradeLimitMonitorID++
+	id := tradeLimitMonitorID
+	tradeLimitMonitorActive = true
+	tradeLimitMonitorDeadline = time.Now().Add(timeout)
+
+	go func(monitor int) {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			if monitor != tradeLimitMonitorID {
+				return
+			}
+			if !tradeLimitMonitorActive {
+				return
+			}
+
+			// If trade closed externally, stop the monitor.
+			if !tradeOpen {
+				stopTradeLimitMonitor()
+				return
+			}
+
+			// If violation resolved, stop the monitor.
+			tradeItemsMu.Lock()
+			itemsCopy := make([]TradeItem, len(currentTradeItems))
+			copy(itemsCopy, currentTradeItems)
+			tradeItemsMu.Unlock()
+			if getTradeLimitViolation(itemsCopy) == nil {
+				stopTradeLimitMonitor()
+				return
+			}
+
+			// If deadline passed, close the trade to free the booth.
+			if time.Now().After(tradeLimitMonitorDeadline) {
+				partnerName := strings.TrimSpace(lastTradePartnerName)
+				if partnerName == "" {
+					partnerName = "Player"
+				}
+				a.AddLogMsg(fmt.Sprintf("[TRADE_LIMIT] unresolved; force-closing trade with %s", partnerName))
+				log.Printf("[TRADE_LIMIT] unresolved; force-closing trade with %s", partnerName)
+				ext.Send(out.SHOUT, "Closing trade due to unresolved trade limits; please reopen if you still want to play")
+				ext.Send(out.TRADE_CLOSE)
+				stopTradeLimitMonitor()
+				return
+			}
+		}
+	}(id)
+}
+
+func stopTradeLimitMonitor() {
+	tradeLimitMonitorID++
+	tradeLimitMonitorActive = false
+	tradeLimitMonitorDeadline = time.Time{}
+}
+
 func startDealerOpenHeartbeat(a *App) {
 	dealerOpenHeartbeatID++
 	id := dealerOpenHeartbeatID
@@ -2581,6 +2750,17 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 			log.Printf("[TRADE_ACCEPT] skipped auto-accept due to insufficient payout stock")
 			return
 		}
+
+		// Also ensure the incoming partner offer respects configured trade limits
+		tradeItemsMu.Lock()
+		itemsCopy := make([]TradeItem, len(currentTradeItems))
+		copy(itemsCopy, currentTradeItems)
+		tradeItemsMu.Unlock()
+		if v := getTradeLimitViolation(itemsCopy); v != nil {
+			a.AddLogMsg("[TRADE_ACCEPT] skipped auto-accept due to trade limit violation")
+			log.Printf("[TRADE_ACCEPT] skipped auto-accept due to trade limit violation")
+			return
+		}
 		// If snapshot not ready (s == nil) allow scheduling and perform a
 		// short wait inside the confirm loop before sending each confirm.
 	}
@@ -2624,6 +2804,18 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 					tradeAutoAcceptPending = false
 					a.AddLogMsg("[TRADE_ACCEPT] canceled auto-accept due to insufficient payout stock")
 					log.Printf("[TRADE_ACCEPT] canceled auto-accept due to insufficient payout stock")
+					return
+				}
+				// Re-check trade-limits immediately before accepting in case the
+				// player modified the offered items during the wait.
+				tradeItemsMu.Lock()
+				itemsCopy := make([]TradeItem, len(currentTradeItems))
+				copy(itemsCopy, currentTradeItems)
+				tradeItemsMu.Unlock()
+				if v := getTradeLimitViolation(itemsCopy); v != nil {
+					tradeAutoAcceptPending = false
+					a.AddLogMsg("[TRADE_ACCEPT] canceled auto-accept due to trade limit violation")
+					log.Printf("[TRADE_ACCEPT] canceled auto-accept due to trade limit violation")
 					return
 				}
 				break
@@ -4129,13 +4321,15 @@ func (a *App) emitHandItemsUpdate() {
 func (a *App) sendLiveDealerSnapshot(items []TradeItem) {
 	go func(snapshot []TradeItem) {
 		payload := LiveDealerStatusPayload{
-			LastSeenAt:    time.Now().UTC().Format(time.RFC3339),
-			DealerOpen:    awaitingTradeOpen && dealerTradeWindowOpen,
-			TradeOpen:     tradeOpen,
-			GameActive:    dealerGameActive(),
-			SnapshotReady: tradeHandSnapshotReady,
-			DealerName:    a.getCurrentDealerName(),
-			Snapshot:      snapshot,
+			LastSeenAt:         time.Now().UTC().Format(time.RFC3339),
+			DealerOpen:         awaitingTradeOpen && dealerTradeWindowOpen,
+			TradeOpen:          tradeOpen,
+			GameActive:         dealerGameActive(),
+			SnapshotReady:      tradeHandSnapshotReady,
+			DealerName:         a.getCurrentDealerName(),
+			MaxUniqueItems:     maxTradeUniqueItems,
+			MaxQuantityPerItem: maxTradeQuantityPerItem,
+			Snapshot:           snapshot,
 		}
 
 		jb, err := json.Marshal(payload)
@@ -4177,12 +4371,14 @@ func (a *App) sendLiveDealerSnapshot(items []TradeItem) {
 func (a *App) sendLiveDealerStatus(open bool, dealerName string) {
 	go func(dealerOpen bool, name string) {
 		payload := LiveDealerStatusPayload{
-			LastSeenAt:    time.Now().UTC().Format(time.RFC3339),
-			DealerOpen:    dealerOpen,
-			TradeOpen:     tradeOpen,
-			GameActive:    dealerGameActive(),
-			SnapshotReady: tradeHandSnapshotReady,
-			DealerName:    strings.TrimSpace(name),
+			LastSeenAt:         time.Now().UTC().Format(time.RFC3339),
+			DealerOpen:         dealerOpen,
+			TradeOpen:          tradeOpen,
+			GameActive:         dealerGameActive(),
+			SnapshotReady:      tradeHandSnapshotReady,
+			DealerName:         strings.TrimSpace(name),
+			MaxUniqueItems:     maxTradeUniqueItems,
+			MaxQuantityPerItem: maxTradeQuantityPerItem,
 		}
 
 		jb, err := json.Marshal(payload)
@@ -5525,8 +5721,9 @@ func resetDiceState() {
 
 // StartCasinoSetup enables dice setup recording. This must be called from the frontend
 // when the user clicks the "Start Casino" button. It resets any existing dice and
-// enables recording of incoming dice IDs.
-func (a *App) StartCasinoSetup(dealerName string) {
+// enables recording of incoming dice IDs. It also receives trade-limit configuration
+// values which are stored in global state and emitted in live-dealer payloads.
+func (a *App) StartCasinoSetup(dealerName string, maxUniqueItems int, maxQuantityPerItem int) {
 	// Reset state first (this will lock/unlock internally)
 	resetDiceState()
 
@@ -5548,6 +5745,18 @@ func (a *App) StartCasinoSetup(dealerName string) {
 		}
 	}
 	a.currentDealerName = name
+
+	// Sanitize and persist configured trade limits
+	if maxUniqueItems < 1 {
+		maxUniqueItems = 5
+	}
+	if maxQuantityPerItem < 1 {
+		maxQuantityPerItem = 50
+	}
+	maxTradeUniqueItems = maxUniqueItems
+	maxTradeQuantityPerItem = maxQuantityPerItem
+	a.AddLogMsg(fmt.Sprintf("[CONFIG] max trade unique items = %d", maxTradeUniqueItems))
+	a.AddLogMsg(fmt.Sprintf("[CONFIG] max trade quantity per item = %d", maxTradeQuantityPerItem))
 
 	a.AddLogMsg("[DICE_SETUP] Dice setup mode enabled - roll all 5 dice now")
 	a.emitDiceSetupUpdate()

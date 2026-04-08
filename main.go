@@ -5605,6 +5605,9 @@ func (a *App) StopCasinoSetup() {
 	stopDealerOpenHeartbeat()
 	stopPayout()
 
+	// release mutex before calling emitDiceSetupUpdate which locks the same mutex
+	mutex.Unlock()
+
 	a.AddLogMsg("[DICE_SETUP] Dice setup stopped and application state cleared via UI")
 	a.emitDiceSetupUpdate()
 	// Notify dashboard that dealer (casino) is closed using stored name.
@@ -5627,16 +5630,22 @@ func (a *App) emitDiceSetupUpdate() {
 	}
 	complete := len(diceList) >= 5
 	ready := casinoReady
+	active := casinoActive
+	setupActive := diceSetupActive
 	mutex.Unlock()
 
 	payload := struct {
-		Dice     []Dice `json:"dice"`
-		Complete bool   `json:"complete"`
-		Ready    bool   `json:"ready"`
+		Dice            []Dice `json:"dice"`
+		Complete        bool   `json:"complete"`
+		Ready           bool   `json:"ready"`
+		Active          bool   `json:"active"`
+		DiceSetupActive bool   `json:"diceSetupActive"`
 	}{
-		Dice:     diceCopy,
-		Complete: complete,
-		Ready:    ready,
+		Dice:            diceCopy,
+		Complete:        complete,
+		Ready:           ready,
+		Active:          active,
+		DiceSetupActive: setupActive,
 	}
 	b, _ := json.Marshal(payload)
 	if a.ctx != nil {

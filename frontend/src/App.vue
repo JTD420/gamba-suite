@@ -1186,24 +1186,39 @@ export default {
     // Dice setup updates from backend
     window.runtime.EventsOn("diceSetupUpdate", (jsonStr) => {
       try {
-        const payload = JSON.parse(jsonStr || '{}');
+        const payload = JSON.parse(jsonStr || '{}') || {};
         const dice = (payload.dice || []).map(d => ({ id: d.ID, value: d.Value, rolled: d.Value && d.Value > 0 }));
         // ensure five slots
         this.diceSetup = Array.from({ length: 5 }).map((_, i) => dice[i] || { id: 0, value: 0, rolled: false });
+
+        const active = !!payload.active;
+        const setupActive = !!payload.diceSetupActive;
+        const ready = !!payload.ready;
+
+        // If backend reports the casino is not active and setup is not active,
+        // immediately switch UI back to stopped so it doesn't remain "Running".
+        if (!active && !setupActive) {
+          this.casinoStatus = 'Stopped';
+          this.casinoStatusKey = 'stopped';
+          this.showDiceSetupModal = false;
+          this.diceSetup = Array.from({ length: 5 }).map(() => ({ id: 0, value: 0, rolled: false }));
+          return;
+        }
+
         if (payload.complete) {
           // small delay so user sees final green
           setTimeout(() => {
             this.showDiceSetupModal = false;
             this.addLogMsg('[UI] Dice setup complete');
           }, 700);
-          // only flip to running if not stopped
-          if (this.casinoStatusKey !== 'stopped') {
+          // only flip to running if backend indicates active/ready
+          if (active || ready) {
             this.casinoStatus = 'Running';
             this.casinoStatusKey = 'running';
           }
         } else {
-          // update awaiting status if we're in awaiting mode
-          if (this.casinoStatusKey === 'awaiting') {
+          // update awaiting status when setup is active
+          if (setupActive) {
             this.casinoStatus = 'Awaiting dice rolls';
             this.casinoStatusKey = 'awaiting';
           }

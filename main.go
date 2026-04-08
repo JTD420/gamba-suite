@@ -241,6 +241,7 @@ type LiveDealerStatusPayload struct {
 	GameActive         bool        `json:"gameActive"`
 	SnapshotReady      bool        `json:"snapshotReady"`
 	DealerName         string      `json:"dealerName"`
+	RoomName           string      `json:"roomName"`
 	MaxUniqueItems     int         `json:"maxUniqueItems"`
 	MaxQuantityPerItem int         `json:"maxQuantityPerItem"`
 	Snapshot           []TradeItem `json:"snapshot,omitempty"`
@@ -417,6 +418,7 @@ type App struct {
 	currentGameHistoryID string
 	ctx                  context.Context
 	currentDealerName    string
+	currentRoomName      string
 }
 
 type PokerDisplayConfig struct {
@@ -461,6 +463,21 @@ func (a *App) getCurrentDealerName() string {
 		return v
 	}
 	return "Dealer"
+}
+
+// getCurrentRoomName returns the configured room name, preferring an
+// explicitly set value on the App instance, then an optional environment
+// override, otherwise empty string.
+func (a *App) getCurrentRoomName() string {
+	if a != nil {
+		if n := strings.TrimSpace(a.currentRoomName); n != "" {
+			return n
+		}
+	}
+	if v := os.Getenv("LIVE_SYNC_ROOM_NAME"); v != "" {
+		return v
+	}
+	return ""
 }
 
 func (a *App) startup(ctx context.Context) {
@@ -4571,6 +4588,7 @@ func (a *App) sendLiveDealerSnapshot(items []TradeItem) {
 			GameActive:         dealerGameActive(),
 			SnapshotReady:      tradeHandSnapshotReady,
 			DealerName:         a.getCurrentDealerName(),
+			RoomName:           a.getCurrentRoomName(),
 			MaxUniqueItems:     maxTradeUniqueItems,
 			MaxQuantityPerItem: maxTradeQuantityPerItem,
 			Snapshot:           snapshot,
@@ -4621,6 +4639,7 @@ func (a *App) sendLiveDealerStatus(open bool, dealerName string) {
 			GameActive:         dealerGameActive(),
 			SnapshotReady:      tradeHandSnapshotReady,
 			DealerName:         strings.TrimSpace(name),
+			RoomName:           a.getCurrentRoomName(),
 			MaxUniqueItems:     maxTradeUniqueItems,
 			MaxQuantityPerItem: maxTradeQuantityPerItem,
 		}
@@ -5967,7 +5986,7 @@ func resetDiceState() {
 // when the user clicks the "Start Casino" button. It resets any existing dice and
 // enables recording of incoming dice IDs. It also receives trade-limit configuration
 // values which are stored in global state and emitted in live-dealer payloads.
-func (a *App) StartCasinoSetup(dealerName string, maxUniqueItems int, maxQuantityPerItem int) {
+func (a *App) StartCasinoSetup(dealerName string, roomName string, maxUniqueItems int, maxQuantityPerItem int) {
 	// Reset state first (this will lock/unlock internally)
 	resetDiceState()
 
@@ -5989,6 +6008,8 @@ func (a *App) StartCasinoSetup(dealerName string, maxUniqueItems int, maxQuantit
 		}
 	}
 	a.currentDealerName = name
+	// Persist room name from frontend
+	a.currentRoomName = strings.TrimSpace(roomName)
 
 	// Sanitize and persist configured trade limits
 	if maxUniqueItems < 1 {

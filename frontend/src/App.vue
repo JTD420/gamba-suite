@@ -65,6 +65,15 @@
             <div class="game-guide-block">
               <input v-model="dealerNameInput" type="text" placeholder="Your Habbo username" style="width:100%;padding:8px;border-radius:4px;border:1px solid #ccc;max-width:420px;" />
             </div>
+            <div class="game-guide-block">
+              <div class="game-guide-label">Room Name</div>
+              <input
+                v-model="roomNameInput"
+                type="text"
+                placeholder="Habbo room name"
+                style="width:100%;padding:8px;border-radius:4px;border:1px solid #ccc;max-width:420px;"
+              />
+            </div>
             <div class="game-guide-block dealer-limits-grid">
               <div class="dealer-limit-field">
                 <div class="game-guide-label">Max Unique Items</div>
@@ -673,6 +682,7 @@ export default {
       showDiceSetupModal: false,
       showDealerNameModal: false,
       dealerNameInput: '',
+      roomNameInput: '',
       maxUniqueItemsInput: 5,
       maxQuantityPerItemInput: 50,
       diceSetup: [],
@@ -819,21 +829,32 @@ export default {
       async confirmDealerName() {
         try {
           const name = (this.dealerNameInput || '').trim();
+          const roomName = (this.roomNameInput || '').trim();
           const maxUnique = Number(this.maxUniqueItemsInput || 0);
           const maxPer = Number(this.maxQuantityPerItemInput || 0);
+
           if (!name) {
             this.addLogMsg('[UI] Start cancelled: no dealer name provided');
             return;
           }
+
+          if (!roomName) {
+            this.addLogMsg('[UI] Start cancelled: no room name provided');
+            return;
+          }
+
           if (!Number.isInteger(maxUnique) || maxUnique < 1) {
             this.addLogMsg('[UI] Start cancelled: max unique items must be a positive integer');
             return;
           }
+
           if (!Number.isInteger(maxPer) || maxPer < 1) {
             this.addLogMsg('[UI] Start cancelled: max quantity per item must be a positive integer');
             return;
           }
-          await window.go.main.App.StartCasinoSetup(name, maxUnique, maxPer);
+
+          await window.go.main.App.StartCasinoSetup(name, roomName, maxUnique, maxPer);
+
           this.showDealerNameModal = false;
           this.diceSetup = Array.from({ length: 5 }).map(() => ({ rolled: false, id: 0, value: 0 }));
           this.showDiceSetupModal = true;

@@ -176,7 +176,13 @@ var (
 	// lastAllTradeItems stores the last full TRADE_ITEMS (all items) packet
 	// so we can compute deltas between successive full-state packets. This
 	// helps reliably attribute the first added item to the correct side.
-	lastAllTradeItems          []TradeItem
+	lastAllTradeItems []TradeItem
+	// partnerAcceptedSnapshot holds a copy of the trade full-state the partner
+	// accepted (set when incoming header 109 is received). Used to determine
+	// whether a subsequent TRADE_ITEMS packet actually changes the accepted
+	// contents or merely restores them; allows re-arming auto-accept on
+	// invalid->valid transitions when appropriate.
+	partnerAcceptedSnapshot    []TradeItem
 	gameBetItems               []TradeItem
 	stripScanMu                sync.Mutex
 	stripScanActive            bool
@@ -305,6 +311,33 @@ func formatTradeLimitViolationMessage(v *tradeLimitViolation) string {
 		return fmt.Sprintf("Too many unique items and too much quantity. Max %d different item types and max %d per item. Quantity too high for: %s.", v.MaxUnique, v.MaxPerItem, strings.Join(names, ", "))
 	}
 	return fmt.Sprintf("Too many unique items. Max %d different item types and max %d per item.", v.MaxUnique, v.MaxPerItem)
+}
+
+// equalTradeItemLists compares two slices of TradeItem for equality by
+// canonicalizing to a name->quantity map and comparing maps. Order is
+// ignored. Useful for detecting whether a full TRADE_ITEMS packet matches
+// a previously recorded snapshot (e.g., partnerAcceptedSnapshot).
+func equalTradeItemLists(a, b []TradeItem) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
+	ma := make(map[string]int)
+	mb := make(map[string]int)
+	for _, it := range a {
+		ma[strings.ToLower(strings.TrimSpace(it.Name))] += it.Quantity
+	}
+	for _, it := range b {
+		mb[strings.ToLower(strings.TrimSpace(it.Name))] += it.Quantity
+	}
+	if len(ma) != len(mb) {
+		return false
+	}
+	for k, v := range ma {
+		if mb[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // rejectTradeForLimitViolation announces the reason, closes the trade and reopens the dealer.
@@ -1179,6 +1212,18 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		// Partner accepted the current trade state. Record this so a later
 		// TRA_ITEMS update will treat it as stale.
 		partnerTradeAccepted = true
+		// Snapshot the full-state the partner accepted so we can detect
+		// whether later TRADE_ITEMS actually change the accepted contents.
+		tradeItemsMu.Lock()
+		if len(lastAllTradeItems) > 0 {
+			partnerAcceptedSnapshot = make([]TradeItem, len(lastAllTradeItems))
+			copy(partnerAcceptedSnapshot, lastAllTradeItems)
+		} else {
+			// Fallback: snapshot currentTradeItems when lastAllTradeItems is empty
+			partnerAcceptedSnapshot = make([]TradeItem, len(currentTradeItems))
+			copy(partnerAcceptedSnapshot, currentTradeItems)
+		}
+		tradeItemsMu.Unlock()
 		a.AddLogMsg("[TRADE_ACCEPT] partner accepted current trade state")
 		log.Printf("[TRADE_ACCEPT] partner accepted current trade state")
 		scheduleAutoTradeAccept(a, string(e.Packet.Data))
@@ -1201,15 +1246,9 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		allItems := a.parseTradeItemsPacket(e.Packet.Data)
 
 		if !payoutTradeActive {
-			// Non-payout: partner offer is the full list.
-			tradeItemsMu.Lock()
-			currentTradeItems = make([]TradeItem, len(allItems))
-			copy(currentTradeItems, allItems)
-			currentOwnTradeItems = []TradeItem{}
-			// Save baseline full-state
-			lastAllTradeItems = make([]TradeItem, len(allItems))
-			copy(lastAllTradeItems, allItems)
-			tradeItemsMu.Unlock()
+			// Non-payout: partner offer is the full list. We'll update the
+			// tracked current/last-state below once we've captured the
+			// previous state for transition detection.
 
 			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] partner=%d all=%d (non-payout)", len(currentTradeItems), len(allItems)))
 			log.Printf("[TRADE_ITEMS #108] partner=%d all=%d (non-payout)", len(currentTradeItems), len(allItems))
@@ -1225,14 +1264,50 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				extendTradeWindowTimeoutForPartnerActivity(a)
 			}
 
-			// Contents changed: any prior partner-accept is now stale.
-			partnerTradeAccepted = false
+			// Determine previous validity so we can detect invalid->valid
+			// transitions and re-arm auto-accept if the partner had already
+			// accepted before the invalid state.
+			tradeItemsMu.Lock()
+			prevAllCopy := make([]TradeItem, len(lastAllTradeItems))
+			copy(prevAllCopy, lastAllTradeItems)
+			tradeItemsMu.Unlock()
 
-			// Validate incoming partner offer against configured trade limits.
+			wasValid := true
+			if len(prevAllCopy) > 0 {
+				wasValid = getTradeLimitViolation(prevAllCopy) == nil
+			}
+
+			// Update current/tracking state (atomic under lock as before).
+			tradeItemsMu.Lock()
+			currentTradeItems = make([]TradeItem, len(allItems))
+			copy(currentTradeItems, allItems)
+			currentOwnTradeItems = []TradeItem{}
+			// Save baseline full-state
+			lastAllTradeItems = make([]TradeItem, len(allItems))
+			copy(lastAllTradeItems, allItems)
+			// Capture accepted-snapshot locally for comparison
+			acceptedSnap := make([]TradeItem, len(partnerAcceptedSnapshot))
+			copy(acceptedSnap, partnerAcceptedSnapshot)
+			tradeItemsMu.Unlock()
+
+			// Contents changed: only clear partner accept if the new full-state
+			// differs from the snapshot the partner previously accepted.
+			// If partnerAcceptedSnapshot matches the new items, keep the flag so
+			// we can re-arm auto-accept when limits recover.
 			tradeItemsMu.Lock()
 			itemsCopy := make([]TradeItem, len(currentTradeItems))
 			copy(itemsCopy, currentTradeItems)
 			tradeItemsMu.Unlock()
+
+			// By default, assume accept is stale unless it matches the snapshot.
+			keepPartnerAccept := false
+			if len(acceptedSnap) > 0 && equalTradeItemLists(itemsCopy, acceptedSnap) {
+				keepPartnerAccept = true
+			}
+			if !keepPartnerAccept {
+				partnerTradeAccepted = false
+				partnerAcceptedSnapshot = nil
+			}
 			// Debug: show parsed trade items prior to validation so we can see
 			// exactly what the bot thinks the partner is offering.
 			a.AddLogMsg(fmt.Sprintf("[TRADE_LIMIT_DEBUG] validating %d parsed trade items", len(itemsCopy)))
@@ -1241,6 +1316,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				log.Printf("[TRADE_LIMIT_DEBUG] parsed[%d] name=%q qty=%d", i, it.Name, it.Quantity)
 			}
 			violation := getTradeLimitViolation(itemsCopy)
+			isValid := violation == nil
 			if violation != nil {
 				tradeLimitWasActive = true
 				a.rejectTradeForLimitViolation(violation)
@@ -1256,6 +1332,20 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				a.AddLogMsg("[TRADE_LIMIT] violation resolved; resuming normal trade flow")
 				log.Printf("[TRADE_LIMIT] violation resolved; resuming normal trade flow")
 				ext.Send(out.SHOUT, "Trade limits OK now, you can accept")
+			}
+
+			// Regardless of whether a trade-limit monitor was active, if the
+			// canonical previous state was invalid but the new state is valid,
+			// consider re-arming auto-accept when the partner had earlier
+			// accepted the same state.
+			if !wasValid && isValid {
+				a.AddLogMsg(fmt.Sprintf("[TRADE_LIMIT] transition invalid->valid detected prevPartnerAccepted=%t", partnerTradeAccepted))
+				log.Printf("[TRADE_LIMIT] transition invalid->valid detected prevPartnerAccepted=%t", partnerTradeAccepted)
+				if partnerTradeAccepted && !tradeAutoAccepted && !tradeAutoAcceptPending {
+					a.AddLogMsg("[TRADE_ACCEPT] re-arming auto-accept after invalid->valid transition")
+					log.Printf("[TRADE_ACCEPT] re-arming auto-accept after invalid->valid transition")
+					scheduleAutoTradeAccept(a, "rearmed-after-limit-fix")
+				}
 			}
 
 			handItemsMu.Lock()
@@ -1381,6 +1471,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		tradeAutoConfirmPending = false
 		// Clear any partner accept / trade-limit state after a completed trade
 		partnerTradeAccepted = false
+		partnerAcceptedSnapshot = nil
 		tradeLimitWasActive = false
 		lastTradeLimitNotice = ""
 		stopTradeLimitMonitor()
@@ -1715,6 +1806,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		// fresh baseline for delta calculations.
 		tradeItemsMu.Lock()
 		lastAllTradeItems = nil
+		partnerAcceptedSnapshot = nil
 		tradeItemsMu.Unlock()
 
 		addItemMu.Lock()
@@ -3789,6 +3881,7 @@ func (a *App) ClearTradeItems() {
 	currentTradeItems = []TradeItem{}
 	currentOwnTradeItems = []TradeItem{}
 	lastAllTradeItems = nil
+	partnerAcceptedSnapshot = nil
 	tradeItemsMu.Unlock()
 
 	handItemsMu.Lock()
@@ -3976,6 +4069,7 @@ func (a *App) reopenDealerIdle(reason string) {
 	tradeLimitWasActive = false
 	lastTradeLimitNotice = ""
 	partnerTradeAccepted = false
+	partnerAcceptedSnapshot = nil
 
 	resetTradeAutoFlow()
 	a.ClearTradeItems()

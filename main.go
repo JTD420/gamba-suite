@@ -212,6 +212,16 @@ type TradeItem struct {
 	RawData  string // Store raw field for debugging
 }
 
+type LiveDealerStatusPayload struct {
+	LastSeenAt    string      `json:"lastSeenAt"`
+	DealerOpen    bool        `json:"dealerOpen"`
+	TradeOpen     bool        `json:"tradeOpen"`
+	GameActive    bool        `json:"gameActive"`
+	SnapshotReady bool        `json:"snapshotReady"`
+	DealerName    string      `json:"dealerName"`
+	Snapshot      []TradeItem `json:"snapshot,omitempty"`
+}
+
 type RoomIdentityEntry struct {
 	Name      string `json:"name"`
 	Token     string `json:"token"`
@@ -346,6 +356,19 @@ func (a *App) startup(ctx context.Context) {
 			a.requestPlayerStrip(false)
 		}
 	}()
+
+	// Send an initial heartbeat so external dashboards receive immediate status
+	a.sendLiveDealerStatus(awaitingTradeOpen && dealerTradeWindowOpen, a.getCurrentDealerName())
+
+	// Start a periodic heartbeat to keep the website's lastSeenAt fresh.
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			a.sendLiveDealerStatus(awaitingTradeOpen && dealerTradeWindowOpen, a.getCurrentDealerName())
+		}
+	}()
+
 }
 
 func (a *App) LoadConfig() *PokerDisplayConfig {
@@ -4105,12 +4128,14 @@ func (a *App) emitHandItemsUpdate() {
 // Runs asynchronously and logs status via `AddLogMsg`.
 func (a *App) sendLiveDealerSnapshot(items []TradeItem) {
 	go func(snapshot []TradeItem) {
-		payload := map[string]interface{}{
-			"timestamp":     time.Now().UTC().Format(time.RFC3339),
-			"snapshot":      snapshot,
-			"tradeOpen":     tradeOpen,
-			"snapshotReady": tradeHandSnapshotReady,
-			"currentPlayer": a.getCurrentDealerName(),
+		payload := LiveDealerStatusPayload{
+			LastSeenAt:    time.Now().UTC().Format(time.RFC3339),
+			DealerOpen:    awaitingTradeOpen && dealerTradeWindowOpen,
+			TradeOpen:     tradeOpen,
+			GameActive:    dealerGameActive(),
+			SnapshotReady: tradeHandSnapshotReady,
+			DealerName:    a.getCurrentDealerName(),
+			Snapshot:      snapshot,
 		}
 
 		jb, err := json.Marshal(payload)
@@ -4151,13 +4176,13 @@ func (a *App) sendLiveDealerSnapshot(items []TradeItem) {
 // to the configured live-dealer webhook. Runs asynchronously and logs status.
 func (a *App) sendLiveDealerStatus(open bool, dealerName string) {
 	go func(dealerOpen bool, name string) {
-		payload := map[string]interface{}{
-			"dealerOpen":    dealerOpen,
-			"tradeOpen":     tradeOpen,
-			"gameActive":    dealerGameActive(),
-			"snapshotReady": tradeHandSnapshotReady,
-			"updatedAt":     time.Now().UTC().Format(time.RFC3339),
-			"currentPlayer": strings.TrimSpace(name),
+		payload := LiveDealerStatusPayload{
+			LastSeenAt:    time.Now().UTC().Format(time.RFC3339),
+			DealerOpen:    dealerOpen,
+			TradeOpen:     tradeOpen,
+			GameActive:    dealerGameActive(),
+			SnapshotReady: tradeHandSnapshotReady,
+			DealerName:    strings.TrimSpace(name),
 		}
 
 		jb, err := json.Marshal(payload)

@@ -116,42 +116,48 @@ var (
 	tradeLimitMonitorActive   bool
 	tradeLimitMonitorDeadline time.Time
 	lastTradeLimitNotice      string
-	lastTradeOpenData         string
-	lastTradeOpen             string
-	tradeOpen                 bool
-	isPokerRolling            bool
-	isTriRolling              bool
-	isBJRolling               bool
-	is13Rolling               bool
-	is13Hitting               bool
-	isHitting                 bool
-	isClosing                 bool
-	ChatIsDisabled            bool
-	mutex                     sync.Mutex
-	resultsWaitGroup          sync.WaitGroup
-	rollDelay                 = 550 * time.Millisecond
-	stripNextDelay            = 2250 * time.Millisecond
-	stripGetNewPayload        = "new"
-	stripGetNextPayload       = "next"
-	tradeUserPattern          = regexp.MustCompile(`\[(\d+)\]`)
-	stripItemNameRe           = regexp.MustCompile(`(?:CF_\d+_[a-z][a-z_]*|[a-z][a-z0-9_]*_[a-z0-9_]+)(?:\*\d+)?`)
-	gameChoiceCleanupRe       = regexp.MustCompile(`[^a-z0-9]+`)
-	roomEntities              = map[int]room.Entity{}
-	roomMu                    sync.Mutex
-	lastRoomUsersRequestAt    time.Time
-	roomUsersReqMu            sync.Mutex
-	users28ByToken            = map[string]string{}
-	users28ByIndex            = map[int]string{} // roomIndex -> name
-	users28ByShortToken       = map[string]string{}
-	roomIdentityByShortToken  = map[string]RoomIdentityEntry{}
-	users28Mu                 sync.Mutex
-	headerSniffUntil          time.Time
-	headerSniffSeen           = map[uint16]bool{}
-	headerSniffMu             sync.Mutex
-	currentTradeItems         []TradeItem
-	currentOwnTradeItems      []TradeItem
-	tradeItemsMu              sync.Mutex
-	lastAddItemWasOurs        bool
+	// Whether the partner has accepted the current (possibly stale) trade state
+	partnerTradeAccepted bool
+	// Whether a trade-limit warning was previously active (used to detect
+	// transitions from invalid -> valid and to shout a one-time "now valid"
+	// message).
+	tradeLimitWasActive      bool
+	lastTradeOpenData        string
+	lastTradeOpen            string
+	tradeOpen                bool
+	isPokerRolling           bool
+	isTriRolling             bool
+	isBJRolling              bool
+	is13Rolling              bool
+	is13Hitting              bool
+	isHitting                bool
+	isClosing                bool
+	ChatIsDisabled           bool
+	mutex                    sync.Mutex
+	resultsWaitGroup         sync.WaitGroup
+	rollDelay                = 550 * time.Millisecond
+	stripNextDelay           = 2250 * time.Millisecond
+	stripGetNewPayload       = "new"
+	stripGetNextPayload      = "next"
+	tradeUserPattern         = regexp.MustCompile(`\[(\d+)\]`)
+	stripItemNameRe          = regexp.MustCompile(`(?:CF_\d+_[a-z][a-z_]*|[a-z][a-z0-9_]*_[a-z0-9_]+)(?:\*\d+)?`)
+	gameChoiceCleanupRe      = regexp.MustCompile(`[^a-z0-9]+`)
+	roomEntities             = map[int]room.Entity{}
+	roomMu                   sync.Mutex
+	lastRoomUsersRequestAt   time.Time
+	roomUsersReqMu           sync.Mutex
+	users28ByToken           = map[string]string{}
+	users28ByIndex           = map[int]string{} // roomIndex -> name
+	users28ByShortToken      = map[string]string{}
+	roomIdentityByShortToken = map[string]RoomIdentityEntry{}
+	users28Mu                sync.Mutex
+	headerSniffUntil         time.Time
+	headerSniffSeen          = map[uint16]bool{}
+	headerSniffMu            sync.Mutex
+	currentTradeItems        []TradeItem
+	currentOwnTradeItems     []TradeItem
+	tradeItemsMu             sync.Mutex
+	lastAddItemWasOurs       bool
 	// lastAddItemByUsAt records when we observed an outgoing TRADE_ADDITEM
 	// packet. Use this timestamp in debugging to detect races between the
 	// outgoing add and the subsequent server TRADE_ITEMS update.
@@ -258,13 +264,16 @@ func getTradeLimitViolation(items []TradeItem) *tradeLimitViolation {
 		v.TooManyUniqueItems = true
 	}
 	for _, it := range items {
-		if it.Quantity > v.MaxPerItem {
+		over := it.Quantity > v.MaxPerItem
+		log.Printf("[TRADE_LIMIT_DEBUG] check item=%q qty=%d max=%d over=%t", it.Name, it.Quantity, v.MaxPerItem, over)
+		if over {
 			v.OverLimitItems = append(v.OverLimitItems, it)
 		}
 	}
 	if len(v.OverLimitItems) > 0 {
 		v.TooMuchQuantity = true
 	}
+	log.Printf("[TRADE_LIMIT_DEBUG] unique=%d maxUnique=%d tooManyUnique=%t tooMuchQuantity=%t", v.UniqueCount, v.MaxUnique, v.TooManyUniqueItems, v.TooMuchQuantity)
 	if !v.TooManyUniqueItems && !v.TooMuchQuantity {
 		return nil
 	}
@@ -306,11 +315,13 @@ func (a *App) rejectTradeForLimitViolation(v *tradeLimitViolation) {
 	msg := formatTradeLimitViolationMessage(v)
 	a.AddLogMsg("[TRADE_LIMIT] " + msg)
 	log.Printf("[TRADE_LIMIT] %s", msg)
-	// Only shout when the message changed since the last notice.
-	changed := msg != lastTradeLimitNotice
+	// Decide whether to shout. Always shout for quantity violations so the
+	// player is informed each time they push an over-limit quantity. For
+	// unique-item violations we may still dedupe by message text.
+	shouldShout := v.TooMuchQuantity || msg != lastTradeLimitNotice
 	lastTradeLimitNotice = msg
 
-	if changed {
+	if shouldShout {
 		go func(m string) {
 			time.Sleep(350 * time.Millisecond)
 			ext.Send(out.SHOUT, m)
@@ -319,6 +330,9 @@ func (a *App) rejectTradeForLimitViolation(v *tradeLimitViolation) {
 
 	// Start a short-lived grace timer instead of closing immediately so the
 	// partner has a chance to remove offending items (similar to shortage flow).
+	// Mark that a trade-limit warning is active so we can detect when it
+	// transitions back to a valid state.
+	tradeLimitWasActive = true
 	startTradeLimitMonitor(a, 12*time.Second)
 }
 
@@ -1162,6 +1176,11 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 	// TRADE_ACCEPT incoming 109 - wait 2 seconds then send TRADE_ACCEPT (69)
 	if e.Packet.Header.Value == 109 {
+		// Partner accepted the current trade state. Record this so a later
+		// TRA_ITEMS update will treat it as stale.
+		partnerTradeAccepted = true
+		a.AddLogMsg("[TRADE_ACCEPT] partner accepted current trade state")
+		log.Printf("[TRADE_ACCEPT] partner accepted current trade state")
 		scheduleAutoTradeAccept(a, string(e.Packet.Data))
 		return
 	}
@@ -1206,14 +1225,37 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				extendTradeWindowTimeoutForPartnerActivity(a)
 			}
 
+			// Contents changed: any prior partner-accept is now stale.
+			partnerTradeAccepted = false
+
 			// Validate incoming partner offer against configured trade limits.
 			tradeItemsMu.Lock()
 			itemsCopy := make([]TradeItem, len(currentTradeItems))
 			copy(itemsCopy, currentTradeItems)
 			tradeItemsMu.Unlock()
-			if violation := getTradeLimitViolation(itemsCopy); violation != nil {
+			// Debug: show parsed trade items prior to validation so we can see
+			// exactly what the bot thinks the partner is offering.
+			a.AddLogMsg(fmt.Sprintf("[TRADE_LIMIT_DEBUG] validating %d parsed trade items", len(itemsCopy)))
+			for i, it := range itemsCopy {
+				a.AddLogMsg(fmt.Sprintf("[TRADE_LIMIT_DEBUG] parsed[%d] name=%q qty=%d", i, it.Name, it.Quantity))
+				log.Printf("[TRADE_LIMIT_DEBUG] parsed[%d] name=%q qty=%d", i, it.Name, it.Quantity)
+			}
+			violation := getTradeLimitViolation(itemsCopy)
+			if violation != nil {
+				tradeLimitWasActive = true
 				a.rejectTradeForLimitViolation(violation)
 				return
+			}
+
+			// If we previously had an active trade-limit warning or monitor,
+			// stop it now that the offer is valid again and notify the player.
+			if tradeLimitWasActive || tradeLimitMonitorActive {
+				stopTradeLimitMonitor()
+				lastTradeLimitNotice = ""
+				tradeLimitWasActive = false
+				a.AddLogMsg("[TRADE_LIMIT] violation resolved; resuming normal trade flow")
+				log.Printf("[TRADE_LIMIT] violation resolved; resuming normal trade flow")
+				ext.Send(out.SHOUT, "Trade limits OK now, you can accept")
 			}
 
 			handItemsMu.Lock()
@@ -1337,6 +1379,11 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		tradeCompleted = true
 		tradeAutoConfirmed = true
 		tradeAutoConfirmPending = false
+		// Clear any partner accept / trade-limit state after a completed trade
+		partnerTradeAccepted = false
+		tradeLimitWasActive = false
+		lastTradeLimitNotice = ""
+		stopTradeLimitMonitor()
 		if payoutTradeActive {
 			stopPayoutResponseTimeoutMonitor()
 			resetPayoutRetryState()
@@ -1673,6 +1720,12 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		addItemMu.Lock()
 		lastAddItemWasOurs = false
 		addItemMu.Unlock()
+
+		// Reset partner accept and any lingering trade-limit state for new trade
+		partnerTradeAccepted = false
+		tradeLimitWasActive = false
+		lastTradeLimitNotice = ""
+		stopTradeLimitMonitor()
 
 		go func() {
 			if ok := a.forceRefreshHandSnapshot("incoming trade open"); ok {
@@ -2757,8 +2810,8 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 		copy(itemsCopy, currentTradeItems)
 		tradeItemsMu.Unlock()
 		if v := getTradeLimitViolation(itemsCopy); v != nil {
-			a.AddLogMsg("[TRADE_ACCEPT] skipped auto-accept due to trade limit violation")
-			log.Printf("[TRADE_ACCEPT] skipped auto-accept due to trade limit violation")
+			a.AddLogMsg("[TRADE_ACCEPT] skipped auto-accept due to active trade limit violation")
+			log.Printf("[TRADE_ACCEPT] skipped auto-accept due to active trade limit violation")
 			return
 		}
 		// If snapshot not ready (s == nil) allow scheduling and perform a
@@ -2814,8 +2867,8 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 				tradeItemsMu.Unlock()
 				if v := getTradeLimitViolation(itemsCopy); v != nil {
 					tradeAutoAcceptPending = false
-					a.AddLogMsg("[TRADE_ACCEPT] canceled auto-accept due to trade limit violation")
-					log.Printf("[TRADE_ACCEPT] canceled auto-accept due to trade limit violation")
+					a.AddLogMsg("[TRADE_ACCEPT] canceled auto-accept because trade became invalid during wait")
+					log.Printf("[TRADE_ACCEPT] canceled auto-accept because trade became invalid during wait")
 					return
 				}
 				break
@@ -3426,13 +3479,26 @@ func (a *App) parseTradeItemsPacket(data []byte) []TradeItem {
 		}
 
 		fieldStr := strings.TrimSpace(string(field))
+		// Log the raw field to aid debugging of parsing failures.
+		a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] field=%q", fieldStr))
+		log.Printf("[TRADE_PARSE_DEBUG] field=%q", fieldStr)
+
 		itemName, qty, ok := a.extractTradeItemAndQuantity(fieldStr)
 		if !ok {
+			a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] skipped field=%q", fieldStr))
+			log.Printf("[TRADE_PARSE_DEBUG] skipped field=%q", fieldStr)
+			// Preserve unknown raw field in logs for later inspection.
+			a.AddLogMsg(fmt.Sprintf("[TRADE_UNKNOWN_FIELD] raw=%q", fieldStr))
+			log.Printf("[TRADE_UNKNOWN_FIELD] raw=%q", fieldStr)
 			continue
 		}
 		if qty <= 0 {
 			qty = 1
 		}
+
+		// Successful parse: record and log.
+		a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] parsed field=%q -> name=%q qty=%d", fieldStr, itemName, qty))
+		log.Printf("[TRADE_PARSE_DEBUG] parsed field=%q -> name=%q qty=%d", fieldStr, itemName, qty)
 
 		counts[itemName] += qty
 		if _, exists := rawByName[itemName]; !exists {
@@ -3463,35 +3529,80 @@ func (a *App) parseTradeItemsPacket(data []byte) []TradeItem {
 }
 
 func (a *App) extractTradeItemAndQuantity(field string) (string, int, bool) {
-	// Legacy format example: "itkoHP|club_sofa"
+	// Try legacy format first (e.g. "itkoHP|club_sofa")
+	a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] try legacy branch field=%q", field))
+	log.Printf("[TRADE_PARSE_DEBUG] try legacy branch field=%q", field)
 	if strings.Contains(field, "|") {
 		parts := strings.Split(field, "|")
 		if len(parts) >= 2 {
-			if name, qty, ok := a.normalizeTradeFieldClassWithQty(parts[len(parts)-1]); ok {
+			cand := strings.TrimSpace(parts[len(parts)-1])
+			a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] legacy candidate=%q", cand))
+			log.Printf("[TRADE_PARSE_DEBUG] legacy candidate=%q", cand)
+			if name, qty, ok := a.normalizeTradeFieldClassWithQty(cand); ok {
+				a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] legacy parsed %q -> %q", cand, name))
+				log.Printf("[TRADE_PARSE_DEBUG] legacy parsed %q -> %q", cand, name)
 				return name, qty, true
 			}
+			a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] legacy failed to parse candidate=%q", cand))
+			log.Printf("[TRADE_PARSE_DEBUG] legacy failed to parse candidate=%q", cand)
 		}
 	}
 
-	// Current format example: "irbUAXb{chair_plasty*2" or "irbUAXb{chair_plasty*109"
+	// Try current format (e.g. "irbUAXb{chair_plasty*2")
+	a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] try current branch field=%q", field))
+	log.Printf("[TRADE_PARSE_DEBUG] try current branch field=%q", field)
 	if strings.Contains(field, "{") {
 		parts := strings.SplitN(field, "{", 2)
 		if len(parts) == 2 {
-			if name, qty, ok := a.normalizeTradeFieldClassWithQty(parts[1]); ok {
+			cand := strings.TrimSpace(parts[1])
+			a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] current candidate=%q", cand))
+			log.Printf("[TRADE_PARSE_DEBUG] current candidate=%q", cand)
+			if name, qty, ok := a.normalizeTradeFieldClassWithQty(cand); ok {
+				a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] current parsed %q -> %q", cand, name))
+				log.Printf("[TRADE_PARSE_DEBUG] current parsed %q -> %q", cand, name)
 				return name, qty, true
 			}
+			a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] current failed to parse candidate=%q", cand))
+			log.Printf("[TRADE_PARSE_DEBUG] current failed to parse candidate=%q", cand)
 		}
 	}
 
-	// Fallback: try to locate a class-name-like substring anywhere in the
-	// field (some server payloads embed the class without a '{' or '|'
-	// wrapper). Use the strict stripItemNameRe to find a candidate.
+	// Fallback: try strict strip regex first, then try looser token candidates.
+	a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] try fallback for field=%q", field))
+	log.Printf("[TRADE_PARSE_DEBUG] try fallback for field=%q", field)
+
 	if match := stripItemNameRe.FindString(field); match != "" {
+		a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] fallback strict matched=%q inside=%q", match, field))
+		log.Printf("[TRADE_PARSE_DEBUG] fallback strict matched=%q inside=%q", match, field)
 		if name, qty, ok := a.normalizeTradeFieldClassWithQty(match); ok {
 			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS_PARSE_FALLBACK] matched %q inside %q", match, field))
 			log.Printf("[TRADE_ITEMS_PARSE_FALLBACK] matched %q inside %q", match, field)
 			return name, qty, true
 		}
+		a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] fallback strict match %q rejected by normalisation/raw-check", match))
+		log.Printf("[TRADE_PARSE_DEBUG] fallback strict match %q rejected by normalisation/raw-check", match)
+	}
+
+	// Looser candidate scanning: find word-like tokens and try each one.
+	candidateRe := regexp.MustCompile(`[A-Za-z][A-Za-z0-9_]*(?:\*\d+)?`)
+	matches := candidateRe.FindAllString(field, -1)
+	if len(matches) > 0 {
+		a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] fallback candidates=%q", matches))
+		log.Printf("[TRADE_PARSE_DEBUG] fallback candidates=%q", matches)
+		for _, cand := range matches {
+			a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] fallback trying candidate=%q", cand))
+			log.Printf("[TRADE_PARSE_DEBUG] fallback trying candidate=%q", cand)
+			if name, qty, ok := a.normalizeTradeFieldClassWithQty(cand); ok {
+				a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] fallback accepted candidate=%q -> %q", cand, name))
+				log.Printf("[TRADE_PARSE_DEBUG] fallback accepted candidate=%q -> %q", cand, name)
+				return name, qty, true
+			}
+			a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] fallback candidate rejected=%q", cand))
+			log.Printf("[TRADE_PARSE_DEBUG] fallback candidate rejected=%q", cand)
+		}
+	} else {
+		a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] fallback found no candidates in %q", field))
+		log.Printf("[TRADE_PARSE_DEBUG] fallback found no candidates in %q", field)
 	}
 
 	return "", 0, false
@@ -3663,6 +3774,11 @@ func (a *App) ClearTradeItems() {
 
 	stopUnderfundedTradeMonitor()
 	stopShortageMonitor()
+	// Ensure any trade-limit state is cleared when clearing trade items.
+	stopTradeLimitMonitor()
+	lastTradeLimitNotice = ""
+	tradeLimitWasActive = false
+	partnerTradeAccepted = false
 	lastTradeCoverageNotice = ""
 	lastTradeBlockNotice = ""
 	a.AddLogMsg("[TRADE_ITEMS] cleared partner and own trade items")
@@ -3826,6 +3942,12 @@ func (a *App) reopenDealerIdle(reason string) {
 	stopTradeWindowTimeoutMonitor()
 	stopShortageMonitor()
 	stopUnderfundedTradeMonitor()
+
+	// Ensure trade-limit monitoring state is cleared when reopening dealer.
+	stopTradeLimitMonitor()
+	tradeLimitWasActive = false
+	lastTradeLimitNotice = ""
+	partnerTradeAccepted = false
 
 	resetTradeAutoFlow()
 	a.ClearTradeItems()

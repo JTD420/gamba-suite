@@ -63,7 +63,7 @@
             </div>
             <p class="game-guide-text">This name will be shown on the live dashboard as the dealer. Please enter your Habbo username.</p>
             <div class="game-guide-block">
-              <input v-model="dealerNameInput" type="text" placeholder="Your Habbo username" style="width:100%;padding:8px;border-radius:4px;border:1px solid #ccc;max-width:420px;" />
+              <input v-model="dealerNameInput" type="text" placeholder="Your Habbo username" autocapitalize="off" autocorrect="off" spellcheck="false" style="width:100%;padding:8px;border-radius:4px;border:1px solid #ccc;max-width:420px;" />
             </div>
             <div class="game-guide-block">
               <div class="game-guide-label">Room Name</div>
@@ -567,7 +567,7 @@
         </table>
 
         <h3 class="section-title">Raw Stats (debug)</h3>
-        <pre style="max-height:300px;overflow:auto;background:#111;color:#dcdcdc;padding:8px;border-radius:6px">{{ JSON.stringify(activeStats, null, 2) }}</pre>
+        <pre class="monospace-wrap">{{ JSON.stringify(activeStats, null, 2) }}</pre>
       </div>
     </div>
 
@@ -599,6 +599,12 @@
           <div ref="debuglogbox" class="log-section debug-log-section">
             <div v-for="(msg, index) in debugLog" :key="`debug-${index}`">{{ msg }}</div>
           </div>
+            <div style="margin-top:8px">
+              <div class="game-guide-label">Python Parser (stdout)</div>
+              <pre class="monospace-wrap small py-stdout">{{ pyStdout }}</pre>
+              <div class="game-guide-label" style="margin-top:6px">Python Parser (stderr)</div>
+              <pre class="monospace-wrap small py-stderr">{{ pyStderr }}</pre>
+            </div>
         </div>
       </div>
 
@@ -696,6 +702,8 @@ export default {
       log: [],
       debugLog: [],
       chatLog: [],
+      pyStdout: '',
+      pyStderr: '',
       showNameSuggestions: false,
       showFlaggedOnly: false,
       // Auto shout UI state
@@ -1148,6 +1156,12 @@ export default {
       this.debugLog = message.split('\n');
       this.scrollBox('debuglogbox');
     });
+    window.runtime.EventsOn("pyParserStdout", (message) => {
+      this.pyStdout = message || '';
+    });
+    window.runtime.EventsOn("pyParserStderr", (message) => {
+      this.pyStderr = message || '';
+    });
     window.runtime.EventsOn("chatLogUpdate", (message) => {
       this.chatLog = message.split('\n');
       this.scrollBox('chatlogbox');
@@ -1352,6 +1366,7 @@ input[type="text"] {
   border: 1px solid #444;
   border-radius: 4px;
   color: #fff;
+  text-transform: none;
   font-size: 14px;
   max-width: 300px;
 }
@@ -2065,4 +2080,24 @@ input[type="text"]::placeholder {
 .game-settings-save {
   margin-top: 12px;
 }
+/* Monospace pre blocks that wrap long lines to avoid horizontal scroll */
+.monospace-wrap {
+  max-height: 300px;
+  background: #111;
+  color: #dcdcdc;
+  padding: 8px;
+  border-radius: 6px;
+  font-family: monospace;
+  white-space: pre-wrap; /* wrap long lines */
+  overflow-wrap: anywhere;
+  word-wrap: break-word;
+  word-break: break-word;
+  overflow-x: hidden; /* prevent horizontal scroll */
+  overflow-y: auto;
+  width: 100%;
+  box-sizing: border-box;
+}
+.monospace-wrap.small { max-height: 120px; }
+.py-stderr { background: #300; color: #f8d7da; }
+.py-stdout { background: #111; color: #dcdcdc; }
 </style>

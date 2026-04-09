@@ -127,6 +127,7 @@ var (
 	lastTradeOpenData        string
 	lastTradeOpen            string
 	tradeOpen                bool
+	messageQueue             []string
 	isPokerRolling           bool
 	isTriRolling             bool
 	isBJRolling              bool
@@ -1150,14 +1151,25 @@ func handleMuteEnd() {
 	isMuted = false
 	log.Println("Mute finished, sending queued messages...")
 
-	// ToDo:
-	// // Send all queued messages
-	// for _, message := range messageQueue {
-	// 	sendMessageWithDelay(message)
-	// }
+	// If any messages were queued while muted, send them now.
+	if len(messageQueue) > 0 {
+		log.Printf("[MUTE_QUEUE] sending %d queued messages", len(messageQueue))
 
-	// // Clear the message queue
-	// messageQueue = []string{}
+		// Ensure the dealer open flags reflect that we'll be announcing now.
+		awaitingTradeOpen = true
+		if canAnnounceDealerOpen() {
+			dealerTradeWindowOpen = true
+		}
+
+		// Send queued messages with small spacing so Habbo's flood control is less likely to trigger.
+		for _, message := range messageQueue {
+			go sendMessageWithDelay(message)
+			time.Sleep(150 * time.Millisecond)
+		}
+
+		// Clear the queue
+		messageQueue = nil
+	}
 }
 
 // waitForUnmute blocks until the mute clears or max duration elapses.
@@ -1298,6 +1310,12 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] partner=%d all=%d (non-payout)", len(currentTradeItems), len(allItems)))
 			log.Printf("[TRADE_ITEMS #108] partner=%d all=%d (non-payout)", len(currentTradeItems), len(allItems))
 
+			// When parser returns zero items, record the raw payload for debugging
+			if len(allItems) == 0 {
+				a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS_DEBUG] zero parsed items, raw=%q", string(e.Packet.Data)))
+				log.Printf("[TRADE_ITEMS_DEBUG] zero parsed items, raw=%q", string(e.Packet.Data))
+			}
+
 			for i, item := range allItems {
 				a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] raw[%d] name=%q quantity=%d", i, item.Name, item.Quantity))
 				log.Printf("[TRADE_ITEMS #108] raw[%d] name=%q quantity=%d", i, item.Name, item.Quantity)
@@ -1305,7 +1323,10 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 			a.emitTradeItemsUpdate("partner")
 
-			if len(allItems) > 0 {
+			// Extend the trade-window timeout on any incoming TRADE_ITEMS packet
+			// payload, even if parsing returned zero parsed items. This avoids
+			// killing valid but unparseable trades while debugging.
+			if len(e.Packet.Data) > 0 {
 				extendTradeWindowTimeoutForPartnerActivity(a)
 			}
 
@@ -1424,6 +1445,13 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS_DEBUG] incoming TRADE_ITEMS all=%d prevAll=%d wasOursFlag=%t lastAddAt=%s", len(allItems), prevAllLen, wasOurs, lastAddAt.Format(time.RFC3339Nano)))
 		log.Printf("[TRADE_ITEMS_DEBUG] incoming TRADE_ITEMS all=%d prevAll=%d wasOursFlag=%t lastAddAt=%s", len(allItems), prevAllLen, wasOurs, lastAddAt.Format(time.RFC3339Nano))
 
+		// When parsing produced zero items, record the raw payload to help
+		// diagnose brittle parser behavior that treats header/token fields as items.
+		if len(allItems) == 0 {
+			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS_DEBUG] zero parsed items (payout-mode), raw=%q", string(e.Packet.Data)))
+			log.Printf("[TRADE_ITEMS_DEBUG] zero parsed items (payout-mode), raw=%q", string(e.Packet.Data))
+		}
+
 		// Build maps of previous full-state and current tracked sides
 		prevAll := map[string]int{}
 		tradeItemsMu.Lock()
@@ -1500,7 +1528,8 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 		a.emitTradeItemsUpdate("both")
 
-		if len(allItems) > 0 {
+		// Extend timeout on any incoming TRADE_ITEMS payload (debug-safe)
+		if len(e.Packet.Data) > 0 {
 			extendTradeWindowTimeoutForPartnerActivity(a)
 		}
 
@@ -1985,7 +2014,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 					resetPayoutRetryState()
 					resetTradeAutoFlow()
 
-					flagMsg := "User have cancelled trade too many times, flagged issue please go to our discord."
+					flagMsg := "User have cancelled trade too many times, flagged issue please go to rollorigins.club."
 					ext.Send(out.SHOUT, flagMsg)
 
 					a.markCurrentGameHistoryIssue(
@@ -2158,7 +2187,7 @@ func (a *App) startPayoutResponseTimeoutMonitor(playerName string, targetID int,
 		ext.Send(out.TRADE_CLOSE)
 
 		if payoutResponseTimeoutAttempts >= 3 {
-			flagMsg := "We have flagged the issues, Please go to our discord to resolve."
+			flagMsg := "We have flagged the issues, Please go to rollorigins.club to resolve."
 			time.Sleep(1200 * time.Millisecond)
 			ext.Send(out.SHOUT, flagMsg)
 
@@ -2727,7 +2756,7 @@ func (a *App) startGameChoiceTimeoutMonitor() {
 		gameChoiceTimeoutActive = false
 
 		closeMsg := fmt.Sprintf("Closing trade no response from %q", player)
-		flagMsg := "We have flagged this game, please advise us on discord"
+		flagMsg := "We have flagged this game, please advise us on rollorigins.club"
 
 		a.AddLogMsg(fmt.Sprintf("[GAME_CHOICE_TIMEOUT] final timeout for %s", player))
 		log.Printf("[GAME_CHOICE_TIMEOUT] final timeout for %s", player)
@@ -3227,7 +3256,7 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 	a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] received packet 28 len=%d", len(e.Packet.Data)))
 	log.Printf("[ROOM_USERS] received packet 28 len=%d", len(e.Packet.Data))
 
-	parsed, err := runUsers28PythonParser(e.Packet.Data)
+	parsed, err := runUsers28PythonParser(a, e.Packet.Data)
 	if err != nil {
 		a.AddLogMsg(fmt.Sprintf("[USERS28_PY] parser failed: %v", err))
 		log.Printf("[USERS28_PY] parser failed: %v", err)
@@ -3601,7 +3630,7 @@ func shortTokenCandidates(token string) []string {
 // runUsers28PythonParser writes the binary packet to a temporary file and
 // invokes the Python parser with --file <tmp> --json, returning typed
 // ParsedUsers28Result.
-func runUsers28PythonParser(packetData []byte) (*ParsedUsers28Result, error) {
+func runUsers28PythonParser(a *App, packetData []byte) (*ParsedUsers28Result, error) {
 	tmpFile, err := os.CreateTemp("", "users28_*.bin")
 	if err != nil {
 		return nil, err
@@ -3615,14 +3644,17 @@ func runUsers28PythonParser(packetData []byte) (*ParsedUsers28Result, error) {
 	}
 	tmpFile.Close()
 
-	// prefer python, fallback to python3 like other helpers
+	// prefer pythonw on Windows to avoid flashing a console window, then
+	// fall back to python / python3.
 	py := "python"
-	if _, err := exec.LookPath(py); err != nil {
-		if _, err2 := exec.LookPath("python3"); err2 == nil {
-			py = "python3"
-		} else {
-			return nil, fmt.Errorf("python not found in PATH")
-		}
+	if p, err := exec.LookPath("pythonw"); err == nil {
+		py = p
+	} else if p, err := exec.LookPath("python"); err == nil {
+		py = p
+	} else if p, err := exec.LookPath("python3"); err == nil {
+		py = p
+	} else {
+		return nil, fmt.Errorf("python not found in PATH")
 	}
 
 	cmd := exec.Command(py, "scripts/parse_users28.py", "--file", tmpPath, "--json")
@@ -3633,7 +3665,21 @@ func runUsers28PythonParser(packetData []byte) (*ParsedUsers28Result, error) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
+		if a != nil && a.ctx != nil {
+			runtime.EventsEmit(a.ctx, "pyParserStdout", stdout.String())
+			runtime.EventsEmit(a.ctx, "pyParserStderr", stderr.String())
+		}
 		return nil, fmt.Errorf("python parser failed: %w stderr=%s", err, stderr.String())
+	}
+
+	if a != nil && a.ctx != nil {
+		// Emit captured output to the frontend so the UI can show parser activity.
+		if stdout.Len() > 0 {
+			runtime.EventsEmit(a.ctx, "pyParserStdout", stdout.String())
+		}
+		if stderr.Len() > 0 {
+			runtime.EventsEmit(a.ctx, "pyParserStderr", stderr.String())
+		}
 	}
 
 	var parsed ParsedUsers28Result
@@ -3647,14 +3693,17 @@ func runUsers28PythonParser(packetData []byte) (*ParsedUsers28Result, error) {
 // runParseUsersScript invokes the Python helper to parse a USERS/TRade blob
 // and returns a map keyed by token_hex (or name) -> parsed JSON object.
 func runParseUsersScript(a *App, data []byte) (map[string]map[string]interface{}, error) {
-	// prefer python, fallback to python3
+	// prefer pythonw on Windows to avoid flashing a console window, then
+	// fall back to python / python3.
 	py := "python"
-	if _, err := exec.LookPath(py); err != nil {
-		if _, err2 := exec.LookPath("python3"); err2 == nil {
-			py = "python3"
-		} else {
-			return nil, fmt.Errorf("python not found in PATH")
-		}
+	if p, err := exec.LookPath("pythonw"); err == nil {
+		py = p
+	} else if p, err := exec.LookPath("python"); err == nil {
+		py = p
+	} else if p, err := exec.LookPath("python3"); err == nil {
+		py = p
+	} else {
+		return nil, fmt.Errorf("python not found in PATH")
 	}
 
 	hexArg := fmt.Sprintf("%x", data)
@@ -3668,7 +3717,21 @@ func runParseUsersScript(a *App, data []byte) (map[string]map[string]interface{}
 	if err := cmd.Run(); err != nil {
 		a.AddLogMsg(fmt.Sprintf("[PY_PARSE] script failed: %v stderr=%s", err, errBuf.String()))
 		log.Printf("[PY_PARSE] script failed: %v stderr=%s", err, errBuf.String())
+		if a != nil && a.ctx != nil {
+			runtime.EventsEmit(a.ctx, "pyParserStdout", outBuf.String())
+			runtime.EventsEmit(a.ctx, "pyParserStderr", errBuf.String())
+		}
 		return nil, err
+	}
+
+	// Emit the parser output to the frontend for visibility when available.
+	if a != nil && a.ctx != nil {
+		if outBuf.Len() > 0 {
+			runtime.EventsEmit(a.ctx, "pyParserStdout", outBuf.String())
+		}
+		if errBuf.Len() > 0 {
+			runtime.EventsEmit(a.ctx, "pyParserStderr", errBuf.String())
+		}
 	}
 
 	var raw struct {
@@ -3820,15 +3883,23 @@ func (a *App) extractTradeItemAndQuantity(field string) (string, int, bool) {
 		parts := strings.Split(field, "|")
 		if len(parts) >= 2 {
 			cand := strings.TrimSpace(parts[len(parts)-1])
-			a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] legacy candidate=%q", cand))
-			log.Printf("[TRADE_PARSE_DEBUG] legacy candidate=%q", cand)
-			if name, qty, ok := a.normalizeTradeFieldClassWithQty(cand); ok {
-				a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] legacy parsed %q -> %q", cand, name))
-				log.Printf("[TRADE_PARSE_DEBUG] legacy parsed %q -> %q", cand, name)
-				return name, qty, true
+			// Reject obvious non-item header/token candidates early: require
+			// either an underscore (typical furni class), a quantity suffix,
+			// or a strict furni regex match before attempting normalization.
+			if !(strings.Contains(cand, "_") || strings.Contains(cand, "*") || stripItemNameRe.MatchString(cand)) {
+				a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] legacy candidate lacks item-like structure, skipping=%q", cand))
+				log.Printf("[TRADE_PARSE_DEBUG] legacy candidate lacks item-like structure, skipping=%q", cand)
+			} else {
+				a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] legacy candidate=%q", cand))
+				log.Printf("[TRADE_PARSE_DEBUG] legacy candidate=%q", cand)
+				if name, qty, ok := a.normalizeTradeFieldClassWithQty(cand); ok {
+					a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] legacy parsed %q -> %q", cand, name))
+					log.Printf("[TRADE_PARSE_DEBUG] legacy parsed %q -> %q", cand, name)
+					return name, qty, true
+				}
+				a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] legacy failed to parse candidate=%q", cand))
+				log.Printf("[TRADE_PARSE_DEBUG] legacy failed to parse candidate=%q", cand)
 			}
-			a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] legacy failed to parse candidate=%q", cand))
-			log.Printf("[TRADE_PARSE_DEBUG] legacy failed to parse candidate=%q", cand)
 		}
 	}
 
@@ -3839,15 +3910,23 @@ func (a *App) extractTradeItemAndQuantity(field string) (string, int, bool) {
 		parts := strings.SplitN(field, "{", 2)
 		if len(parts) == 2 {
 			cand := strings.TrimSpace(parts[1])
-			a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] current candidate=%q", cand))
-			log.Printf("[TRADE_PARSE_DEBUG] current candidate=%q", cand)
-			if name, qty, ok := a.normalizeTradeFieldClassWithQty(cand); ok {
-				a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] current parsed %q -> %q", cand, name))
-				log.Printf("[TRADE_PARSE_DEBUG] current parsed %q -> %q", cand, name)
-				return name, qty, true
+			// Ensure the payload inside the brace looks like a furni-class or
+			// quantity suffix before trying to normalise. This avoids treating
+			// token-like headers (e.g. "m{MHcizMH") as item classes.
+			if !(strings.Contains(cand, "_") || strings.Contains(cand, "*") || strings.HasPrefix(strings.ToLower(cand), "cf_") || stripItemNameRe.MatchString(cand)) {
+				a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] current candidate looks invalid, skipping: %q", cand))
+				log.Printf("[TRADE_PARSE_DEBUG] current candidate looks invalid, skipping: %q", cand)
+			} else {
+				a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] current candidate=%q", cand))
+				log.Printf("[TRADE_PARSE_DEBUG] current candidate=%q", cand)
+				if name, qty, ok := a.normalizeTradeFieldClassWithQty(cand); ok {
+					a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] current parsed %q -> %q", cand, name))
+					log.Printf("[TRADE_PARSE_DEBUG] current parsed %q -> %q", cand, name)
+					return name, qty, true
+				}
+				a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] current failed to parse candidate=%q", cand))
+				log.Printf("[TRADE_PARSE_DEBUG] current failed to parse candidate=%q", cand)
 			}
-			a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] current failed to parse candidate=%q", cand))
-			log.Printf("[TRADE_PARSE_DEBUG] current failed to parse candidate=%q", cand)
 		}
 	}
 
@@ -3892,27 +3971,29 @@ func (a *App) extractTradeItemAndQuantity(field string) (string, int, bool) {
 	// Relaxed fallback: some server payloads include recognizable single-word
 	// class names that don't match the strict furni regex (no underscore)
 	// but are still meaningful (examples: "giftflowers", "hologram").
-	// Try to match any single-word class that appears in the dealer's
-	// scanned hand snapshot as a substring of the raw field payload.
+	// Prefer the longest matching hand-item name found as a substring of the
+	// raw field payload to avoid choosing shorter overlapping names (e.g.
+	// prefer "redhologram" over "hologram").
 	low := strings.ToLower(field)
 	handItemsMu.Lock()
+	best := ""
 	for _, it := range currentHandItems {
 		name := strings.ToLower(it.Name)
-		if name == "" {
-			continue
-		}
-		// Skip very short names to avoid false positives
-		if len(name) < 3 {
+		if name == "" || len(name) < 3 {
 			continue
 		}
 		if strings.Contains(low, name) {
-			normalized, ok := normalizeClassKeyWithVariant(name)
-			if ok {
-				a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS_PARSE_RELAXED] accepted %q inside %q", normalized, field))
-				log.Printf("[TRADE_ITEMS_PARSE_RELAXED] accepted %q inside %q", normalized, field)
-				handItemsMu.Unlock()
-				return normalized, 1, true
+			if len(name) > len(best) {
+				best = name
 			}
+		}
+	}
+	if best != "" {
+		if normalized, ok := normalizeClassKeyWithVariant(best); ok {
+			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS_PARSE_RELAXED] accepted %q inside %q (best match)", normalized, field))
+			log.Printf("[TRADE_ITEMS_PARSE_RELAXED] accepted %q inside %q (best match)", normalized, field)
+			handItemsMu.Unlock()
+			return normalized, 1, true
 		}
 	}
 	handItemsMu.Unlock()
@@ -4874,6 +4955,10 @@ func (a *App) captureTradeHandSnapshot() {
 	log.Printf("[TRADE_HAND_SNAPSHOT] ready=true (items=%d)", len(snapshot))
 	// Send snapshot to configured live-dealer webhook (non-blocking)
 	a.sendLiveDealerSnapshot(snapshot)
+
+	// If the partner already accepted while we were refreshing the hand,
+	// attempt an immediate auto-accept now the frozen snapshot is ready.
+	go a.maybeAutoAcceptOnSnapshotReady("capture")
 }
 
 func (a *App) invalidateTradeHandSnapshot(reason string) {
@@ -4917,6 +5002,10 @@ func (a *App) notifyTradeQuantityCoverage() {
 		log.Printf("[TRADE_COVERAGE] sufficient stock for payout")
 		// Cancel any active shortage monitor since coverage is sufficient now.
 		stopShortageMonitor()
+		// If the partner had already accepted while we were resyncing the
+		// hand, attempt an immediate accept now the snapshot and coverage
+		// checks are clear.
+		go a.maybeAutoAcceptOnSnapshotReady("coverage")
 		return
 	}
 	// During an active payout flow we skip force-closing here; caller
@@ -5069,6 +5158,52 @@ func (a *App) getTradeCoverageShortages() []tradeShortage {
 	}
 
 	return shortages
+}
+
+// maybeAutoAcceptOnSnapshotReady attempts to auto-accept the trade immediately
+// when a frozen hand snapshot becomes available and the partner has already
+// signalled acceptance. This helps avoid the race where TRADE_ACCEPT arrives
+// before the hand snapshot is ready and the scheduled auto-accept times out.
+func (a *App) maybeAutoAcceptOnSnapshotReady(context string) {
+	if !partnerTradeAccepted || tradeAutoAccepted || tradeAutoAcceptPending {
+		return
+	}
+
+	handItemsMu.Lock()
+	ready := tradeHandSnapshotReady
+	handItemsMu.Unlock()
+	if !ready {
+		return
+	}
+
+	// Check coverage shortages (should be non-nil since snapshot is ready)
+	shortages := a.getTradeCoverageShortages()
+	if shortages == nil {
+		return
+	}
+	if len(shortages) > 0 {
+		a.AddLogMsg("[TRADE_ACCEPT] not auto-accepting: shortages detected on snapshot ready")
+		log.Printf("[TRADE_ACCEPT] not auto-accepting: shortages detected on snapshot ready")
+		return
+	}
+
+	// Validate trade limits before auto-accepting
+	tradeItemsMu.Lock()
+	itemsCopy := make([]TradeItem, len(currentTradeItems))
+	copy(itemsCopy, currentTradeItems)
+	tradeItemsMu.Unlock()
+	if v := getTradeLimitViolation(itemsCopy); v != nil {
+		a.AddLogMsg("[TRADE_ACCEPT] not auto-accepting: trade limit violation on snapshot ready")
+		log.Printf("[TRADE_ACCEPT] not auto-accepting: trade limit violation on snapshot ready")
+		return
+	}
+
+	// All checks passed — accept the trade now and mark as auto-accepted.
+	ext.Send(out.TRADE_ACCEPT)
+	tradeAutoAccepted = true
+	tradeAutoAcceptPending = false
+	a.AddLogMsg(fmt.Sprintf("[TRADE_ACCEPT] sent outgoing[69] (snapshot-ready %s)", context))
+	log.Printf("[TRADE_ACCEPT] sent outgoing[69] (snapshot-ready %s)", context)
 }
 
 func formatTradeShortages(shortages []tradeShortage) string {
@@ -6332,7 +6467,9 @@ func (a *App) SkipDiceSetupForTesting() {
 		go sendMessageWithDelay(a.dealerOpenMessage())
 	} else {
 		dealerTradeWindowOpen = false
-		log.Printf("User is muted. Dealer open announcement skipped; incoming trades will be blocked.")
+		// Queue the dealer-open message so it will be announced when the mute clears.
+		messageQueue = append(messageQueue, a.dealerOpenMessage())
+		log.Printf("User is muted. Dealer open announcement skipped and queued; incoming trades will be blocked until unmute.")
 	}
 	a.AddLogMsg("Dice setup bypass enabled for testing. Using 5 fake dice values.")
 }
@@ -6386,7 +6523,9 @@ func (a *App) handleThrowDice(e *g.Intercept) {
 				go sendMessageWithDelay(a.dealerOpenMessage())
 			} else {
 				dealerTradeWindowOpen = false
-				log.Printf("User is muted. Skipping dealer open prompt message.")
+				// Queue the dealer-open prompt to be sent once mute clears
+				messageQueue = append(messageQueue, a.dealerOpenMessage())
+				log.Printf("User is muted. Skipping dealer open prompt message (queued)")
 			}
 			// Turn off setup mode once complete
 			diceSetupActive = false

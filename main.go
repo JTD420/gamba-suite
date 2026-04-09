@@ -1855,6 +1855,18 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		if partnerName == "" {
 			partnerName = "Unknown"
 		}
+		// If the incoming trade partner is unknown, cancel the trade and notify.
+		if !isPayoutTradeOpen && !matchedRecentOutgoing {
+			if partnerName == "" || strings.EqualFold(partnerName, "Unknown") {
+				notify := "Sorry canno't see you, please try again or rejoin room"
+				a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] unknown partner, cancelling trade: %s", notify))
+				log.Printf("[TRADE_OPEN] unknown partner, cancelling trade: %s", notify)
+				e.Block()
+				ext.Send(out.TRADE_CLOSE)
+				ext.Send(out.SHOUT, notify)
+				return
+			}
+		}
 		openMsg := fmt.Sprintf("Trade Opened: \"%s\"", partnerName)
 		shouldAnnounceTradeOpen := true
 		if payoutActive || payoutTradeSent || payoutTradeActive {
@@ -3977,7 +3989,14 @@ func (a *App) extractTradeItemAndQuantity(field string) (string, int, bool) {
 	low := strings.ToLower(field)
 	handItemsMu.Lock()
 	best := ""
-	for _, it := range currentHandItems {
+	// Prefer the frozen trade snapshot when available so relaxed parsing
+	// only accepts items that were actually present in the snapshot used
+	// for coverage checks. Fall back to the live hand when no snapshot.
+	itemsToCheck := currentHandItems
+	if tradeHandSnapshotReady && len(tradeHandSnapshot) > 0 {
+		itemsToCheck = tradeHandSnapshot
+	}
+	for _, it := range itemsToCheck {
 		name := strings.ToLower(it.Name)
 		if name == "" || len(name) < 3 {
 			continue
@@ -4016,15 +4035,25 @@ func (a *App) normalizeTradeFieldClassWithQty(raw string) (string, int, bool) {
 }
 
 func isKnownTradeClassName(a *App, name string) bool {
-	// Accept names that match the strict furni class-name regex (e.g. chair_plasty, cf_10_coin_gold).
-	if stripItemNameRe.MatchString(name) && stripItemNameRe.FindString(name) == name {
+	// Normalize input
+	name = strings.TrimSpace(strings.ToLower(name))
+	if name == "" {
+		return false
+	}
+
+	// Prefer explicit catalog membership to avoid false-positives from
+	// protocol/header tokens that happen to match the furni-name pattern.
+	catalogSet := a.GetCatalogNameSet()
+	if _, ok := catalogSet[name]; ok {
 		return true
 	}
 
-	// Also accept single-word items that appear in the dealer's scanned hand (e.g. edice).
+	// Also accept items observed in the dealer's scanned hand (single-word
+	// items or uncatalogued classes). This preserves the previous behaviour
+	// of permitting hand-only names while rejecting arbitrary tokens.
 	handItemsMu.Lock()
 	for _, item := range currentHandItems {
-		if item.Name == name {
+		if strings.ToLower(strings.TrimSpace(item.Name)) == name {
 			handItemsMu.Unlock()
 			return true
 		}

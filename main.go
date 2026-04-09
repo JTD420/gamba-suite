@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -150,14 +152,17 @@ var (
 	users28ByIndex           = map[int]string{} // roomIndex -> name
 	users28ByShortToken      = map[string]string{}
 	roomIdentityByShortToken = map[string]RoomIdentityEntry{}
-	users28Mu                sync.Mutex
-	headerSniffUntil         time.Time
-	headerSniffSeen          = map[uint16]bool{}
-	headerSniffMu            sync.Mutex
-	currentTradeItems        []TradeItem
-	currentOwnTradeItems     []TradeItem
-	tradeItemsMu             sync.Mutex
-	lastAddItemWasOurs       bool
+	// parsedUserInfoByToken stores parsed JSON returned by the Python helper
+	parsedUserInfoByToken = map[string]map[string]interface{}{}
+	parsedUserInfoMu      sync.Mutex
+	users28Mu             sync.Mutex
+	headerSniffUntil      time.Time
+	headerSniffSeen       = map[uint16]bool{}
+	headerSniffMu         sync.Mutex
+	currentTradeItems     []TradeItem
+	currentOwnTradeItems  []TradeItem
+	tradeItemsMu          sync.Mutex
+	lastAddItemWasOurs    bool
 	// lastAddItemByUsAt records when we observed an outgoing TRADE_ADDITEM
 	// packet. Use this timestamp in debugging to detect races between the
 	// outgoing add and the subsequent server TRADE_ITEMS update.
@@ -376,6 +381,29 @@ type RoomIdentityEntry struct {
 	Short     string `json:"short"`
 	ChatIndex int    `json:"chatIndex"`
 	RoomIndex int    `json:"roomIndex"`
+}
+
+// ParsedUsers28Result represents the JSON output produced by
+// scripts/parse_users28.py when invoked with --json.
+type ParsedUsers28Result struct {
+	Users  []ParsedUsers28User  `json:"users"`
+	Trades []ParsedUsers28Trade `json:"trades"`
+}
+
+type ParsedUsers28User struct {
+	Name         string `json:"name"`
+	TokenHex     string `json:"token_hex"`
+	ShortToken   string `json:"short_token"`
+	ChatID       int    `json:"chat_id"`
+	RoomIndex    int    `json:"room_index"`
+	FigureString string `json:"figureString"`
+	Motto        string `json:"motto"`
+}
+
+type ParsedUsers28Trade struct {
+	Item       string `json:"item"`
+	Colors     string `json:"colors"`
+	FieldIndex int    `json:"field_index"`
 }
 
 type GameHistoryEntry struct {
@@ -1728,17 +1756,34 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 			// Keep token-based fallback for when index decode fails.
 			if len(e.Packet.Data) >= 4 {
-				tradeToken := string(e.Packet.Data[:4])
-				lastTradePartnerToken = tradeToken
+				rawToken := e.Packet.Data[:4]
+				tradeTokenHex := hex.EncodeToString(rawToken)
+				lastTradePartnerToken = tradeTokenHex
+
+				// Prefer resolving by token hex from the USERS28 cache.
 				if lastTradePartnerName == "" || lastTradePartnerName == "Unknown" {
-					if name, ok := lookupUsers28Token(tradeToken); ok {
+					if name, ok := lookupUsers28Token(tradeTokenHex); ok {
 						lastTradePartnerName = name
-						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] fallback token %q matched name %q", tradeToken, name))
-						log.Printf("[TRADE_OPEN] fallback token %q matched name %q", tradeToken, name)
+						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] fallback token hex %q matched name %q", tradeTokenHex, name))
+						log.Printf("[TRADE_OPEN] fallback token hex %q matched name %q", tradeTokenHex, name)
+					} else {
+						// Try short-token (first 2 bytes) as a fallback
+						short := string(rawToken[:2])
+						if isLikelyChatToken(short) {
+							users28Mu.Lock()
+							if n, ok := users28ByShortToken[short]; ok {
+								lastTradePartnerName = n
+								a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] fallback short token %q matched name %q", short, n))
+								log.Printf("[TRADE_OPEN] fallback short token %q matched name %q", short, n)
+							}
+							users28Mu.Unlock()
+						}
 					}
 				}
+
+				// If still unknown, attempt to resolve a room index by raw token
 				if lastTradePartnerID <= 0 {
-					if idx, name, ok := resolveTradeTokenToRoomIndex(tradeToken); ok {
+					if idx, name, ok := resolveTradeTokenToRoomIndex(string(rawToken)); ok {
 						lastTradePartnerID = idx
 						if lastTradePartnerName == "" || lastTradePartnerName == "Unknown" {
 							lastTradePartnerName = name
@@ -3175,19 +3220,17 @@ func scanTradeOpenFields(data []byte) []string {
 }
 
 func handleUsers28Packet(a *App, e *g.Intercept) {
-	if e.Packet.Header.Dir != g.In {
+	if e.Packet.Header.Dir != g.In || e.Packet.Header.Value != 28 {
 		return
 	}
 
-	if e.Packet.Header.Value != 28 {
-		return
-	}
+	a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] received packet 28 len=%d", len(e.Packet.Data)))
+	log.Printf("[ROOM_USERS] received packet 28 len=%d", len(e.Packet.Data))
 
-	raw := string(e.Packet.Data)
-	entries := extractUsers28Entries(raw)
-	if len(entries) == 0 {
-		a.AddLogMsg(fmt.Sprintf("[USERS28] received header %d but found no parseable entries raw=%q", e.Packet.Header.Value, raw))
-		log.Printf("[USERS28] received header %d but found no parseable entries raw=%q", e.Packet.Header.Value, raw)
+	parsed, err := runUsers28PythonParser(e.Packet.Data)
+	if err != nil {
+		a.AddLogMsg(fmt.Sprintf("[USERS28_PY] parser failed: %v", err))
+		log.Printf("[USERS28_PY] parser failed: %v", err)
 		return
 	}
 
@@ -3196,57 +3239,85 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 	for k, v := range roomIdentityByShortToken {
 		prev[k] = v
 	}
-	clear(users28ByToken)
-	clear(users28ByIndex)
-	clear(users28ByShortToken)
-	clear(roomIdentityByShortToken)
+	users28ByToken = map[string]string{}
+	users28ByIndex = map[int]string{}
+	users28ByShortToken = map[string]string{}
+	roomIdentityByShortToken = map[string]RoomIdentityEntry{}
+	users28Mu.Unlock()
 
-	for _, entry := range entries {
-		name := strings.TrimSpace(entry.Name)
+	parsedUserInfoMu.Lock()
+	parsedUserInfoByToken = map[string]map[string]interface{}{}
+	parsedUserInfoMu.Unlock()
+
+	for _, u := range parsed.Users {
+		name := strings.TrimSpace(u.Name)
+		token := strings.TrimSpace(u.TokenHex)
+		short := strings.TrimSpace(u.ShortToken)
+
+		if name == "" {
+			continue
+		}
+
+		// Determine chat index from short token if possible
 		chatIndex := 0
-		if idx, ok := chatIndexFromShortToken(entry.ShortToken); ok && idx > 0 {
+		if idx, ok := chatIndexFromShortToken(short); ok && idx > 0 {
 			chatIndex = idx
 		}
 
-		if entry.Token != "" {
-			users28ByToken[entry.Token] = name
-		}
-		if entry.ShortToken != "" {
-			users28ByShortToken[entry.ShortToken] = name
-			if chatIndex > 0 {
-				users28ByIndex[chatIndex] = name
+		users28Mu.Lock()
+		if token != "" {
+			users28ByToken[token] = name
+			// Keep backwards-compat mapping from raw 4-byte token -> name
+			if decoded, err := hex.DecodeString(token); err == nil && len(decoded) == 4 {
+				users28ByToken[string(decoded)] = name
 			}
 		}
-		if entry.RoomIndex > 0 {
-			users28ByIndex[entry.RoomIndex] = name
-			if short := shortTokenFromIndex(entry.RoomIndex); isLikelyChatToken(short) {
-				users28ByShortToken[short] = name
-			}
+		if u.RoomIndex > 0 {
+			users28ByIndex[u.RoomIndex] = name
 		}
-
-		for _, short := range shortTokenCandidates(entry.Token) {
+		if chatIndex > 0 {
+			users28ByIndex[chatIndex] = name
+		}
+		if short != "" {
 			users28ByShortToken[short] = name
-			if idx, ok := chatIndexFromShortToken(short); ok && idx > 0 {
-				users28ByIndex[idx] = name
-				if chatIndex <= 0 {
-					chatIndex = idx
-				}
+			roomIdentityByShortToken[short] = RoomIdentityEntry{
+				Name:      name,
+				Token:     token,
+				Short:     short,
+				ChatIndex: u.ChatID,
+				RoomIndex: u.RoomIndex,
 			}
+		}
+		users28Mu.Unlock()
+
+		if token != "" {
+			parsedUserInfoMu.Lock()
+			parsedUserInfoByToken[token] = map[string]interface{}{
+				"name":         u.Name,
+				"token_hex":    u.TokenHex,
+				"short_token":  u.ShortToken,
+				"chat_id":      u.ChatID,
+				"room_index":   u.RoomIndex,
+				"figureString": u.FigureString,
+				"motto":        u.Motto,
+			}
+			parsedUserInfoMu.Unlock()
 		}
 
-		if entry.ShortToken != "" {
-			roomIdentityByShortToken[entry.ShortToken] = RoomIdentityEntry{
-				Name:      name,
-				Token:     entry.Token,
-				Short:     entry.ShortToken,
-				ChatIndex: chatIndex,
-				RoomIndex: entry.RoomIndex,
-			}
-		}
+		a.AddLogMsg(fmt.Sprintf(
+			"[USERS28_PY] stored name=%q roomIndex=%d chatID=%d short=%q token=%q",
+			name, u.RoomIndex, u.ChatID, short, token,
+		))
+		log.Printf(
+			"[USERS28_PY] stored name=%q roomIndex=%d chatID=%d short=%q token=%q",
+			name, u.RoomIndex, u.ChatID, short, token,
+		)
 	}
 
+	// Compute joined / left based on short-token identity snapshot
 	joined := make([]string, 0)
 	left := make([]string, 0)
+	users28Mu.Lock()
 	for short, curr := range roomIdentityByShortToken {
 		if _, ok := prev[short]; !ok {
 			joined = append(joined, fmt.Sprintf("%s(%s)", curr.Name, short))
@@ -3269,14 +3340,15 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 		a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] left: %s", strings.Join(left, ", ")))
 		log.Printf("[ROOM_USERS] left: %s", strings.Join(left, ", "))
 	}
+
 	a.emitRoomIdentityUpdate()
 
-	for _, entry := range entries {
-		a.AddLogMsg(fmt.Sprintf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, entry.Token, entry.ShortToken, entry.Name, entry.RoomIndex))
-		log.Printf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, entry.Token, entry.ShortToken, entry.Name, entry.RoomIndex)
-		if chatIdx, ok := chatIndexFromShortToken(entry.ShortToken); ok && chatIdx > 0 {
-			a.AddLogMsg(fmt.Sprintf("[USERS28_DEBUG] name=%q roomIndex=%d chatIndex=%d short=%q token=%q", entry.Name, entry.RoomIndex, chatIdx, entry.ShortToken, entry.Token))
-			log.Printf("[USERS28_DEBUG] name=%q roomIndex=%d chatIndex=%d short=%q token=%q", entry.Name, entry.RoomIndex, chatIdx, entry.ShortToken, entry.Token)
+	for _, u := range parsed.Users {
+		a.AddLogMsg(fmt.Sprintf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, u.TokenHex, u.ShortToken, u.Name, u.RoomIndex))
+		log.Printf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, u.TokenHex, u.ShortToken, u.Name, u.RoomIndex)
+		if chatIdx, ok := chatIndexFromShortToken(u.ShortToken); ok && chatIdx > 0 {
+			a.AddLogMsg(fmt.Sprintf("[USERS28_DEBUG] name=%q roomIndex=%d chatIndex=%d short=%q token=%q", u.Name, u.RoomIndex, chatIdx, u.ShortToken, u.TokenHex))
+			log.Printf("[USERS28_DEBUG] name=%q roomIndex=%d chatIndex=%d short=%q token=%q", u.Name, u.RoomIndex, chatIdx, u.ShortToken, u.TokenHex)
 		}
 	}
 }
@@ -3292,6 +3364,13 @@ func clearRoomUserCaches(a *App) {
 	clear(users28ByShortToken)
 	clear(roomIdentityByShortToken)
 	users28Mu.Unlock()
+
+	// clear parsed external info as room membership changed
+	parsedUserInfoMu.Lock()
+	for k := range parsedUserInfoByToken {
+		delete(parsedUserInfoByToken, k)
+	}
+	parsedUserInfoMu.Unlock()
 
 	a.emitRoomIdentityUpdate()
 }
@@ -3517,6 +3596,102 @@ func shortTokenCandidates(token string) []string {
 		out = append(out, cand)
 	}
 	return out
+}
+
+// runUsers28PythonParser writes the binary packet to a temporary file and
+// invokes the Python parser with --file <tmp> --json, returning typed
+// ParsedUsers28Result.
+func runUsers28PythonParser(packetData []byte) (*ParsedUsers28Result, error) {
+	tmpFile, err := os.CreateTemp("", "users28_*.bin")
+	if err != nil {
+		return nil, err
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmpFile.Write(packetData); err != nil {
+		tmpFile.Close()
+		return nil, err
+	}
+	tmpFile.Close()
+
+	// prefer python, fallback to python3 like other helpers
+	py := "python"
+	if _, err := exec.LookPath(py); err != nil {
+		if _, err2 := exec.LookPath("python3"); err2 == nil {
+			py = "python3"
+		} else {
+			return nil, fmt.Errorf("python not found in PATH")
+		}
+	}
+
+	cmd := exec.Command(py, "scripts/parse_users28.py", "--file", tmpPath, "--json")
+	cmd.Dir = "."
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("python parser failed: %w stderr=%s", err, stderr.String())
+	}
+
+	var parsed ParsedUsers28Result
+	if err := json.Unmarshal(stdout.Bytes(), &parsed); err != nil {
+		return nil, fmt.Errorf("failed to decode parser json: %w output=%s", err, stdout.String())
+	}
+
+	return &parsed, nil
+}
+
+// runParseUsersScript invokes the Python helper to parse a USERS/TRade blob
+// and returns a map keyed by token_hex (or name) -> parsed JSON object.
+func runParseUsersScript(a *App, data []byte) (map[string]map[string]interface{}, error) {
+	// prefer python, fallback to python3
+	py := "python"
+	if _, err := exec.LookPath(py); err != nil {
+		if _, err2 := exec.LookPath("python3"); err2 == nil {
+			py = "python3"
+		} else {
+			return nil, fmt.Errorf("python not found in PATH")
+		}
+	}
+
+	hexArg := fmt.Sprintf("%x", data)
+	cmd := exec.Command(py, "scripts/parse_users28.py", "--hex", hexArg, "--json")
+	// run from repo root so script relative path resolves
+	cmd.Dir = "."
+	var outBuf bytes.Buffer
+	var errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		a.AddLogMsg(fmt.Sprintf("[PY_PARSE] script failed: %v stderr=%s", err, errBuf.String()))
+		log.Printf("[PY_PARSE] script failed: %v stderr=%s", err, errBuf.String())
+		return nil, err
+	}
+
+	var raw struct {
+		Users  []map[string]interface{} `json:"users"`
+		Trades []map[string]interface{} `json:"trades"`
+	}
+	if err := json.Unmarshal(outBuf.Bytes(), &raw); err != nil {
+		a.AddLogMsg(fmt.Sprintf("[PY_PARSE] json unmarshal failed: %v", err))
+		log.Printf("[PY_PARSE] json unmarshal failed: %v", err)
+		return nil, err
+	}
+
+	res := map[string]map[string]interface{}{}
+	for _, u := range raw.Users {
+		if tok, ok := u["token_hex"].(string); ok && tok != "" {
+			res[tok] = u
+			continue
+		}
+		if name, ok := u["name"].(string); ok && name != "" {
+			res[name] = u
+		}
+	}
+	return res, nil
 }
 
 func lookupRoomEntityIndexByName(name string) (int, bool) {
@@ -4950,13 +5125,20 @@ func (a *App) sendTradeCompletionMessage() {
 	gameChoiceUnreadableWarned = false
 	awaitingGameChoicePartnerName = strings.TrimSpace(lastTradePartnerName)
 	// Prefer the live room entity index for chat sender matching.
-	// USERS28 indices are often larger room ids and can differ from chat indices.
+	// First try the immediate room entity cache, otherwise wait briefly
+	// for a USERS28 update (which may arrive asynchronously) before
+	// falling back to the raw lastTradePartnerID.
 	if chatIdx, ok := lookupRoomEntityIndexByName(awaitingGameChoicePartnerName); ok && chatIdx > 0 {
 		awaitingGameChoicePartnerID = chatIdx
-	} else if chatIdx, ok := lookupUsers28NameIndex(awaitingGameChoicePartnerName); ok && chatIdx > 0 {
-		awaitingGameChoicePartnerID = chatIdx
 	} else {
-		awaitingGameChoicePartnerID = lastTradePartnerID
+		// Wait up to 900ms for USERS28 name->index mapping to arrive.
+		if chatIdx, ok := waitForUsers28NameIndex(awaitingGameChoicePartnerName, 900*time.Millisecond); ok && chatIdx > 0 {
+			awaitingGameChoicePartnerID = chatIdx
+		} else if chatIdx, ok := lookupUsers28NameIndex(awaitingGameChoicePartnerName); ok && chatIdx > 0 {
+			awaitingGameChoicePartnerID = chatIdx
+		} else {
+			awaitingGameChoicePartnerID = lastTradePartnerID
+		}
 	}
 
 	// Start the game-choice timeout monitor to handle non-responsive partners.

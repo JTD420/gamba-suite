@@ -342,6 +342,7 @@ def main():
     p.add_argument("--api", default="https://origins.habbo.com/api/public/users", help="Origins API base URL")
     p.add_argument("--window", type=int, default=64, help="Bytes to look back when extracting username")
     p.add_argument("--trade", action="store_true", help="Extract trade item(s) from packet and print them")
+    p.add_argument("--json", action="store_true", help="Output results as JSON (users + trades)")
     args = p.parse_args()
 
     if args.hex:
@@ -377,6 +378,39 @@ def main():
                 for k in range(max(0, t['field_index'] - 1), min(len(t['fields']), t['field_index'] + 3)):
                     nearby.append(f"[{k}] {t['fields'][k]}")
                 print("  context:", " | ".join(nearby))
+
+    # JSON output mode: emit both parsed users and trades as JSON and exit
+    if args.json:
+        out = {"users": [], "trades": []}
+        # Prepare users (drop raw bytes, include token_hex)
+        for e in entries:
+            ue = {
+                "name": e.get("name"),
+                "raw_name_start": e.get("raw_name_start"),
+                "adj_name_start": e.get("adj_name_start"),
+                "name_end": e.get("name_end"),
+                "token_hex": e.get("token_hex"),
+                "short_token": e.get("short_token"),
+                "chat_id": e.get("chat_id"),
+                "room_index": e.get("room_index"),
+                "figureString": e.get("figureString"),
+                "motto": e.get("motto"),
+            }
+            # Attach Origins API result if available
+            try:
+                api = query_origins(ue["name"], api_base=args.api)
+            except Exception:
+                api = None
+            if api:
+                ue["origins"] = api
+            out["users"].append(ue)
+
+        trades_list = find_trade_entries(data)
+        for t in trades_list:
+            out["trades"].append({"item": t.get("item"), "colors": t.get("colors"), "field_index": t.get("field_index")})
+
+        print(json.dumps(out, ensure_ascii=False))
+        sys.exit(0)
 
     for i, e in enumerate(entries, 1):
         print(f"\nEntry {i}:")

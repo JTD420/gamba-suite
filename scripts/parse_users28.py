@@ -261,6 +261,54 @@ def find_user_entries(data: bytes, window: int = 64):
     return entries
 
 
+def find_trade_entries(data: bytes):
+    """Extract traded items from a TRADE packet blob.
+
+    Returns a list of dicts: {item, colors, field_index, fields, raw}
+    The function splits on 0x02 and searches each field for a lowercase
+    item token (e.g. 'redhologram'). It also captures a following
+    color palette field when present (comma-separated #RRGGBB values).
+    """
+    entries = []
+    try:
+        s = data.decode('latin-1')
+    except Exception:
+        s = data.decode('latin-1', errors='replace')
+
+    parts = s.split('\x02')
+    # require a minimum length (4 chars) to avoid short token false-positives
+    lower_re = re.compile(r'([a-z][a-z0-9_]{3,})')
+    color_re = re.compile(r'(?:#(?:[0-9A-Fa-f]{6})(?:,#(?:[0-9A-Fa-f]{6}))*)')
+
+    for i, p in enumerate(parts):
+        # skip the first field (usually the trade token/prefix)
+        if i == 0:
+            continue
+        m = lower_re.search(p)
+        if not m:
+            continue
+        item = m.group(1)
+        colors = None
+        # check the next field for a color palette
+        if i + 1 < len(parts) and '#' in parts[i + 1]:
+            # keep raw palette text
+            colors = parts[i + 1]
+        else:
+            cm = color_re.search(p)
+            if cm:
+                colors = cm.group(0)
+
+        entries.append({
+            'item': item,
+            'colors': colors,
+            'field_index': i,
+            'fields': parts,
+            'raw': s,
+        })
+
+    return entries
+
+
 def query_origins(username: str, api_base: str = "https://origins.habbo.com/api/public/users"):
     """Query the Origins public users endpoint. Returns parsed JSON or None."""
     try:
@@ -293,6 +341,7 @@ def main():
     p.add_argument("--file", "-f", help="Path to binary USERS28 packet file")
     p.add_argument("--api", default="https://origins.habbo.com/api/public/users", help="Origins API base URL")
     p.add_argument("--window", type=int, default=64, help="Bytes to look back when extracting username")
+    p.add_argument("--trade", action="store_true", help="Extract trade item(s) from packet and print them")
     args = p.parse_args()
 
     if args.hex:
@@ -308,9 +357,26 @@ def main():
         data = bytes.fromhex(SAMPLE_HEX)
 
     entries = find_user_entries(data, window=args.window)
-    if not entries:
+    # If the user asked only for trade extraction, don't exit when no usernames
+    if not entries and not args.trade:
         print("No username entries found.")
         sys.exit(0)
+
+    if args.trade:
+        trades = find_trade_entries(data)
+        if not trades:
+            print("No trade items found.")
+        else:
+            for j, t in enumerate(trades, 1):
+                print(f"\nTrade {j}:")
+                print("  item:", t.get('item'))
+                print("  colors:", t.get('colors'))
+                print("  field_index:", t.get('field_index'))
+                # print the neighbouring fields for context
+                nearby = []
+                for k in range(max(0, t['field_index'] - 1), min(len(t['fields']), t['field_index'] + 3)):
+                    nearby.append(f"[{k}] {t['fields'][k]}")
+                print("  context:", " | ".join(nearby))
 
     for i, e in enumerate(entries, 1):
         print(f"\nEntry {i}:")

@@ -5338,6 +5338,21 @@ type user28Entry struct {
 	RoomIndex  int
 }
 
+var users28FigurePrefixes = []string{
+	"hd-", "hr-", "ch-", "lg-", "sh-",
+	"ha-", "he-", "ea-", "fa-", "ca-",
+	"cc-", "wa-", "cp-",
+}
+
+func hasUsers28FigurePrefix(s string) bool {
+	for _, prefix := range users28FigurePrefixes {
+		if strings.HasPrefix(s, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func extractUsers28Entries(raw string) []user28Entry {
 	b := []byte(raw)
 	entries := make([]user28Entry, 0)
@@ -5347,7 +5362,7 @@ func extractUsers28Entries(raw string) []user28Entry {
 		if b[i] != 0x02 {
 			continue
 		}
-		if !(strings.HasPrefix(raw[i+1:], "hr-") || strings.HasPrefix(raw[i+1:], "hd-")) {
+		if !hasUsers28FigurePrefix(raw[i+1:]) {
 			continue
 		}
 

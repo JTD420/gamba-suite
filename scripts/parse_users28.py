@@ -6,10 +6,10 @@ Usage examples:
   python scripts/parse_users28.py --file users28.bin
 
 The script scans for field separators (\x02), validates that the following bytes look like
-known figure prefixes such as 'hr-' or 'hd-', extracts the username immediately before the
-figure field, reads the 4-byte token immediately before the username (adjusting for the
-uppercase marker rule), and pulls the in-packet figure string. It then queries the Origins
-public user API to compare the figureString and print results.
+known Habbo figure prefixes such as 'hd-', 'hr-', 'ch-', 'lg-' or 'sh-', extracts the
+username immediately before the figure field, reads the 4-byte token immediately before the
+username (adjusting for the uppercase marker rule), and pulls the in-packet figure string.
+It then queries the Origins public user API to compare the figureString and print results.
 """
 import re
 import argparse
@@ -70,7 +70,11 @@ def find_user_entries(data: bytes, window: int = 64):
     """Return list of detected entries with name, token, figureString and offsets."""
     entries = []
     seen = set()
-    figure_prefixes = (b"hr-", b"hd-")
+    figure_prefixes = (
+        b"hd-", b"hr-", b"ch-", b"lg-", b"sh-",
+        b"ha-", b"he-", b"ea-", b"fa-", b"ca-",
+        b"cc-", b"wa-", b"cp-"
+    )
     name_pat = re.compile(r"([A-Za-z][A-Za-z0-9_-]{2,})$")
     fallback_pat = re.compile(r"([A-Za-z][A-Za-z0-9_-]{1,})$")
 

@@ -6,6 +6,14 @@ export function AddChatLog(arg1) {
   return window['go']['main']['App']['AddChatLog'](arg1);
 }
 
+export function AddDebugLog(arg1, arg2) {
+  return window['go']['main']['App']['AddDebugLog'](arg1, arg2);
+}
+
+export function AddErrorLog(arg1, arg2) {
+  return window['go']['main']['App']['AddErrorLog'](arg1, arg2);
+}
+
 export function AddLogMsg(arg1) {
   return window['go']['main']['App']['AddLogMsg'](arg1);
 }

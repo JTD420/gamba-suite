@@ -37,6 +37,7 @@ var (
 	currentSum                           int
 	awaitingTradeOpen                    bool
 	dealerTradeWindowOpen                bool
+	dealerAcceptingTrades                bool
 	tradeOpenCount                       int
 	tradeCloseCount                      int
 	lastTradePartnerID                   int
@@ -225,6 +226,7 @@ var (
 	tradeWindowDeadline         time.Time
 	tradeWindowTimeoutActive    bool
 	blockAllTrades              = true
+	dealerAnnouncementsEnabled  = true
 	// Auto shout configuration
 	autoShoutEnabled bool
 	autoShoutPhrase  string
@@ -351,7 +353,6 @@ func (a *App) rejectTradeForLimitViolation(v *tradeLimitViolation) {
 	}
 	msg := formatTradeLimitViolationMessage(v)
 	a.AddLogMsg("[TRADE_LIMIT] " + msg)
-	log.Printf("[TRADE_LIMIT] %s", msg)
 	// Decide whether to shout. Always shout for quantity violations so the
 	// player is informed each time they push an over-limit quantity. For
 	// unique-item violations we may still dedupe by message text.
@@ -533,16 +534,13 @@ func (a *App) startup(ctx context.Context) {
 		scanID := a.requestPlayerStrip(true)
 		if ok := waitForStripScanCompletion(scanID, 20*time.Second); ok {
 			a.AddLogMsg(fmt.Sprintf("[STRIP] initial hand sync complete (session=%d)", scanID))
-			log.Printf("[STRIP] initial hand sync complete (session=%d)", scanID)
 			if !strictTradeSnapshotLifecycle || !tradeHandSnapshotReady {
 				a.captureTradeHandSnapshot()
 			} else {
 				a.AddLogMsg("[STRIP] strict snapshot lifecycle active and snapshot already ready; skipping initial capture")
-				log.Printf("[STRIP] strict snapshot lifecycle active and snapshot already ready; skipping initial capture")
 			}
 		} else {
 			a.AddLogMsg(fmt.Sprintf("[STRIP] initial hand sync timeout (session=%d)", scanID))
-			log.Printf("[STRIP] initial hand sync timeout (session=%d)", scanID)
 		}
 
 		ticker := time.NewTicker(30 * time.Second)
@@ -553,14 +551,14 @@ func (a *App) startup(ctx context.Context) {
 	}()
 
 	// Send an initial heartbeat so external dashboards receive immediate status
-	a.sendLiveDealerStatus(awaitingTradeOpen && dealerTradeWindowOpen, a.getCurrentDealerName())
+	a.sendLiveDealerStatus(dealerAcceptingTrades, a.getCurrentDealerName())
 
 	// Start a periodic heartbeat to keep the website's lastSeenAt fresh.
 	go func() {
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			a.sendLiveDealerStatus(awaitingTradeOpen && dealerTradeWindowOpen, a.getCurrentDealerName())
+			a.sendLiveDealerStatus(dealerAcceptingTrades, a.getCurrentDealerName())
 		}
 	}()
 
@@ -761,8 +759,7 @@ func dealerGameActive() bool {
 }
 
 func dealerReadyForNewTrade() bool {
-	return awaitingTradeOpen &&
-		dealerTradeWindowOpen &&
+	return dealerAcceptingTrades &&
 		!dealerGameActive() &&
 		!dealerResyncInProgress &&
 		dealerSnapshotReady()
@@ -793,6 +790,10 @@ func canAnnounceDealerOpenLocked() bool {
 
 func canAnnounceDealerOpen() bool {
 	return !isMuted && dealerDiceReady()
+}
+
+func shouldAnnounceDealerOpen() bool {
+	return dealerAnnouncementsEnabled && canAnnounceDealerOpen()
 }
 
 func getConfigFilePath() string {
@@ -1125,7 +1126,6 @@ func registerCustomTradeHeaders(a *App) {
 	if _, ok := a.ext.Headers().TryGet(confirmID); !ok {
 		a.ext.Headers().Add("TRADE_CONFIRM_ACCEPT", g.Header{Dir: g.Out, Value: 402})
 		a.AddLogMsg("[TRADE_HEADERS] registered outgoing TRADE_CONFIRM_ACCEPT -> 402")
-		log.Printf("[TRADE_HEADERS] registered outgoing TRADE_CONFIRM_ACCEPT -> 402")
 	}
 }
 
@@ -1169,7 +1169,8 @@ func handleMuteEnd() {
 		// Ensure the dealer open flags reflect that we'll be announcing now.
 		if dealerOpenQueued {
 			awaitingTradeOpen = true
-			if canAnnounceDealerOpen() {
+			dealerAcceptingTrades = true
+			if shouldAnnounceDealerOpen() {
 				dealerTradeWindowOpen = true
 				startDealerOpenHeartbeat(nil)
 			}
@@ -1226,7 +1227,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 	defer func() {
 		if r := recover(); r != nil {
 			a.AddLogMsg(fmt.Sprintf("[TRADE] recovered while handling header %d: %v", e.Packet.Header.Value, r))
-			log.Printf("[TRADE] recovered while handling header %d: %v", e.Packet.Header.Value, r)
 		}
 	}()
 
@@ -1242,10 +1242,8 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		if targetID, ok := decodeLeadingVL64(e.Packet.Data); ok {
 			rememberOutgoingTradeOpenTarget(targetID)
 			a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #71] remembered outgoing target id %d", targetID))
-			log.Printf("[TRADE_OPEN #71] remembered outgoing target id %d", targetID)
 		} else {
 			a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #71] outgoing payload decode failed: %q", string(e.Packet.Data)))
-			log.Printf("[TRADE_OPEN #71] outgoing payload decode failed: %q", string(e.Packet.Data))
 		}
 	}
 
@@ -1257,14 +1255,11 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		addItemMu.Unlock()
 		// Debug log outgoing add with timestamp
 		a.AddLogMsg(fmt.Sprintf("[TRADE_ADDITEM_DEBUG] outgoing TRADE_ADDITEM payload=%q at=%s", string(e.Packet.Data), lastAddItemByUsAt.Format(time.RFC3339Nano)))
-		log.Printf("[TRADE_ADDITEM_DEBUG] outgoing TRADE_ADDITEM payload=%q at=%s", string(e.Packet.Data), lastAddItemByUsAt.Format(time.RFC3339Nano))
 		if payoutTradeActive {
 			payoutActualAddCount++
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] observed outgoing TRADE_ADDITEM count %d/%d", payoutActualAddCount, payoutExpectedAddCount))
-			log.Printf("[PAYOUT_DEBUG] observed outgoing TRADE_ADDITEM count %d/%d", payoutActualAddCount, payoutExpectedAddCount)
 		}
 		a.AddLogMsg("[TRADE_ADDITEM #72] outgoing: next TRADE_ITEMS belongs to us")
-		log.Printf("[TRADE_ADDITEM #72] outgoing: next TRADE_ITEMS belongs to us")
 		return
 	}
 
@@ -1272,7 +1267,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		switch e.Packet.Header.Value {
 		case 105, 108, 109, 111, 112:
 			a.AddLogMsg(fmt.Sprintf("[TRADE_GUARD] suppressing incoming trade packet %d during blocked-trade cleanup", e.Packet.Header.Value))
-			log.Printf("[TRADE_GUARD] suppressing incoming trade packet %d during blocked-trade cleanup", e.Packet.Header.Value)
 			e.Block()
 			return
 		}
@@ -1296,7 +1290,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		}
 		tradeItemsMu.Unlock()
 		a.AddLogMsg("[TRADE_ACCEPT] partner accepted current trade state")
-		log.Printf("[TRADE_ACCEPT] partner accepted current trade state")
 		scheduleAutoTradeAccept(a, string(e.Packet.Data))
 		return
 	}
@@ -1322,17 +1315,14 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			// previous state for transition detection.
 
 			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] partner=%d all=%d (non-payout)", len(currentTradeItems), len(allItems)))
-			log.Printf("[TRADE_ITEMS #108] partner=%d all=%d (non-payout)", len(currentTradeItems), len(allItems))
 
 			// When parser returns zero items, record the raw payload for debugging
 			if len(allItems) == 0 {
 				a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS_DEBUG] zero parsed items, raw=%q", string(e.Packet.Data)))
-				log.Printf("[TRADE_ITEMS_DEBUG] zero parsed items, raw=%q", string(e.Packet.Data))
 			}
 
 			for i, item := range allItems {
 				a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] raw[%d] name=%q quantity=%d", i, item.Name, item.Quantity))
-				log.Printf("[TRADE_ITEMS #108] raw[%d] name=%q quantity=%d", i, item.Name, item.Quantity)
 			}
 
 			a.emitTradeItemsUpdate("partner")
@@ -1385,7 +1375,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			a.AddLogMsg(fmt.Sprintf("[TRADE_LIMIT_DEBUG] validating %d parsed trade items", len(itemsCopy)))
 			for i, it := range itemsCopy {
 				a.AddLogMsg(fmt.Sprintf("[TRADE_LIMIT_DEBUG] parsed[%d] name=%q qty=%d", i, it.Name, it.Quantity))
-				log.Printf("[TRADE_LIMIT_DEBUG] parsed[%d] name=%q qty=%d", i, it.Name, it.Quantity)
 			}
 			violation := getTradeLimitViolation(itemsCopy)
 			isValid := violation == nil
@@ -1402,7 +1391,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				lastTradeLimitNotice = ""
 				tradeLimitWasActive = false
 				a.AddLogMsg("[TRADE_LIMIT] violation resolved; trade is valid again")
-				log.Printf("[TRADE_LIMIT] violation resolved; trade is valid again")
 				ext.Send(out.SHOUT, "Trade is back within limits, accept again if needed")
 			}
 
@@ -1412,10 +1400,8 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			// accepted the same state.
 			if !wasValid && isValid {
 				a.AddLogMsg(fmt.Sprintf("[TRADE_LIMIT] transition invalid->valid detected prevPartnerAccepted=%t", partnerTradeAccepted))
-				log.Printf("[TRADE_LIMIT] transition invalid->valid detected prevPartnerAccepted=%t", partnerTradeAccepted)
 				if partnerTradeAccepted && !tradeAutoAccepted && !tradeAutoAcceptPending {
 					a.AddLogMsg("[TRADE_ACCEPT] re-arming auto-accept after invalid->valid transition")
-					log.Printf("[TRADE_ACCEPT] re-arming auto-accept after invalid->valid transition")
 					scheduleAutoTradeAccept(a, "rearmed-after-limit-fix")
 				}
 			}
@@ -1426,7 +1412,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 			if !ready {
 				a.AddLogMsg("[TRADE_COVERAGE] snapshot not ready yet, skipping live trade check")
-				log.Printf("[TRADE_COVERAGE] snapshot not ready yet, skipping live trade check")
 				return
 			}
 
@@ -1449,13 +1434,11 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		tradeItemsMu.Unlock()
 
 		a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS_DEBUG] incoming TRADE_ITEMS all=%d prevAll=%d wasOursFlag=%t lastAddAt=%s", len(allItems), prevAllLen, wasOurs, lastAddAt.Format(time.RFC3339Nano)))
-		log.Printf("[TRADE_ITEMS_DEBUG] incoming TRADE_ITEMS all=%d prevAll=%d wasOursFlag=%t lastAddAt=%s", len(allItems), prevAllLen, wasOurs, lastAddAt.Format(time.RFC3339Nano))
 
 		// When parsing produced zero items, record the raw payload to help
 		// diagnose brittle parser behavior that treats header/token fields as items.
 		if len(allItems) == 0 {
 			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS_DEBUG] zero parsed items (payout-mode), raw=%q", string(e.Packet.Data)))
-			log.Printf("[TRADE_ITEMS_DEBUG] zero parsed items (payout-mode), raw=%q", string(e.Packet.Data))
 		}
 
 		// Build maps of previous full-state and current tracked sides
@@ -1525,11 +1508,9 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		tradeItemsMu.Unlock()
 
 		a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] partner=%d own=%d all=%d wasOurs=%t (payout)", len(currentTradeItems), len(currentOwnTradeItems), len(allItems), wasOurs))
-		log.Printf("[TRADE_ITEMS #108] partner=%d own=%d all=%d wasOurs=%t (payout)", len(currentTradeItems), len(currentOwnTradeItems), len(allItems), wasOurs)
 
 		for i, item := range allItems {
 			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] raw[%d] name=%q quantity=%d", i, item.Name, item.Quantity))
-			log.Printf("[TRADE_ITEMS #108] raw[%d] name=%q quantity=%d", i, item.Name, item.Quantity)
 		}
 
 		a.emitTradeItemsUpdate("both")
@@ -1540,7 +1521,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		}
 
 		a.AddLogMsg("[TRADE_COVERAGE] skipped shortage enforcement during payout trade")
-		log.Printf("[TRADE_COVERAGE] skipped shortage enforcement during payout trade")
 		return
 	}
 
@@ -1570,26 +1550,21 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			}
 
 			a.AddLogMsg("[TRADE_COMPLETED #112] payout trade completed")
-			log.Printf("[TRADE_COMPLETED #112] payout trade completed")
 			a.captureCurrentGameHistoryPayoutItems(payoutItems, "Payout trade completed successfully", true)
 
 			completeMsg := fmt.Sprintf("Trade Completed: \"%s\"", partnerName)
 			a.AddLogMsg(fmt.Sprintf("[TRADE_COMPLETED] shouting: %q", completeMsg))
-			log.Printf("[TRADE_COMPLETED] shouting: %q", completeMsg)
 			ext.Send(out.SHOUT, completeMsg)
 		} else {
 			a.AddLogMsg("[TRADE_COMPLETED #112] trade completed, sending trade summary")
-			log.Printf("[TRADE_COMPLETED #112] trade completed, sending trade summary")
 
 			// Send the trade items summary to chat
 			a.sendTradeCompletionMessage()
 			go func() {
 				if ok := a.forceRefreshHandSnapshot("trade completed"); ok {
 					a.AddLogMsg("[TRADE_COMPLETED] forced hand refresh complete after trade")
-					log.Printf("[TRADE_COMPLETED] forced hand refresh complete after trade")
 				} else {
 					a.AddLogMsg("[TRADE_COMPLETED] forced hand refresh failed after trade")
-					log.Printf("[TRADE_COMPLETED] forced hand refresh failed after trade")
 				}
 			}()
 		}
@@ -1608,10 +1583,8 @@ func handleTradePacket(a *App, e *g.Intercept) {
 					incomingToken := extractTradeTokenFromPacket(e.Packet.Data)
 					if partnerToken, ok := lookupTokenByName(partnerName); ok {
 						a.AddLogMsg(fmt.Sprintf("[TRADE_BLOCK_DEBUG] active partner=%q expectedToken=%q incomingToken=%q", partnerName, partnerToken, incomingToken))
-						log.Printf("[TRADE_BLOCK_DEBUG] active partner=%q expectedToken=%q incomingToken=%q", partnerName, partnerToken, incomingToken)
 						if incomingToken != "" && incomingToken == partnerToken {
 							a.AddLogMsg(fmt.Sprintf("[TRADE_BLOCK] allowing trade from active partner %q by token match", partnerName))
-							log.Printf("[TRADE_BLOCK] allowing trade from active partner %q by token match", partnerName)
 							allowed = true
 						}
 					}
@@ -1619,11 +1592,9 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 				if !allowed {
 					a.AddLogMsg("[TRADE_BLOCK] incoming trade blocked during active round")
-					log.Printf("[TRADE_BLOCK] incoming trade blocked during active round")
 
 					// Detailed guard state for diagnostics
 					a.AddLogMsg(fmt.Sprintf("[TRADE_GUARD] block reason=%s awaitingTradeOpen=%t dealerTradeWindowOpen=%t dealerGameActive=%t dealerResyncInProgress=%t", "incoming blocked during active round", awaitingTradeOpen, dealerTradeWindowOpen, dealerGameActive(), dealerResyncInProgress))
-					log.Printf("[TRADE_GUARD] block reason=%s awaitingTradeOpen=%t dealerTradeWindowOpen=%t dealerGameActive=%t dealerResyncInProgress=%t", "incoming blocked during active round", awaitingTradeOpen, dealerTradeWindowOpen, dealerGameActive(), dealerResyncInProgress)
 					hiddenBlockedTradeCleanupPending = true
 					ignoreNextGuardCloseRecovery = true
 					suppressNextTradeCloseAnnouncement = true
@@ -1652,7 +1623,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			incomingToken := extractTradeTokenFromPacket(e.Packet.Data)
 			expectedToken, _ := lookupTokenByName(payoutTargetName)
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] incoming trade-open while payout active: sent=%t target=%q targetID=%d expectedToken=%q incomingToken=%q matchedRecentOutgoing=%t", payoutTradeSent, payoutTargetName, payoutTargetID, expectedToken, incomingToken, matchedRecentOutgoing))
-			log.Printf("[PAYOUT_DEBUG] incoming trade-open while payout active: sent=%t target=%q targetID=%d expectedToken=%q incomingToken=%q matchedRecentOutgoing=%t", payoutTradeSent, payoutTargetName, payoutTargetID, expectedToken, incomingToken, matchedRecentOutgoing)
 			if payoutTradeSent {
 				// Our outgoing TRADE_OPEN was accepted — this is the payout trade opening successfully
 				savedPayoutTargetID := payoutTargetID
@@ -1663,18 +1633,15 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				payoutTargetName = savedPayoutTargetName
 				isPayoutTradeOpen = true
 				a.AddLogMsg(fmt.Sprintf("[PAYOUT] trade opened successfully with %s, proceeding", savedPayoutTargetName))
-				log.Printf("[PAYOUT] trade opened successfully with %s, proceeding", savedPayoutTargetName)
 				// Fall through to normal trade-open handling below
 				go a.autoAddPayoutItems()
 				go a.startPayoutResponseTimeoutMonitor(savedPayoutTargetName, savedPayoutTargetID, savedPayoutTargetName)
 			} else {
 				// Someone else opened a trade with us during payout — block it
 				a.AddLogMsg(fmt.Sprintf("[PAYOUT] incoming trade blocked during payout to %s, closing", payoutTargetName))
-				log.Printf("[PAYOUT] incoming trade blocked during payout to %s, closing", payoutTargetName)
 
 				// Detailed guard state for diagnostics
 				a.AddLogMsg(fmt.Sprintf("[TRADE_GUARD] block reason=%s awaitingTradeOpen=%t dealerTradeWindowOpen=%t dealerGameActive=%t dealerResyncInProgress=%t", "incoming blocked during payout", awaitingTradeOpen, dealerTradeWindowOpen, dealerGameActive(), dealerResyncInProgress))
-				log.Printf("[TRADE_GUARD] block reason=%s awaitingTradeOpen=%t dealerTradeWindowOpen=%t dealerGameActive=%t dealerResyncInProgress=%t", "incoming blocked during payout", awaitingTradeOpen, dealerTradeWindowOpen, dealerGameActive(), dealerResyncInProgress)
 				hiddenBlockedTradeCleanupPending = true
 				ignoreNextGuardCloseRecovery = true
 				suppressNextTradeCloseAnnouncement = true
@@ -1690,18 +1657,14 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				reason = "dealer busy in active game"
 			} else if dealerResyncInProgress {
 				reason = "dealer syncing hand"
-			} else if !awaitingTradeOpen {
+			} else if !dealerAcceptingTrades {
 				reason = "dealer not accepting trades"
-			} else if !dealerTradeWindowOpen {
-				reason = "dealer open announcement not active"
 			}
 
 			a.AddLogMsg(fmt.Sprintf("[TRADE_GUARD] blocking incoming trade open: %s", reason))
-			log.Printf("[TRADE_GUARD] blocking incoming trade open: %s", reason)
 
 			// Detailed guard state for diagnostics
 			a.AddLogMsg(fmt.Sprintf("[TRADE_GUARD] block reason=%s awaitingTradeOpen=%t dealerTradeWindowOpen=%t dealerGameActive=%t dealerResyncInProgress=%t", reason, awaitingTradeOpen, dealerTradeWindowOpen, dealerGameActive(), dealerResyncInProgress))
-			log.Printf("[TRADE_GUARD] block reason=%s awaitingTradeOpen=%t dealerTradeWindowOpen=%t dealerGameActive=%t dealerResyncInProgress=%t", reason, awaitingTradeOpen, dealerTradeWindowOpen, dealerGameActive(), dealerResyncInProgress)
 			hiddenBlockedTradeCleanupPending = true
 			ignoreNextGuardCloseRecovery = true
 			suppressNextTradeCloseAnnouncement = true
@@ -1712,7 +1675,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 		if matchedRecentOutgoing {
 			a.AddLogMsg(fmt.Sprintf("[TRADE_GUARD] allowing incoming trade open because it matches recent outgoing target %d", recentTargetID))
-			log.Printf("[TRADE_GUARD] allowing incoming trade open because it matches recent outgoing target %d", recentTargetID)
 		}
 
 		// Defensive guard: do not allow incoming trade to proceed if we don't
@@ -1720,7 +1682,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		// ClearTradeItems() wiped the snapshot and the dealer reopens immediately.
 		if !isPayoutTradeOpen && !matchedRecentOutgoing && !dealerSnapshotReady() {
 			a.AddLogMsg("[TRADE_GUARD] blocking incoming trade open: hand snapshot not ready")
-			log.Printf("[TRADE_GUARD] blocking incoming trade open: hand snapshot not ready")
 			hiddenBlockedTradeCleanupPending = true
 			ignoreNextGuardCloseRecovery = true
 			suppressNextTradeCloseAnnouncement = true
@@ -1752,12 +1713,10 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 		for _, decodeLine := range decodeTradeOpenPacket(e.Packet) {
 			a.AddLogMsg("[TRADE_OPEN_DECODE] " + decodeLine)
-			log.Printf("[TRADE_OPEN_DECODE] %s", decodeLine)
 		}
 
 		for _, candidateLine := range describeTradeRoomCandidates(a.ext) {
 			a.AddLogMsg("[TRADE_ROOM] " + candidateLine)
-			log.Printf("[TRADE_ROOM] %s", candidateLine)
 		}
 
 		if len(e.Packet.Data) >= 1 {
@@ -1777,11 +1736,9 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				if name, ok := lookupUsers28Token(tradeTokenHex); ok {
 					lastTradePartnerName = name
 					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] token hex %q matched name %q", tradeTokenHex, name))
-					log.Printf("[TRADE_OPEN] token hex %q matched name %q", tradeTokenHex, name)
 				} else if waitedName, waitedOk := waitForUsers28TokenName(tradeTokenHex, 1200*time.Millisecond); waitedOk {
 					lastTradePartnerName = waitedName
 					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] token hex %q matched name %q after wait", tradeTokenHex, waitedName))
-					log.Printf("[TRADE_OPEN] token hex %q matched name %q after wait", tradeTokenHex, waitedName)
 				} else {
 					// Try short-token (first 2 bytes) as a fallback.
 					short := string(rawToken[:2])
@@ -1790,7 +1747,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 						if n, ok := users28ByShortToken[short]; ok {
 							lastTradePartnerName = n
 							a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] short token %q matched name %q", short, n))
-							log.Printf("[TRADE_OPEN] short token %q matched name %q", short, n)
 						}
 						users28Mu.Unlock()
 					}
@@ -1801,7 +1757,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 					if idx, ok := waitForUsers28RoomIndexByName(lastTradePartnerName, 500*time.Millisecond); ok {
 						lastTradePartnerID = idx
 						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] resolved room index %d from token-matched name %q", idx, lastTradePartnerName))
-						log.Printf("[TRADE_OPEN] resolved room index %d from token-matched name %q", idx, lastTradePartnerName)
 					}
 				}
 
@@ -1815,7 +1770,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 							lastTradePartnerName = name
 						}
 						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] resolved token to room index %d and name %q", idx, name))
-						log.Printf("[TRADE_OPEN] resolved token to room index %d and name %q", idx, name)
 					}
 				}
 			}
@@ -1827,7 +1781,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			if vlen > 0 && vlen <= len(e.Packet.Data) {
 				traderRoomIndex := gencoding.VL64Decode(e.Packet.Data[:vlen])
 				a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] leading VL64 candidate room index %d", traderRoomIndex))
-				log.Printf("[TRADE_OPEN] leading VL64 candidate room index %d", traderRoomIndex)
 				if isPlausibleTradeRoomIndex(traderRoomIndex) {
 					if indexName, indexOk := lookupUsers28Index(traderRoomIndex); indexOk {
 						lastTradePartnerID = traderRoomIndex
@@ -1835,21 +1788,17 @@ func handleTradePacket(a *App, e *g.Intercept) {
 							lastTradePartnerName = indexName
 						}
 						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] confirmed room index %d as %q", traderRoomIndex, indexName))
-						log.Printf("[TRADE_OPEN] confirmed room index %d as %q", traderRoomIndex, indexName)
 					} else if waitedName, waitedOk := waitForUsers28IndexName(traderRoomIndex, 500*time.Millisecond); waitedOk {
 						lastTradePartnerID = traderRoomIndex
 						if lastTradePartnerName == "" || strings.EqualFold(lastTradePartnerName, "Unknown") {
 							lastTradePartnerName = waitedName
 						}
 						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] confirmed room index %d as %q after wait", traderRoomIndex, waitedName))
-						log.Printf("[TRADE_OPEN] confirmed room index %d as %q after wait", traderRoomIndex, waitedName)
 					} else {
 						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] plausible room index %d was not present in USERS28 cache", traderRoomIndex))
-						log.Printf("[TRADE_OPEN] plausible room index %d was not present in USERS28 cache", traderRoomIndex)
 					}
 				} else {
 					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] ignoring implausible leading VL64 room index %d", traderRoomIndex))
-					log.Printf("[TRADE_OPEN] ignoring implausible leading VL64 room index %d", traderRoomIndex)
 				}
 			}
 		}
@@ -1866,19 +1815,17 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			partnerID := lastTradePartnerID
 			outPreview := string(ext.NewPacket(out.TRADE_OPEN, partnerID).Data)
 			a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #%d] derived outgoing[%d] -> %s (partner id %d)", tradeOpenCount, 71, outPreview, partnerID))
-			log.Printf("[TRADE_OPEN #%d] derived outgoing[%d] -> %s (partner id %d)", tradeOpenCount, 71, outPreview, partnerID)
 		} else if partnerID, ok := extractTradePartnerID(tradePayload); ok {
 			lastTradePartnerID = partnerID
 			lastTradePartnerName = "Unknown"
 			outPreview := string(ext.NewPacket(out.TRADE_OPEN, partnerID).Data)
 			a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #%d] fallback candidate outgoing[%d] -> %s (partner id %d)", tradeOpenCount, 71, outPreview, partnerID))
-			log.Printf("[TRADE_OPEN #%d] fallback candidate outgoing[%d] -> %s (partner id %d)", tradeOpenCount, 71, outPreview, partnerID)
 		} else {
 			lastTradePartnerID = 0
 			a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #%d] unresolved reopen target: waiting for room-user mapping", tradeOpenCount))
-			log.Printf("[TRADE_OPEN #%d] unresolved reopen target: waiting for room-user mapping", tradeOpenCount)
 		}
 		awaitingTradeOpen = false
+		dealerAcceptingTrades = false
 		dealerTradeWindowOpen = false
 		log.Printf("[TRADE_OPEN #%d] %s", tradeOpenCount, lastTradeOpen)
 		a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #%d] %s", tradeOpenCount, lastTradeOpen))
@@ -1892,7 +1839,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			if partnerName == "" || strings.EqualFold(partnerName, "Unknown") {
 				notify := "Sorry canno't see you, please try again or rejoin room"
 				a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] unknown partner, cancelling trade: %s", notify))
-				log.Printf("[TRADE_OPEN] unknown partner, cancelling trade: %s", notify)
 				e.Block()
 				ext.Send(out.TRADE_CLOSE)
 				ext.Send(out.SHOUT, notify)
@@ -1906,11 +1852,9 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		}
 		if shouldAnnounceTradeOpen {
 			a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] shouting: %q", openMsg))
-			log.Printf("[TRADE_OPEN] shouting: %q", openMsg)
 			ext.Send(out.SHOUT, openMsg)
 		} else {
 			a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] suppressed public shout during payout flow: %q", openMsg))
-			log.Printf("[TRADE_OPEN] suppressed public shout during payout flow: %q", openMsg)
 		}
 
 		handItemsMu.Lock()
@@ -1923,7 +1867,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			tradeHandSnapshotReady = false
 			// Diagnostic: explicit log when non-strict lifecycle clears snapshot
 			a.AddLogMsg("[TRADE_HAND_SNAPSHOT] cleared snapshot due to non-strict lifecycle on TRADE_OPEN")
-			log.Printf("[TRADE_HAND_SNAPSHOT] cleared snapshot due to non-strict lifecycle on TRADE_OPEN")
 		}
 		handItemsMu.Unlock()
 
@@ -1965,7 +1908,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				a.notifyTradeQuantityCoverage()
 			} else {
 				a.AddLogMsg("[TRADE_HAND_SNAPSHOT] forced refresh failed on incoming trade open")
-				log.Printf("[TRADE_HAND_SNAPSHOT] forced refresh failed on incoming trade open")
 			}
 		}()
 		return
@@ -1979,7 +1921,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		if ignoreNextGuardCloseRecovery {
 			ignoreNextGuardCloseRecovery = false
 			a.AddLogMsg("[TRADE_GUARD] ignoring trade-close recovery for blocked foreign trade during active round")
-			log.Printf("[TRADE_GUARD] ignoring trade-close recovery for blocked foreign trade during active round")
 			e.Block()
 			return
 		}
@@ -2003,12 +1944,10 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		if !tradeCompleted && !tradeCloseAnnounced && !suppressCloseAnnouncement {
 			closeMsg := fmt.Sprintf("Trade Closed: \"%s\"", partnerName)
 			a.AddLogMsg(fmt.Sprintf("[TRADE_CLOSE] shouting: %q", closeMsg))
-			log.Printf("[TRADE_CLOSE] shouting: %q", closeMsg)
 			ext.Send(out.SHOUT, closeMsg)
 			tradeCloseAnnounced = true
 		} else if suppressCloseAnnouncement {
 			a.AddLogMsg("[TRADE_GUARD] suppressed trade closed announcement for forced guard-close")
-			log.Printf("[TRADE_GUARD] suppressed trade closed announcement for forced guard-close")
 		}
 
 		tradeClosePayload := strings.TrimSpace(string(e.Packet.Data))
@@ -2043,7 +1982,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				payoutCancelCount++
 
 				a.AddLogMsg(fmt.Sprintf("[PAYOUT] payout trade cancelled by %s, cancel count %d/5", retryTargetName, payoutCancelCount))
-				log.Printf("[PAYOUT] payout trade cancelled by %s, cancel count %d/5", retryTargetName, payoutCancelCount)
 				a.noteCurrentGameHistory(fmt.Sprintf("Payout trade closed before completion; retry %d/5", payoutCancelCount))
 
 				playerName := strings.TrimSpace(retryTargetName)
@@ -2080,14 +2018,12 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				return
 			} else {
 				a.AddLogMsg("[TRADE_REOPEN] trade closed before completion, reopening dealer (idle recovery)")
-				log.Printf("[TRADE_REOPEN] trade closed before completion, reopening dealer (idle recovery)")
 				go a.reopenDealerIdle("incomplete trade close")
 			}
 		} else if payoutTradeActive {
 			// Payout trade completed normally — clear active flag
 			payoutTradeActive = false
 			a.AddLogMsg("[PAYOUT] payout trade completed successfully")
-			log.Printf("[PAYOUT] payout trade completed successfully")
 			stopPayoutResponseTimeoutMonitor()
 			resetPayoutRetryState()
 			a.noteCurrentGameHistory("Dealer payout flow finished successfully")
@@ -2104,7 +2040,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		}
 
 		a.AddLogMsg(fmt.Sprintf("[TRADE_REOPEN] ready for manual reopen -> %s (%d)", lastTradePartnerName, partnerID))
-		log.Printf("[TRADE_REOPEN] ready for manual reopen -> %s (%d)", lastTradePartnerName, partnerID)
 	}
 }
 
@@ -2197,7 +2132,6 @@ func markPayoutCancelNoticeSent() {
 
 func resumeDealerAfterPayoutIssue(a *App, reason string) {
 	a.AddLogMsg(fmt.Sprintf("[PAYOUT] resuming dealer after payout issue: %s", reason))
-	log.Printf("[PAYOUT] resuming dealer after payout issue: %s", reason)
 
 	// Clear payout state and retry counters first.
 	stopPayout()
@@ -2228,7 +2162,6 @@ func (a *App) startPayoutResponseTimeoutMonitor(playerName string, targetID int,
 		payoutResponseTimeoutAttempts++
 
 		a.AddLogMsg(fmt.Sprintf("[PAYOUT_TIMEOUT] payout response timeout %d/3 for %s", payoutResponseTimeoutAttempts, player))
-		log.Printf("[PAYOUT_TIMEOUT] payout response timeout %d/3 for %s", payoutResponseTimeoutAttempts, player)
 
 		timeoutMsg := fmt.Sprintf("%q did not accept trade", player)
 		ext.Send(out.SHOUT, timeoutMsg)
@@ -2289,7 +2222,6 @@ func startPayout(a *App, targetID int, targetName string) {
 
 			if hiddenBlockedTradeCleanupPending {
 				a.AddLogMsg("[PAYOUT_DEBUG] waiting for blocked-trade cleanup before opening payout trade")
-				log.Printf("[PAYOUT_DEBUG] waiting for blocked-trade cleanup before opening payout trade")
 				ext.Send(out.TRADE_CLOSE)
 				waitForHiddenBlockedTradeCleanup(2 * time.Second)
 			}
@@ -2297,42 +2229,34 @@ func startPayout(a *App, targetID int, targetName string) {
 			if strings.TrimSpace(targetName) != "" {
 				expectedToken, _ := lookupTokenByName(targetName)
 				a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] attempt %d target=%q currentTargetID=%d expectedToken=%q", attempt, targetName, targetID, expectedToken))
-				log.Printf("[PAYOUT_DEBUG] attempt %d target=%q currentTargetID=%d expectedToken=%q", attempt, targetName, targetID, expectedToken)
 				go requestRoomUsers(a)
 				if resolvedID, ok := waitForRoomEntityIndexByName(targetName, 900*time.Millisecond); ok && resolvedID > 0 && resolvedID != targetID {
 					a.AddLogMsg(fmt.Sprintf("[PAYOUT] refreshed %s target from ROOM_USERS index %d -> %d", targetName, targetID, resolvedID))
-					log.Printf("[PAYOUT] refreshed %s target from ROOM_USERS index %d -> %d", targetName, targetID, resolvedID)
 					targetID = resolvedID
 					payoutTargetID = resolvedID
 				} else if resolvedID, ok := waitForUsers28RoomIndexByName(targetName, 700*time.Millisecond); ok && resolvedID > 0 && resolvedID != targetID {
 					a.AddLogMsg(fmt.Sprintf("[PAYOUT] refreshed %s target from USERS28 room index %d -> %d", targetName, targetID, resolvedID))
-					log.Printf("[PAYOUT] refreshed %s target from USERS28 room index %d -> %d", targetName, targetID, resolvedID)
 					targetID = resolvedID
 					payoutTargetID = resolvedID
 				} else if resolvedID, ok := waitForUsers28NameIndex(targetName, 700*time.Millisecond); ok {
 					a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] generic USERS28 name->index fallback produced %d for %s (current target %d)", resolvedID, targetName, targetID))
-					log.Printf("[PAYOUT_DEBUG] generic USERS28 name->index fallback produced %d for %s (current target %d)", resolvedID, targetName, targetID)
 				}
 			}
 
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT] opening trade with %s (%d), attempt %d/5", targetName, targetID, attempt))
-			log.Printf("[PAYOUT] opening trade with %s (%d), attempt %d/5", targetName, targetID, attempt)
 			payoutTradeSent = true
 			rememberOutgoingTradeOpenTarget(targetID)
 			outPreview := string(ext.NewPacket(out.TRADE_OPEN, targetID).Data)
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT] outgoing[71] payload=%q", outPreview))
-			log.Printf("[PAYOUT] outgoing[71] payload=%q", outPreview)
 			ext.Send(out.TRADE_OPEN, targetID)
 
 			// Fallback: send the raw VL64 payload form as well. Some sessions are picky about payload composition.
 			rawPayload := encodeVL64(targetID)
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT] outgoing[71] raw payload fallback=%q", rawPayload))
-			log.Printf("[PAYOUT] outgoing[71] raw payload fallback=%q", rawPayload)
 			ext.Send(g.Out.Id("TRADE_OPEN"), []byte(rawPayload))
 
 			if attempt > 1 {
 				a.AddLogMsg(fmt.Sprintf("[PAYOUT] retry trade open attempt %d/5 for %s", attempt, targetName))
-				log.Printf("[PAYOUT] retry trade open attempt %d/5 for %s", attempt, targetName)
 			}
 
 			// Wait up to 5 seconds for the trade to open (header 104 will call stopPayout)
@@ -2351,13 +2275,13 @@ func startPayout(a *App, targetID int, targetName string) {
 		if sessionID == payoutSessionID {
 			msg := "Recorded game history and flagged"
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT] all attempts exhausted, shouting: %q", msg))
-			log.Printf("[PAYOUT] all attempts exhausted, shouting: %q", msg)
 			a.markCurrentGameHistoryIssue("Payout trade failed to open after all retry attempts", true)
 			sendMessageWithDelay(msg)
 			stopPayout()
 			// Resume normal dealer-open cycle
 			awaitingTradeOpen = true
-			if canAnnounceDealerOpen() {
+			dealerAcceptingTrades = true
+			if shouldAnnounceDealerOpen() {
 				dealerTradeWindowOpen = true
 				go sendMessageWithDelay(a.dealerOpenMessage())
 			}
@@ -2375,14 +2299,12 @@ func (a *App) autoAddPayoutItems() {
 	// re-added the same item type and the live hand cache has not caught up yet.
 	if ok := a.forceRefreshHandSnapshot("payout auto-add start"); !ok {
 		a.AddLogMsg("[PAYOUT] aborting auto-add because forced hand refresh failed at payout start")
-		log.Printf("[PAYOUT] aborting auto-add because forced hand refresh failed at payout start")
 		return
 	}
 
 	betItems := gameBetItems
 	if len(betItems) == 0 {
 		a.AddLogMsg("[PAYOUT] no bet items recorded, skipping auto-add")
-		log.Printf("[PAYOUT] no bet items recorded, skipping auto-add")
 		return
 	}
 
@@ -2436,15 +2358,12 @@ func (a *App) autoAddPayoutItems() {
 
 		if attempt < 3 {
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] payout still short after hand scan attempt %d, forcing full rescan: %s", attempt, formatMissingCounts(missing)))
-			log.Printf("[PAYOUT_DEBUG] payout still short after hand scan attempt %d, forcing full rescan: %s", attempt, formatMissingCounts(missing))
 			if ok := a.forceRefreshHandSnapshot(fmt.Sprintf("payout auto-add retry %d", attempt+1)); !ok {
 				a.AddLogMsg(fmt.Sprintf("[PAYOUT] forced hand refresh failed during payout retry %d", attempt+1))
-				log.Printf("[PAYOUT] forced hand refresh failed during payout retry %d", attempt+1)
 				break
 			}
 		} else {
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] payout still short after final hand scan attempt: %s", formatMissingCounts(missing)))
-			log.Printf("[PAYOUT_DEBUG] payout still short after final hand scan attempt: %s", formatMissingCounts(missing))
 		}
 	}
 
@@ -2456,7 +2375,6 @@ func (a *App) autoAddPayoutItems() {
 		a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] selected ids for %s: selected=%d needed=%d", betItem.Name, len(toAdd), needed))
 		if len(toAdd) < needed {
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT] warning: need %d of %s but only found %d unique item ids", needed, betItem.Name, len(toAdd)))
-			log.Printf("[PAYOUT] warning: need %d of %s but only found %d unique item ids", needed, betItem.Name, len(toAdd))
 		}
 		for _, itemID := range toAdd {
 			if !payoutTradeActive {
@@ -2469,13 +2387,10 @@ func (a *App) autoAddPayoutItems() {
 			total++
 			payload := string(ext.NewPacket(out.TRADE_ADDITEM, -itemID).Data)
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT] added item %d (%s) %d/%d payload=%q", itemID, betItem.Name, total, needed, payload))
-			log.Printf("[PAYOUT] added item %d (%s) %d/%d payload=%q", itemID, betItem.Name, total, needed, payload)
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] added id %d (planned so far %d/%d)", itemID, len(plannedIDs), payoutExpectedAddCount))
-			log.Printf("[PAYOUT_DEBUG] added id %d (planned so far %d/%d)", itemID, len(plannedIDs), payoutExpectedAddCount)
 		}
 	}
 	a.AddLogMsg(fmt.Sprintf("[PAYOUT] auto-add complete: %d item(s) offered", total))
-	log.Printf("[PAYOUT] auto-add complete: %d item(s) offered", total)
 
 	// Accept only after full payout placement has been queued.
 	fullyPlanned := true
@@ -2492,10 +2407,8 @@ func (a *App) autoAddPayoutItems() {
 			tradeAutoAccepted = true
 			tradeAutoAcceptPending = false
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT] auto-accept sent after full payout placement (%d/%d sent=%d)", total, requiredTotal, payoutActualAddCount))
-			log.Printf("[PAYOUT] auto-accept sent after full payout placement (%d/%d sent=%d)", total, requiredTotal, payoutActualAddCount)
 		} else {
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] accept deferred: planned=%d/%d sent=%d/%d", total, requiredTotal, payoutActualAddCount, requiredTotal))
-			log.Printf("[PAYOUT_DEBUG] accept deferred: planned=%d/%d sent=%d/%d", total, requiredTotal, payoutActualAddCount, requiredTotal)
 		}
 	}
 
@@ -2616,7 +2529,6 @@ func (a *App) tryAcceptPayoutTrade(required map[string]int, source string) bool 
 	ok, detail := a.ownTradeHasRequiredPayoutOffer(required)
 	if !ok {
 		a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] not accepting yet (%s): %s", source, detail))
-		log.Printf("[PAYOUT_DEBUG] not accepting yet (%s): %s", source, detail)
 		return false
 	}
 
@@ -2624,7 +2536,6 @@ func (a *App) tryAcceptPayoutTrade(required map[string]int, source string) bool 
 	tradeAutoAccepted = true
 	tradeAutoAcceptPending = false
 	a.AddLogMsg(fmt.Sprintf("[PAYOUT] auto-accept sent after verifying payout items (%s)", source))
-	log.Printf("[PAYOUT] auto-accept sent after verifying payout items (%s)", source)
 	return true
 }
 
@@ -2651,14 +2562,12 @@ func (a *App) verifyAndRetryPayoutAdds(plannedIDs []int) {
 
 	ownTotal := ownTradeOfferTotal()
 	a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] post-add own offer total=%d planned=%d", ownTotal, len(plannedIDs)))
-	log.Printf("[PAYOUT_DEBUG] post-add own offer total=%d planned=%d", ownTotal, len(plannedIDs))
 	if a.tryAcceptPayoutTrade(required, "after-negative-add") {
 		return
 	}
 
 	// Fallback for sessions where TRADE_ADDITEM expects a positive item id.
 	a.AddLogMsg("[PAYOUT_DEBUG] own offer still empty after auto-add, retrying with positive item IDs")
-	log.Printf("[PAYOUT_DEBUG] own offer still empty after auto-add, retrying with positive item IDs")
 	for _, itemID := range plannedIDs {
 		if !payoutTradeActive {
 			return
@@ -2670,9 +2579,7 @@ func (a *App) verifyAndRetryPayoutAdds(plannedIDs []int) {
 		}
 		payload := string(ext.NewPacket(out.TRADE_ADDITEM, itemID).Data)
 		a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] retry add item +%d payload=%q", itemID, payload))
-		log.Printf("[PAYOUT_DEBUG] retry add item +%d payload=%q", itemID, payload)
 		a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] sent count now %d/%d", payoutActualAddCount, payoutExpectedAddCount))
-		log.Printf("[PAYOUT_DEBUG] sent count now %d/%d", payoutActualAddCount, payoutExpectedAddCount)
 	}
 
 	// Wait again for trade echo, then only accept if exact payout offer is present.
@@ -2688,12 +2595,10 @@ func (a *App) verifyAndRetryPayoutAdds(plannedIDs []int) {
 		tradeAutoAccepted = true
 		tradeAutoAcceptPending = false
 		a.AddLogMsg(fmt.Sprintf("[PAYOUT] auto-accept fallback after queued full payout (%d/%d sent=%d)", len(plannedIDs), requiredTotal, payoutActualAddCount))
-		log.Printf("[PAYOUT] auto-accept fallback after queued full payout (%d/%d sent=%d)", len(plannedIDs), requiredTotal, payoutActualAddCount)
 		return
 	}
 
 	a.AddLogMsg("[PAYOUT_DEBUG] payout items still not fully reflected in own trade offer; waiting for manual intervention")
-	log.Printf("[PAYOUT_DEBUG] payout items still not fully reflected in own trade offer; waiting for manual intervention")
 	a.noteCurrentGameHistory("Payout items did not fully reflect in trade offer; manual review may be needed")
 }
 
@@ -2730,7 +2635,6 @@ func startTradeWindowTimeoutMonitor(a *App) {
 			tradeWindowTimeoutActive = false
 			msg := "closing trade window opened for too long"
 			a.AddLogMsg("[TRADE_TIMEOUT] " + msg)
-			log.Printf("[TRADE_TIMEOUT] %s", msg)
 			a.markCurrentGameHistoryIssue("Trade window stayed open too long and was force closed", true)
 			ext.Send(out.SHOUT, msg)
 			ext.Send(out.TRADE_CLOSE)
@@ -2759,7 +2663,6 @@ func extendTradeWindowTimeoutForPartnerActivity(a *App) {
 		tradeWindowDeadline = extendedDeadline
 		seconds := int(tradeWindowDeadline.Sub(tradeWindowOpenedAt).Seconds())
 		a.AddLogMsg(fmt.Sprintf("[TRADE_TIMEOUT] partner adding items, extending window to %ds max", seconds))
-		log.Printf("[TRADE_TIMEOUT] partner adding items, extending window to %ds max", seconds)
 	}
 }
 
@@ -2801,7 +2704,6 @@ func (a *App) startGameChoiceTimeoutMonitor() {
 
 		reminder := "Shout pkr, 21, 13, Tri"
 		a.AddLogMsg(fmt.Sprintf("[GAME_CHOICE_TIMEOUT] 30s no response, repeating prompt for %s", player))
-		log.Printf("[GAME_CHOICE_TIMEOUT] 30s no response, repeating prompt for %s", player)
 		ext.Send(out.SHOUT, reminder)
 
 		// Another 30 seconds
@@ -2822,7 +2724,6 @@ func (a *App) startGameChoiceTimeoutMonitor() {
 		flagMsg := "We have flagged this game, please advise us on rollorigins.club"
 
 		a.AddLogMsg(fmt.Sprintf("[GAME_CHOICE_TIMEOUT] final timeout for %s", player))
-		log.Printf("[GAME_CHOICE_TIMEOUT] final timeout for %s", player)
 
 		ext.Send(out.SHOUT, closeMsg)
 		time.Sleep(1200 * time.Millisecond)
@@ -2887,7 +2788,6 @@ func startShortageMonitor(a *App, timeout time.Duration) {
 					partnerName = "Player"
 				}
 				a.AddLogMsg(fmt.Sprintf("[TRADE_COVERAGE] shortage unresolved; force-closing trade with %s", partnerName))
-				log.Printf("[TRADE_COVERAGE] shortage unresolved; force-closing trade with %s", partnerName)
 				ext.Send(out.SHOUT, "Sorry none avabile to see my hand - rollorigins.club")
 				ext.Send(out.TRADE_CLOSE)
 				stopShortageMonitor()
@@ -2946,7 +2846,6 @@ func startTradeLimitMonitor(a *App, timeout time.Duration) {
 					partnerName = "Player"
 				}
 				a.AddLogMsg(fmt.Sprintf("[TRADE_LIMIT] unresolved; force-closing trade with %s", partnerName))
-				log.Printf("[TRADE_LIMIT] unresolved; force-closing trade with %s", partnerName)
 				ext.Send(out.SHOUT, "Trade still over limit; closing now.")
 				ext.Send(out.TRADE_CLOSE)
 				stopTradeLimitMonitor()
@@ -3055,7 +2954,6 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 	if !payoutTradeActive {
 		if s := a.getTradeCoverageShortages(); s != nil && len(s) > 0 {
 			a.AddLogMsg("[TRADE_ACCEPT] skipped auto-accept due to insufficient payout stock")
-			log.Printf("[TRADE_ACCEPT] skipped auto-accept due to insufficient payout stock")
 			return
 		}
 
@@ -3066,7 +2964,6 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 		tradeItemsMu.Unlock()
 		if v := getTradeLimitViolation(itemsCopy); v != nil {
 			a.AddLogMsg("[TRADE_ACCEPT] skipped auto-accept due to active trade limit violation")
-			log.Printf("[TRADE_ACCEPT] skipped auto-accept due to active trade limit violation")
 			return
 		}
 		// If snapshot not ready (s == nil) allow scheduling and perform a
@@ -3076,7 +2973,6 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 	tradeAutoAcceptPending = true
 	flowID := tradeAutoFlowID
 	a.AddLogMsg(fmt.Sprintf("[TRADE_ACCEPT #109] detected (%q), auto-accept in 2s", payload))
-	log.Printf("[TRADE_ACCEPT #109] detected (%q), auto-accept in 2s", payload)
 
 	go func(flow int) {
 		time.Sleep(2 * time.Second)
@@ -3102,7 +2998,6 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 					if time.Now().After(deadline) {
 						tradeAutoAcceptPending = false
 						a.AddLogMsg("[TRADE_ACCEPT] canceled auto-accept: hand snapshot unavailable")
-						log.Printf("[TRADE_ACCEPT] canceled auto-accept: hand snapshot unavailable")
 						return
 					}
 					time.Sleep(100 * time.Millisecond)
@@ -3111,7 +3006,6 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 				if len(s) > 0 {
 					tradeAutoAcceptPending = false
 					a.AddLogMsg("[TRADE_ACCEPT] canceled auto-accept due to insufficient payout stock")
-					log.Printf("[TRADE_ACCEPT] canceled auto-accept due to insufficient payout stock")
 					return
 				}
 				// Re-check trade-limits immediately before accepting in case the
@@ -3123,7 +3017,6 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 				if v := getTradeLimitViolation(itemsCopy); v != nil {
 					tradeAutoAcceptPending = false
 					a.AddLogMsg("[TRADE_ACCEPT] canceled auto-accept because trade became invalid during wait")
-					log.Printf("[TRADE_ACCEPT] canceled auto-accept because trade became invalid during wait")
 					return
 				}
 				break
@@ -3134,7 +3027,6 @@ func scheduleAutoTradeAccept(a *App, payload string) {
 		tradeAutoAcceptPending = false
 		tradeAutoAccepted = true
 		a.AddLogMsg("[TRADE_ACCEPT] sent outgoing[69]")
-		log.Printf("[TRADE_ACCEPT] sent outgoing[69]")
 	}(flowID)
 }
 
@@ -3145,7 +3037,6 @@ func scheduleAutoTradeConfirm(a *App, payload string) {
 	if !payoutTradeActive {
 		if s := a.getTradeCoverageShortages(); s != nil && len(s) > 0 {
 			a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] skipped auto-confirm due to insufficient payout stock")
-			log.Printf("[TRADE_CONFIRM_ACCEPT] skipped auto-confirm due to insufficient payout stock")
 			return
 		}
 		// If snapshot not ready (s == nil) allow scheduling and perform a
@@ -3155,14 +3046,12 @@ func scheduleAutoTradeConfirm(a *App, payload string) {
 	tradeAutoConfirmPending = true
 	flowID := tradeAutoFlowID
 	a.AddLogMsg(fmt.Sprintf("[TRADE_CONFIRM #111] detected (%q), auto-confirm starts in 4s with up to 10 attempts", payload))
-	log.Printf("[TRADE_CONFIRM #111] detected (%q), auto-confirm starts in 4s with up to 10 attempts", payload)
 
 	go func(flow int) {
 		defer func() {
 			if r := recover(); r != nil {
 				tradeAutoConfirmPending = false
 				a.AddLogMsg(fmt.Sprintf("[TRADE_CONFIRM_ACCEPT] recovered from panic: %v", r))
-				log.Printf("[TRADE_CONFIRM_ACCEPT] recovered from panic: %v", r)
 			}
 		}()
 
@@ -3188,7 +3077,6 @@ func scheduleAutoTradeConfirm(a *App, payload string) {
 						if time.Now().After(deadline) {
 							tradeAutoConfirmPending = false
 							a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] canceled auto-confirm: hand snapshot unavailable")
-							log.Printf("[TRADE_CONFIRM_ACCEPT] canceled auto-confirm: hand snapshot unavailable")
 							return
 						}
 						time.Sleep(100 * time.Millisecond)
@@ -3197,7 +3085,6 @@ func scheduleAutoTradeConfirm(a *App, payload string) {
 					if len(s) > 0 {
 						tradeAutoConfirmPending = false
 						a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] canceled auto-confirm due to insufficient payout stock")
-						log.Printf("[TRADE_CONFIRM_ACCEPT] canceled auto-confirm due to insufficient payout stock")
 						return
 					}
 					break
@@ -3206,7 +3093,6 @@ func scheduleAutoTradeConfirm(a *App, payload string) {
 
 			ext.Send(g.Out.Id("TRADE_CONFIRM_ACCEPT"))
 			a.AddLogMsg(fmt.Sprintf("[TRADE_CONFIRM_ACCEPT] sent outgoing[402] attempt %d/10", attempt))
-			log.Printf("[TRADE_CONFIRM_ACCEPT] sent outgoing[402] attempt %d/10", attempt)
 		}
 
 		tradeAutoConfirmPending = false
@@ -3223,12 +3109,11 @@ func handleTradeConfirmTimeout(a *App) {
 	}
 
 	a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] max attempts reached; sending trade close")
-	log.Printf("[TRADE_CONFIRM_ACCEPT] max attempts reached; sending trade close")
 	a.markCurrentGameHistoryIssue("Trade confirm timed out and trade was force closed", true)
 	ext.Send(out.TRADE_CLOSE)
 
 	closeMsg := fmt.Sprintf("Trade Closed: \"%s\"", partnerName)
-	if canAnnounceDealerOpen() {
+	if shouldAnnounceDealerOpen() {
 		tradeCloseAnnounced = true
 		sendMessageWithDelay(closeMsg)
 		sendMessageWithDelay(a.dealerOpenMessage())
@@ -3236,7 +3121,6 @@ func handleTradeConfirmTimeout(a *App) {
 	} else {
 		dealerTradeWindowOpen = false
 		a.AddLogMsg("[TRADE_CONFIRM_ACCEPT] user muted; skipped timeout close announcement")
-		log.Printf("[TRADE_CONFIRM_ACCEPT] user muted; skipped timeout close announcement")
 	}
 
 	awaitingTradeOpen = true
@@ -3326,12 +3210,10 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 	}
 
 	a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] received packet 28 len=%d", len(e.Packet.Data)))
-	log.Printf("[ROOM_USERS] received packet 28 len=%d", len(e.Packet.Data))
 
 	parsed, err := runUsers28PythonParser(a, e.Packet.Data)
 	if err != nil {
 		a.AddLogMsg(fmt.Sprintf("[USERS28_PY] parser failed: %v", err))
-		log.Printf("[USERS28_PY] parser failed: %v", err)
 		return
 	}
 
@@ -3352,13 +3234,13 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 
 	for _, u := range parsed.Users {
 		rawName := strings.TrimSpace(u.DetectedName)
-		if rawName == "" {
-			rawName = strings.TrimSpace(u.Name)
-		}
-		name := normalizeUsername(strings.TrimSpace(u.Name))
+		apiName := strings.TrimSpace(u.Name)
+		name := apiName
 		if name == "" {
-			name = normalizeUsername(rawName)
+			name = rawName
 		}
+		name = normalizeUsername(name)
+		rawName = normalizeUsername(rawName)
 		token := strings.TrimSpace(u.TokenHex)
 		short := strings.TrimSpace(u.ShortToken)
 
@@ -3367,8 +3249,7 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 		}
 
 		if rawName != "" && rawName != name {
-			a.AddLogMsg(fmt.Sprintf("[USERS28_FIX] cleaned name %q -> %q figureMatch=%t alias=%q", rawName, name, u.FigureMatch, u.MatchedAlias))
-			log.Printf("[USERS28_FIX] cleaned name %q -> %q figureMatch=%t alias=%q", rawName, name, u.FigureMatch, u.MatchedAlias)
+			a.AddLogMsg(fmt.Sprintf("[USERS28_API] resolved detected=%q -> api=%q figureMatch=%t alias=%q", rawName, name, u.FigureMatch, u.MatchedAlias))
 		}
 
 		// Determine chat index from short token if possible
@@ -3451,22 +3332,21 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 	sort.Strings(left)
 	if len(joined) > 0 {
 		a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] joined: %s", strings.Join(joined, ", ")))
-		log.Printf("[ROOM_USERS] joined: %s", strings.Join(joined, ", "))
 	}
 	if len(left) > 0 {
 		a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] left: %s", strings.Join(left, ", ")))
-		log.Printf("[ROOM_USERS] left: %s", strings.Join(left, ", "))
 	}
 
 	a.emitRoomIdentityUpdate()
 
 	for _, u := range parsed.Users {
-		cleanName := normalizeUsername(u.Name)
-		a.AddLogMsg(fmt.Sprintf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, u.TokenHex, u.ShortToken, cleanName, u.RoomIndex))
-		log.Printf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, u.TokenHex, u.ShortToken, cleanName, u.RoomIndex)
+		resolvedName := normalizeUsername(strings.TrimSpace(u.Name))
+		if resolvedName == "" {
+			resolvedName = normalizeUsername(strings.TrimSpace(u.DetectedName))
+		}
+		a.AddLogMsg(fmt.Sprintf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, u.TokenHex, u.ShortToken, resolvedName, u.RoomIndex))
 		if chatIdx, ok := chatIndexFromShortToken(u.ShortToken); ok && chatIdx > 0 {
-			a.AddLogMsg(fmt.Sprintf("[USERS28_DEBUG] name=%q roomIndex=%d chatIndex=%d short=%q token=%q", cleanName, u.RoomIndex, chatIdx, u.ShortToken, u.TokenHex))
-			log.Printf("[USERS28_DEBUG] name=%q roomIndex=%d chatIndex=%d short=%q token=%q", cleanName, u.RoomIndex, chatIdx, u.ShortToken, u.TokenHex)
+			a.AddLogMsg(fmt.Sprintf("[USERS28_DEBUG] name=%q roomIndex=%d chatIndex=%d short=%q token=%q", resolvedName, u.RoomIndex, chatIdx, u.ShortToken, u.TokenHex))
 		}
 	}
 }
@@ -3500,6 +3380,7 @@ func (a *App) resetDealerSessionState(reason string) {
 	stopGameChoiceTimeoutMonitor()
 
 	awaitingTradeOpen = false
+	dealerAcceptingTrades = false
 	dealerTradeWindowOpen = false
 	awaitingGameChoice = false
 	gameChoiceUnreadableWarned = false
@@ -3531,7 +3412,6 @@ func (a *App) resetDealerSessionState(reason string) {
 
 	clearRoomUserCaches(a)
 	a.AddLogMsg(fmt.Sprintf("[DEALER_RESET] session reset (%s)", reason))
-	log.Printf("[DEALER_RESET] session reset (%s)", reason)
 }
 
 func lookupUsers28Token(token string) (string, bool) {
@@ -3679,36 +3559,6 @@ func normalizeUsername(raw string) string {
 	if raw == "" {
 		return raw
 	}
-
-	// Fix parser artefacts like "adfAmaver1995" or "fAmaver1995" without
-	// mangling normal lowercase usernames. Only strip a short leading run of
-	// lowercase junk when it is immediately followed by an uppercase-led name.
-	if len(raw) >= 4 {
-		maxPrefix := 4
-		if len(raw)-3 < maxPrefix {
-			maxPrefix = len(raw) - 3
-		}
-		for i := 1; i <= maxPrefix; i++ {
-			prefixOK := true
-			for j := 0; j < i; j++ {
-				if raw[j] < 'a' || raw[j] > 'z' {
-					prefixOK = false
-					break
-				}
-			}
-			if !prefixOK {
-				continue
-			}
-			if raw[i] < 'A' || raw[i] > 'Z' {
-				continue
-			}
-			if raw[i+1] < 'a' || raw[i+1] > 'z' {
-				continue
-			}
-			return raw[i:]
-		}
-	}
-
 	return raw
 }
 
@@ -3862,7 +3712,6 @@ func runParseUsersScript(a *App, data []byte) (map[string]map[string]interface{}
 	cmd.Stderr = &errBuf
 	if err := cmd.Run(); err != nil {
 		a.AddLogMsg(fmt.Sprintf("[PY_PARSE] script failed: %v stderr=%s", err, errBuf.String()))
-		log.Printf("[PY_PARSE] script failed: %v stderr=%s", err, errBuf.String())
 		if a != nil && a.ctx != nil {
 			runtime.EventsEmit(a.ctx, "pyParserStdout", outBuf.String())
 			runtime.EventsEmit(a.ctx, "pyParserStderr", errBuf.String())
@@ -3886,7 +3735,6 @@ func runParseUsersScript(a *App, data []byte) (map[string]map[string]interface{}
 	}
 	if err := json.Unmarshal(outBuf.Bytes(), &raw); err != nil {
 		a.AddLogMsg(fmt.Sprintf("[PY_PARSE] json unmarshal failed: %v", err))
-		log.Printf("[PY_PARSE] json unmarshal failed: %v", err)
 		return nil, err
 	}
 
@@ -3974,15 +3822,12 @@ func (a *App) parseTradeItemsPacket(data []byte) []TradeItem {
 		fieldStr := strings.TrimSpace(string(field))
 		// Log the raw field to aid debugging of parsing failures.
 		a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] field=%q", fieldStr))
-		log.Printf("[TRADE_PARSE_DEBUG] field=%q", fieldStr)
 
 		itemName, qty, ok := a.extractTradeItemAndQuantity(fieldStr)
 		if !ok {
 			a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] skipped field=%q", fieldStr))
-			log.Printf("[TRADE_PARSE_DEBUG] skipped field=%q", fieldStr)
 			// Preserve unknown raw field in logs for later inspection.
 			a.AddLogMsg(fmt.Sprintf("[TRADE_UNKNOWN_FIELD] raw=%q", fieldStr))
-			log.Printf("[TRADE_UNKNOWN_FIELD] raw=%q", fieldStr)
 			continue
 		}
 		if qty <= 0 {
@@ -3991,7 +3836,6 @@ func (a *App) parseTradeItemsPacket(data []byte) []TradeItem {
 
 		// Successful parse: record and log.
 		a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] parsed field=%q -> name=%q qty=%d", fieldStr, itemName, qty))
-		log.Printf("[TRADE_PARSE_DEBUG] parsed field=%q -> name=%q qty=%d", fieldStr, itemName, qty)
 
 		counts[itemName] += qty
 		if _, exists := rawByName[itemName]; !exists {
@@ -4024,7 +3868,6 @@ func (a *App) parseTradeItemsPacket(data []byte) []TradeItem {
 func (a *App) extractTradeItemAndQuantity(field string) (string, int, bool) {
 	// Try legacy format first (e.g. "itkoHP|club_sofa")
 	a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] try legacy branch field=%q", field))
-	log.Printf("[TRADE_PARSE_DEBUG] try legacy branch field=%q", field)
 	if strings.Contains(field, "|") {
 		parts := strings.Split(field, "|")
 		if len(parts) >= 2 {
@@ -4034,24 +3877,19 @@ func (a *App) extractTradeItemAndQuantity(field string) (string, int, bool) {
 			// or a strict furni regex match before attempting normalization.
 			if !(strings.Contains(cand, "_") || strings.Contains(cand, "*") || stripItemNameRe.MatchString(cand)) {
 				a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] legacy candidate lacks item-like structure, skipping=%q", cand))
-				log.Printf("[TRADE_PARSE_DEBUG] legacy candidate lacks item-like structure, skipping=%q", cand)
 			} else {
 				a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] legacy candidate=%q", cand))
-				log.Printf("[TRADE_PARSE_DEBUG] legacy candidate=%q", cand)
 				if name, qty, ok := a.normalizeTradeFieldClassWithQty(cand); ok {
 					a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] legacy parsed %q -> %q", cand, name))
-					log.Printf("[TRADE_PARSE_DEBUG] legacy parsed %q -> %q", cand, name)
 					return name, qty, true
 				}
 				a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] legacy failed to parse candidate=%q", cand))
-				log.Printf("[TRADE_PARSE_DEBUG] legacy failed to parse candidate=%q", cand)
 			}
 		}
 	}
 
 	// Try current format (e.g. "irbUAXb{chair_plasty*2")
 	a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] try current branch field=%q", field))
-	log.Printf("[TRADE_PARSE_DEBUG] try current branch field=%q", field)
 	if strings.Contains(field, "{") {
 		parts := strings.SplitN(field, "{", 2)
 		if len(parts) == 2 {
@@ -4061,35 +3899,27 @@ func (a *App) extractTradeItemAndQuantity(field string) (string, int, bool) {
 			// token-like headers (e.g. "m{MHcizMH") as item classes.
 			if !(strings.Contains(cand, "_") || strings.Contains(cand, "*") || strings.HasPrefix(strings.ToLower(cand), "cf_") || stripItemNameRe.MatchString(cand)) {
 				a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] current candidate looks invalid, skipping: %q", cand))
-				log.Printf("[TRADE_PARSE_DEBUG] current candidate looks invalid, skipping: %q", cand)
 			} else {
 				a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] current candidate=%q", cand))
-				log.Printf("[TRADE_PARSE_DEBUG] current candidate=%q", cand)
 				if name, qty, ok := a.normalizeTradeFieldClassWithQty(cand); ok {
 					a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] current parsed %q -> %q", cand, name))
-					log.Printf("[TRADE_PARSE_DEBUG] current parsed %q -> %q", cand, name)
 					return name, qty, true
 				}
 				a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] current failed to parse candidate=%q", cand))
-				log.Printf("[TRADE_PARSE_DEBUG] current failed to parse candidate=%q", cand)
 			}
 		}
 	}
 
 	// Fallback: try strict strip regex first, then try looser token candidates.
 	a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] try fallback for field=%q", field))
-	log.Printf("[TRADE_PARSE_DEBUG] try fallback for field=%q", field)
 
 	if match := stripItemNameRe.FindString(field); match != "" {
 		a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] fallback strict matched=%q inside=%q", match, field))
-		log.Printf("[TRADE_PARSE_DEBUG] fallback strict matched=%q inside=%q", match, field)
 		if name, qty, ok := a.normalizeTradeFieldClassWithQty(match); ok {
 			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS_PARSE_FALLBACK] matched %q inside %q", match, field))
-			log.Printf("[TRADE_ITEMS_PARSE_FALLBACK] matched %q inside %q", match, field)
 			return name, qty, true
 		}
 		a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] fallback strict match %q rejected by normalisation/raw-check", match))
-		log.Printf("[TRADE_PARSE_DEBUG] fallback strict match %q rejected by normalisation/raw-check", match)
 	}
 
 	// Looser candidate scanning: find word-like tokens and try each one.
@@ -4097,21 +3927,16 @@ func (a *App) extractTradeItemAndQuantity(field string) (string, int, bool) {
 	matches := candidateRe.FindAllString(field, -1)
 	if len(matches) > 0 {
 		a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] fallback candidates=%q", matches))
-		log.Printf("[TRADE_PARSE_DEBUG] fallback candidates=%q", matches)
 		for _, cand := range matches {
 			a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] fallback trying candidate=%q", cand))
-			log.Printf("[TRADE_PARSE_DEBUG] fallback trying candidate=%q", cand)
 			if name, qty, ok := a.normalizeTradeFieldClassWithQty(cand); ok {
 				a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] fallback accepted candidate=%q -> %q", cand, name))
-				log.Printf("[TRADE_PARSE_DEBUG] fallback accepted candidate=%q -> %q", cand, name)
 				return name, qty, true
 			}
 			a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] fallback candidate rejected=%q", cand))
-			log.Printf("[TRADE_PARSE_DEBUG] fallback candidate rejected=%q", cand)
 		}
 	} else {
 		a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] fallback found no candidates in %q", field))
-		log.Printf("[TRADE_PARSE_DEBUG] fallback found no candidates in %q", field)
 	}
 
 	// Relaxed fallback: some server payloads include recognizable single-word
@@ -4144,7 +3969,6 @@ func (a *App) extractTradeItemAndQuantity(field string) (string, int, bool) {
 	if best != "" {
 		if normalized, ok := normalizeClassKeyWithVariant(best); ok {
 			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS_PARSE_RELAXED] accepted %q inside %q (best match)", normalized, field))
-			log.Printf("[TRADE_ITEMS_PARSE_RELAXED] accepted %q inside %q (best match)", normalized, field)
 			handItemsMu.Unlock()
 			return normalized, 1, true
 		}
@@ -4339,7 +4163,6 @@ func (a *App) ClearTradeItems() {
 	lastTradeCoverageNotice = ""
 	lastTradeBlockNotice = ""
 	a.AddLogMsg("[TRADE_ITEMS] cleared partner and own trade items")
-	log.Printf("[TRADE_ITEMS] cleared partner and own trade items")
 	a.emitTradeItemsUpdate("both")
 }
 
@@ -4388,7 +4211,6 @@ func (a *App) requestPlayerStrip(force bool) int {
 
 	if !force && tradeOpen && snapshotReady {
 		a.AddLogMsg("[STRIP_DEBUG] skipped hand scan because trade snapshot is already frozen")
-		log.Printf("[STRIP_DEBUG] skipped hand scan because trade snapshot is already frozen")
 
 		stripScanMu.Lock()
 		sid := stripScanSessionID
@@ -4407,13 +4229,10 @@ func (a *App) requestPlayerStrip(force bool) int {
 	stripScanMu.Unlock()
 
 	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] start scan session=%d force=%t", sid, force))
-	log.Printf("[STRIP_DEBUG] start scan session=%d force=%t", sid, force)
 
 	ext.Send(out.GETSTRIP, "new")
 	a.AddLogMsg("[STRIP_DEBUG] raw GETSTRIP send payload=\"new\"")
-	log.Printf("[STRIP_DEBUG] raw GETSTRIP send payload=%q", "new")
 	a.AddLogMsg("[STRIP] requested player hand scan (GETSTRIP new)")
-	log.Printf("[STRIP] requested player hand scan (GETSTRIP new)")
 
 	return sid
 }
@@ -4458,7 +4277,6 @@ func (a *App) resyncHandThenOpenDealer() {
 	dealerResyncInProgress = true
 
 	a.AddLogMsg("[TRADE_REOPEN] full reset complete; syncing room users and hand before reopening trades")
-	log.Printf("[TRADE_REOPEN] full reset complete; syncing room users and hand before reopening trades")
 	requestRoomUsers(a)
 
 	ok := a.forceRefreshHandSnapshot("resyncHandThenOpenDealer")
@@ -4470,20 +4288,19 @@ func (a *App) resyncHandThenOpenDealer() {
 
 	if !ok {
 		a.AddLogMsg("[TRADE_REOPEN] refusing to announce dealer open because forced hand refresh failed")
-		log.Printf("[TRADE_REOPEN] refusing to announce dealer open because forced hand refresh failed")
 		return
 	}
 
 	awaitingTradeOpen = true
-	if canAnnounceDealerOpen() {
+	dealerAcceptingTrades = true
+	if shouldAnnounceDealerOpen() {
 		dealerTradeWindowOpen = true
 		openMsg := a.dealerOpenMessage()
 		a.AddLogMsg(fmt.Sprintf("[TRADE_REOPEN] shouting: %q", openMsg))
-		log.Printf("[TRADE_REOPEN] shouting: %q", openMsg)
 		go sendMessageWithDelay(openMsg)
 	} else {
 		dealerTradeWindowOpen = false
-		log.Printf("User is muted. Dealer open announcement skipped; incoming trades will be blocked.")
+		log.Printf("Dealer announcement skipped; incoming trades remain allowed.")
 	}
 	startDealerOpenHeartbeat(a)
 }
@@ -4535,18 +4352,18 @@ func (a *App) reopenDealerIdle(reason string) {
 
 	if !ok {
 		awaitingTradeOpen = false
+		dealerAcceptingTrades = false
 		dealerTradeWindowOpen = false
 		a.AddLogMsg(fmt.Sprintf("[TRADE_REOPEN] refusing to announce dealer open because forced hand refresh failed (%s)", reason))
-		log.Printf("[TRADE_REOPEN] refusing to announce dealer open because forced hand refresh failed (%s)", reason)
 		return
 	}
 
 	awaitingTradeOpen = true
-	if canAnnounceDealerOpen() {
+	dealerAcceptingTrades = true
+	if shouldAnnounceDealerOpen() {
 		dealerTradeWindowOpen = true
 		openMsg := a.dealerOpenMessage()
 		a.AddLogMsg(fmt.Sprintf("[TRADE_REOPEN] shouting: %q (%s)", openMsg, reason))
-		log.Printf("[TRADE_REOPEN] shouting: %q (%s)", openMsg, reason)
 		go sendMessageWithDelay(openMsg)
 	} else {
 		dealerTradeWindowOpen = false
@@ -4554,7 +4371,6 @@ func (a *App) reopenDealerIdle(reason string) {
 
 	startDealerOpenHeartbeat(a)
 	a.AddLogMsg(fmt.Sprintf("[TRADE_REOPEN] reopened idle dealer (%s)", reason))
-	log.Printf("[TRADE_REOPEN] reopened idle dealer (%s)", reason)
 }
 
 // snapshotDice returns a shallow copy of the current diceList for safe
@@ -4641,16 +4457,15 @@ func (a *App) openDealerAfterRound() {
 
 	if !ok {
 		a.AddLogMsg("[DEALER_REOPEN] refusing to announce dealer open because forced hand refresh failed")
-		log.Printf("[DEALER_REOPEN] refusing to announce dealer open because forced hand refresh failed")
 		return
 	}
 
 	awaitingTradeOpen = true
-	if canAnnounceDealerOpen() {
+	dealerAcceptingTrades = true
+	if shouldAnnounceDealerOpen() {
 		dealerTradeWindowOpen = true
 		openMsg := a.dealerOpenMessage()
 		a.AddLogMsg(fmt.Sprintf("[DEALER_REOPEN] shouting: %q", openMsg))
-		log.Printf("[DEALER_REOPEN] shouting: %q", openMsg)
 		go sendMessageWithDelay(openMsg)
 	} else {
 		dealerTradeWindowOpen = false
@@ -4671,7 +4486,6 @@ func handleStripPacket(a *App, e *g.Intercept) {
 	active := stripScanActive
 	if !active {
 		a.AddLogMsg("[STRIP_DEBUG] ignored strip packet because no scan is active")
-		log.Printf("[STRIP_DEBUG] ignored strip packet because no scan is active")
 		stripScanMu.Unlock()
 		return
 	}
@@ -4701,7 +4515,6 @@ func handleStripPacket(a *App, e *g.Intercept) {
 
 	pageLimitReached := stripScanPageCount >= 25
 	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] session=%d page=%d items=%d repeated=%t pageLimit=%t", scanID, currentPage, pageRecords, pageRepeated, pageLimitReached))
-	log.Printf("[STRIP_DEBUG] session=%d page=%d items=%d repeated=%t pageLimit=%t", scanID, currentPage, pageRecords, pageRepeated, pageLimitReached)
 
 	stripScanMu.Unlock()
 
@@ -4722,7 +4535,6 @@ func handleStripPacket(a *App, e *g.Intercept) {
 	}()
 
 	a.AddLogMsg(fmt.Sprintf("[STRIP] continuing scan: page %d had %d item(s), requesting next after %s", currentPage, pageRecords, stripNextDelay))
-	log.Printf("[STRIP] continuing scan: page %d had %d item(s), requesting next after %s", currentPage, pageRecords, stripNextDelay)
 	return
 }
 
@@ -4730,7 +4542,6 @@ func (a *App) finalizeStripScan(sessionID int, reason string) {
 	stripScanMu.Lock()
 	if !stripScanActive || stripScanSessionID != sessionID {
 		a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] finalize skipped session=%d active=%t currentSession=%d", sessionID, stripScanActive, stripScanSessionID))
-		log.Printf("[STRIP_DEBUG] finalize skipped session=%d active=%t currentSession=%d", sessionID, stripScanActive, stripScanSessionID)
 		stripScanMu.Unlock()
 		return
 	}
@@ -4741,7 +4552,6 @@ func (a *App) finalizeStripScan(sessionID int, reason string) {
 	stripScanActive = false
 	stripScanMu.Unlock()
 	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] finalize session=%d reason=%s pages=%d", sessionID, reason, pagesScanned))
-	log.Printf("[STRIP_DEBUG] finalize session=%d reason=%s pages=%d", sessionID, reason, pagesScanned)
 
 	handItemsMu.Lock()
 	currentHandItems = items
@@ -4749,10 +4559,8 @@ func (a *App) finalizeStripScan(sessionID int, reason string) {
 	handItemsMu.Unlock()
 
 	a.AddLogMsg(fmt.Sprintf("[STRIP] scan complete after %d page(s), reason=%s; hand item types=%d", pagesScanned, reason, len(items)))
-	log.Printf("[STRIP] scan complete after %d page(s), reason=%s; hand item types=%d", pagesScanned, reason, len(items))
 	for i, item := range items {
 		a.AddLogMsg(fmt.Sprintf("[STRIP] hand[%d] name=%q qty=%d", i, item.Name, item.Quantity))
-		log.Printf("[STRIP] hand[%d] name=%q qty=%d", i, item.Name, item.Quantity)
 	}
 	a.emitHandItemsUpdate()
 
@@ -4772,7 +4580,6 @@ func (a *App) finalizeStripScan(sessionID int, reason string) {
 			}()
 		} else {
 			a.AddLogMsg("[STRIP_DEBUG] trade open and strict snapshot lifecycle active; skipping snapshot refresh")
-			log.Printf("[STRIP_DEBUG] trade open and strict snapshot lifecycle active; skipping snapshot refresh")
 		}
 	}
 }
@@ -4783,14 +4590,12 @@ func (a *App) handleOutgoingGetStrip(e *g.Intercept) {
 	}
 	payload := strings.TrimSpace(string(e.Packet.Data))
 	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] outgoing GETSTRIP[65] payload=%q", payload))
-	log.Printf("[STRIP_DEBUG] outgoing GETSTRIP[65] payload=%q", payload)
 }
 
 func sendGetStripRaw(a *App, payload string) {
 	trimmed := strings.TrimSpace(payload)
 	ext.Send(g.Out.Id("GETSTRIP"), []byte(trimmed))
 	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] raw GETSTRIP send payload=%q", trimmed))
-	log.Printf("[STRIP_DEBUG] raw GETSTRIP send payload=%q", trimmed)
 }
 
 func buildStripScanItems() []TradeItem {
@@ -5002,7 +4807,7 @@ func (a *App) sendLiveDealerSnapshot(items []TradeItem) {
 	go func(snapshot []TradeItem) {
 		payload := LiveDealerStatusPayload{
 			LastSeenAt:         time.Now().UTC().Format(time.RFC3339),
-			DealerOpen:         awaitingTradeOpen && dealerTradeWindowOpen,
+			DealerOpen:         dealerAcceptingTrades,
 			TradeOpen:          tradeOpen,
 			GameActive:         dealerGameActive(),
 			SnapshotReady:      tradeHandSnapshotReady,
@@ -5113,9 +4918,7 @@ func (a *App) captureTradeHandSnapshot() {
 
 	joined := strings.Join(parts, ",")
 	a.AddLogMsg("[TRADE_HAND_SNAPSHOT] captured: " + joined)
-	log.Printf("[TRADE_HAND_SNAPSHOT] captured: %s", joined)
 	a.AddLogMsg(fmt.Sprintf("[TRADE_HAND_SNAPSHOT] ready=true (items=%d)", len(snapshot)))
-	log.Printf("[TRADE_HAND_SNAPSHOT] ready=true (items=%d)", len(snapshot))
 	// Send snapshot to configured live-dealer webhook (non-blocking)
 	a.sendLiveDealerSnapshot(snapshot)
 
@@ -5131,9 +4934,7 @@ func (a *App) invalidateTradeHandSnapshot(reason string) {
 	handItemsMu.Unlock()
 
 	a.AddLogMsg(fmt.Sprintf("[TRADE_HAND_SNAPSHOT] invalidated: %s", reason))
-	log.Printf("[TRADE_HAND_SNAPSHOT] invalidated: %s", reason)
 	a.AddLogMsg("[TRADE_HAND_SNAPSHOT] ready=false")
-	log.Printf("[TRADE_HAND_SNAPSHOT] ready=false")
 }
 
 func (a *App) forceRefreshHandSnapshot(reason string) bool {
@@ -5141,17 +4942,14 @@ func (a *App) forceRefreshHandSnapshot(reason string) bool {
 
 	scanID := a.requestPlayerStrip(true)
 	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] forced strip requested session=%d reason=%s", scanID, reason))
-	log.Printf("[STRIP_DEBUG] forced strip requested session=%d reason=%s", scanID, reason)
 	if ok := waitForStripScanCompletion(scanID, 20*time.Second); !ok {
 		a.AddLogMsg(fmt.Sprintf("[TRADE_HAND_SNAPSHOT] forced hand sync timeout (session=%d reason=%s)", scanID, reason))
-		log.Printf("[TRADE_HAND_SNAPSHOT] forced hand sync timeout (session=%d reason=%s)", scanID, reason)
 		return false
 	}
 
 	// Always overwrite with the latest current hand after a forced scan.
 	a.captureTradeHandSnapshot()
 	a.AddLogMsg(fmt.Sprintf("[TRADE_HAND_SNAPSHOT] forced refresh complete (session=%d reason=%s)", scanID, reason))
-	log.Printf("[TRADE_HAND_SNAPSHOT] forced refresh complete (session=%d reason=%s)", scanID, reason)
 	return true
 }
 
@@ -5162,7 +4960,6 @@ func (a *App) notifyTradeQuantityCoverage() {
 		lastTradeCoverageNotice = ""
 		lastTradeBlockNotice = ""
 		a.AddLogMsg("[TRADE_COVERAGE] sufficient stock for payout")
-		log.Printf("[TRADE_COVERAGE] sufficient stock for payout")
 
 		// Cancel any active shortage monitor since coverage is sufficient now.
 		stopShortageMonitor()
@@ -5178,7 +4975,6 @@ func (a *App) notifyTradeQuantityCoverage() {
 	// (payout logic) handles shortages differently.
 	if payoutTradeActive {
 		a.AddLogMsg("[TRADE_COVERAGE] shortages detected but skipping enforcement during payout trade")
-		log.Printf("[TRADE_COVERAGE] shortages detected but skipping enforcement during payout trade")
 		return
 	}
 
@@ -5196,7 +4992,6 @@ func (a *App) notifyTradeQuantityCoverage() {
 	}
 
 	a.AddLogMsg(fmt.Sprintf("[TRADE_COVERAGE] immediate shortage close with %s: %s", partnerName, msg))
-	log.Printf("[TRADE_COVERAGE] immediate shortage close with %s: %s", partnerName, msg)
 
 	go func(m string) {
 		if changed {
@@ -5312,7 +5107,6 @@ func (a *App) getTradeCoverageShortages() []tradeShortage {
 		}
 		sort.Strings(reqKeys)
 		a.AddLogMsg(fmt.Sprintf("[TRADE_COVERAGE_DEBUG] hand=%s incoming=%s required=%s", strings.Join(handKeys, ","), strings.Join(incomingKeys, ","), strings.Join(reqKeys, ",")))
-		log.Printf("[TRADE_COVERAGE_DEBUG] hand=%s incoming=%s required=%s", strings.Join(handKeys, ","), strings.Join(incomingKeys, ","), strings.Join(reqKeys, ","))
 	}
 
 	return shortages
@@ -5341,7 +5135,6 @@ func (a *App) maybeAutoAcceptOnSnapshotReady(context string) {
 	}
 	if len(shortages) > 0 {
 		a.AddLogMsg("[TRADE_ACCEPT] not auto-accepting: shortages detected on snapshot ready")
-		log.Printf("[TRADE_ACCEPT] not auto-accepting: shortages detected on snapshot ready")
 		return
 	}
 
@@ -5352,7 +5145,6 @@ func (a *App) maybeAutoAcceptOnSnapshotReady(context string) {
 	tradeItemsMu.Unlock()
 	if v := getTradeLimitViolation(itemsCopy); v != nil {
 		a.AddLogMsg("[TRADE_ACCEPT] not auto-accepting: trade limit violation on snapshot ready")
-		log.Printf("[TRADE_ACCEPT] not auto-accepting: trade limit violation on snapshot ready")
 		return
 	}
 
@@ -5361,7 +5153,6 @@ func (a *App) maybeAutoAcceptOnSnapshotReady(context string) {
 	tradeAutoAccepted = true
 	tradeAutoAcceptPending = false
 	a.AddLogMsg(fmt.Sprintf("[TRADE_ACCEPT] sent outgoing[69] (snapshot-ready %s)", context))
-	log.Printf("[TRADE_ACCEPT] sent outgoing[69] (snapshot-ready %s)", context)
 }
 
 func formatTradeShortages(shortages []tradeShortage) string {
@@ -5387,7 +5178,6 @@ func (a *App) sendTradeCompletionMessage() {
 
 	if len(gameBetItems) == 0 {
 		a.AddLogMsg("[TRADE_MESSAGE] no items detected in trade, continuing anyway")
-		log.Printf("[TRADE_MESSAGE] no items detected in trade, continuing anyway")
 	} else {
 		a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE] recorded %d bet item type(s) for payout", len(gameBetItems)))
 	}
@@ -5438,13 +5228,11 @@ func (a *App) sendTradeCompletionMessage() {
 	a.startGameChoiceTimeoutMonitor()
 
 	a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE] shouting: %q", first))
-	log.Printf("[TRADE_MESSAGE] shouting: %q", first)
 	ext.Send(out.SHOUT, first)
 
 	go func(msg string) {
 		time.Sleep(1750 * time.Millisecond)
 		a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE] shouting: %q", msg))
-		log.Printf("[TRADE_MESSAGE] shouting: %q", msg)
 		ext.Send(out.SHOUT, msg)
 	}(second)
 }
@@ -5588,7 +5376,6 @@ func isLikelyToken(s string) bool {
 func (a *App) handleRoomReady(e *g.Intercept) {
 	clearRoomUserCaches(a)
 	a.AddLogMsg("[ROOM_USERS] cleared cached room users")
-	log.Printf("[ROOM_USERS] cleared cached room users")
 	go requestRoomUsers(a)
 }
 
@@ -5596,18 +5383,15 @@ func (a *App) handleRoomUsers(e *g.Intercept) {
 	defer func() {
 		if r := recover(); r != nil {
 			a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] failed to parse packet %d: %v", e.Packet.Header.Value, r))
-			log.Printf("[ROOM_USERS] failed to parse packet %d: %v", e.Packet.Header.Value, r)
 		}
 	}()
 
 	a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] received packet %d len=%d", e.Packet.Header.Value, len(e.Packet.Data)))
-	log.Printf("[ROOM_USERS] received packet %d len=%d", e.Packet.Header.Value, len(e.Packet.Data))
 
 	// In this client, header 28 often uses raw USERS28 layout, not room.Entity wire format.
 	// That payload is handled by handleUsers28Packet; skip structured decode here.
 	if e.Packet.Header.Value == 28 {
 		a.AddLogMsg("[ROOM_USERS] header 28 uses raw USERS28 layout; skipping room.Entity decode")
-		log.Printf("[ROOM_USERS] header 28 uses raw USERS28 layout; skipping room.Entity decode")
 		return
 	}
 
@@ -5660,7 +5444,6 @@ func (a *App) handleRoomUsers(e *g.Intercept) {
 
 	for _, line := range summarizeRoomUsers() {
 		a.AddLogMsg("[ROOM_USERS] " + line)
-		log.Printf("[ROOM_USERS] %s", line)
 	}
 }
 
@@ -5668,7 +5451,6 @@ func requestRoomUsers(a *App) {
 	defer func() {
 		if recover() != nil {
 			a.AddLogMsg("[ROOM_USERS] request failed")
-			log.Printf("[ROOM_USERS] request failed")
 		}
 	}()
 
@@ -5682,7 +5464,6 @@ func requestRoomUsers(a *App) {
 	a.ext.Send(out.GETSPACENODEUSERS)
 	startIncomingHeaderSniff(8 * time.Second)
 	a.AddLogMsg("[ROOM_USERS] requested current room users via G_USRS + GETSPACENODEUSERS")
-	log.Printf("[ROOM_USERS] requested current room users via G_USRS + GETSPACENODEUSERS")
 }
 
 func shouldRefreshRoomUsers() bool {
@@ -5716,7 +5497,6 @@ func (a *App) emitRoomIdentityUpdate() {
 	jsonData, err := json.Marshal(entries)
 	if err != nil {
 		a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] failed to marshal room identity update: %v", err))
-		log.Printf("[ROOM_USERS] failed to marshal room identity update: %v", err)
 		return
 	}
 	runtime.EventsEmit(a.ctx, "roomIdentityUpdate", string(jsonData))
@@ -5796,7 +5576,6 @@ func handleIncomingHeaderSniff(a *App, e *g.Intercept) {
 	}
 	name := ext.Headers().Name(e.Packet.Header)
 	a.AddLogMsg(fmt.Sprintf("[HEADER_SNIFF] incoming[%d:%s] len=%d preview=%q", header, name, len(e.Packet.Data), preview))
-	log.Printf("[HEADER_SNIFF] incoming[%d:%s] len=%d preview=%q", header, name, len(e.Packet.Data), preview)
 }
 
 func summarizeRoomUsers() []string {
@@ -6111,12 +5890,10 @@ func (a *App) onChatMessage(e *g.Intercept) {
 			e.Block()
 			blockAllTrades = true
 			a.AddLogMsg("[TRADE_BLOCK] all incoming trades are now blocked")
-			log.Printf("[TRADE_BLOCK] all incoming trades are now blocked")
 		case strings.HasSuffix(command, "tradeson"):
 			e.Block()
 			blockAllTrades = false
 			a.AddLogMsg("[TRADE_BLOCK] incoming trades re-enabled")
-			log.Printf("[TRADE_BLOCK] incoming trades re-enabled")
 		}
 	}
 }
@@ -6164,13 +5941,11 @@ func (a *App) beginPokerSequence() {
 	second := fmt.Sprintf("%s Roll", playerName)
 
 	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", first))
-	log.Printf("[GAME_SELECT] shouting: %q", first)
 	ext.Send(out.SHOUT, first)
 
 	go func(msg string) {
 		time.Sleep(700 * time.Millisecond)
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", msg))
-		log.Printf("[GAME_SELECT] shouting: %q", msg)
 		ext.Send(out.SHOUT, msg)
 
 		time.Sleep(700 * time.Millisecond)
@@ -6194,13 +5969,11 @@ func (a *App) beginBlackjackSequence() {
 	second := fmt.Sprintf("%s Roll", playerName)
 
 	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", first))
-	log.Printf("[GAME_SELECT] shouting: %q", first)
 	ext.Send(out.SHOUT, first)
 
 	go func(msg string) {
 		time.Sleep(700 * time.Millisecond)
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", msg))
-		log.Printf("[GAME_SELECT] shouting: %q", msg)
 		ext.Send(out.SHOUT, msg)
 
 		time.Sleep(700 * time.Millisecond)
@@ -6227,13 +6000,11 @@ func (a *App) begin13Sequence() {
 	second := fmt.Sprintf("%s Roll", playerName)
 
 	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", first))
-	log.Printf("[GAME_SELECT] shouting: %q", first)
 	ext.Send(out.SHOUT, first)
 
 	go func(msg string) {
 		time.Sleep(700 * time.Millisecond)
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", msg))
-		log.Printf("[GAME_SELECT] shouting: %q", msg)
 		ext.Send(out.SHOUT, msg)
 
 		time.Sleep(700 * time.Millisecond)
@@ -6267,7 +6038,6 @@ func (a *App) beginTriChoiceSequence() {
 
 	msg := "High or Low?"
 	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", msg))
-	log.Printf("[GAME_SELECT] shouting: %q", msg)
 	ext.Send(out.SHOUT, msg)
 }
 
@@ -6297,13 +6067,11 @@ func (a *App) beginTriRound(mode string) {
 	second := fmt.Sprintf("%s Roll", playerName)
 
 	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", first))
-	log.Printf("[GAME_SELECT] shouting: %q", first)
 	ext.Send(out.SHOUT, first)
 
 	go func(msg string) {
 		time.Sleep(700 * time.Millisecond)
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", msg))
-		log.Printf("[GAME_SELECT] shouting: %q", msg)
 		ext.Send(out.SHOUT, msg)
 
 		time.Sleep(700 * time.Millisecond)
@@ -6316,10 +6084,8 @@ func (a *App) start13DealerTurn(reason string) {
 	awaiting13Decision = false
 	thirteenPlayerTurn = false
 	a.AddLogMsg(fmt.Sprintf("[13_DEBUG] dealer turn starting reason=%s playerTotal=%d dealerTotal=%d", reason, thirteenPlayerTotal, thirteenDealerTotal))
-	log.Printf("[13_DEBUG] dealer turn starting reason=%s playerTotal=%d dealerTotal=%d", reason, thirteenPlayerTotal, thirteenDealerTotal)
 	message := "Dealer Roll"
 	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", message))
-	log.Printf("[GAME_SELECT] shouting: %q", message)
 	ext.Send(out.SHOUT, message)
 	go func() {
 		time.Sleep(700 * time.Millisecond)
@@ -6346,9 +6112,7 @@ func (a *App) finalize13Round(playerWins bool, reason string) {
 	winnerMsg := fmt.Sprintf("%s Wins - %s: %s | Dealer: %s", winnerName, playerName, playerHand, dealerHand)
 
 	a.AddLogMsg(fmt.Sprintf("[13_RULES] winner=%s reason=%s player=%d dealer=%d", winnerName, reason, thirteenPlayerTotal, thirteenDealerTotal))
-	log.Printf("[13_RULES] winner=%s reason=%s player=%d dealer=%d", winnerName, reason, thirteenPlayerTotal, thirteenDealerTotal)
 	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", winnerMsg))
-	log.Printf("[GAME_SELECT] shouting: %q", winnerMsg)
 	if !ChatIsDisabled {
 		waitForUnmute(90 * time.Second)
 		time.Sleep(800 * time.Millisecond)
@@ -6363,7 +6127,6 @@ func (a *App) finalize13Round(playerWins bool, reason string) {
 		a.setCurrentGameHistoryResults(playerHand, dealerHand, playerName, "Payout Pending", false)
 		a.noteCurrentGameHistory(winnerMsg)
 		a.AddLogMsg(fmt.Sprintf("[PAYOUT] 13 player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID))
-		log.Printf("[PAYOUT] 13 player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID)
 		resetPayoutRetryState()
 		startPayout(a, payoutTargetID, payoutTargetName)
 		return
@@ -6426,7 +6189,6 @@ func (a *App) finalizeTriRound() {
 	)
 
 	a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", winnerMsg))
-	log.Printf("[GAME_SELECT] shouting: %q", winnerMsg)
 
 	if !ChatIsDisabled {
 		waitForUnmute(90 * time.Second)
@@ -6442,7 +6204,6 @@ func (a *App) finalizeTriRound() {
 		a.setCurrentGameHistoryResults(playerHand, dealerHand, playerName, "Payout Pending", false)
 		a.noteCurrentGameHistory(winnerMsg)
 		a.AddLogMsg(fmt.Sprintf("[PAYOUT] tri player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID))
-		log.Printf("[PAYOUT] tri player won, initiating payout trade to %s (%d)", payoutTargetName, payoutTargetID)
 		resetPayoutRetryState()
 		startPayout(a, payoutTargetID, payoutTargetName)
 		return
@@ -6470,6 +6231,7 @@ func resetDiceState() {
 	diceList = []*Dice{}
 	casinoReady = false
 	awaitingTradeOpen = false
+	dealerAcceptingTrades = false
 	dealerTradeWindowOpen = false
 	tradeOpen = false
 	dealerResyncInProgress = false
@@ -6675,28 +6437,27 @@ func (a *App) openDealerAfterSetup(reason string) {
 
 	if !ok {
 		awaitingTradeOpen = false
+		dealerAcceptingTrades = false
 		dealerTradeWindowOpen = false
 		a.AddLogMsg(fmt.Sprintf("[DEALER_SETUP] refusing to announce dealer open because forced hand refresh failed (%s)", reason))
-		log.Printf("[DEALER_SETUP] refusing to announce dealer open because forced hand refresh failed (%s)", reason)
 		a.sendLiveDealerStatus(false, a.getCurrentDealerName())
 		return
 	}
 
 	awaitingTradeOpen = true
-	if canAnnounceDealerOpen() {
+	dealerAcceptingTrades = true
+	if shouldAnnounceDealerOpen() {
 		dealerTradeWindowOpen = true
 		openMsg := a.dealerOpenMessage()
 		a.AddLogMsg(fmt.Sprintf("[DEALER_SETUP] shouting: %q (%s)", openMsg, reason))
-		log.Printf("[DEALER_SETUP] shouting: %q (%s)", openMsg, reason)
 		go sendMessageWithDelay(openMsg)
 	} else {
 		dealerTradeWindowOpen = false
-		messageQueue = append(messageQueue, a.dealerOpenMessage())
-		log.Printf("[DEALER_SETUP] dealer open queued because muted or dice not ready (%s)", reason)
+		log.Printf("[DEALER_SETUP] dealer announcement skipped but trades remain active (%s)", reason)
 	}
 
 	startDealerOpenHeartbeat(a)
-	a.sendLiveDealerStatus(awaitingTradeOpen && dealerTradeWindowOpen, a.getCurrentDealerName())
+	a.sendLiveDealerStatus(dealerAcceptingTrades, a.getCurrentDealerName())
 }
 
 func (a *App) SkipDiceSetupForTesting() {
@@ -6852,7 +6613,6 @@ func (a *App) handleDiceResult(e *g.Intercept) {
 					defer func() {
 						if r := recover(); r != nil {
 							a.AddLogMsg(fmt.Sprintf("[DICE_SYNC_GUARD] recovered from resultsWaitGroup.Done panic for dice %d: %v", diceID, r))
-							log.Printf("[DICE_SYNC_GUARD] recovered from resultsWaitGroup.Done panic for dice %d: %v", diceID, r)
 						}
 					}()
 					resultsWaitGroup.Done()
@@ -7037,7 +6797,6 @@ func (a *App) rollBjDice() {
 		blackjackNextHitIndex = 3
 		currentSum = 0
 		a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] turn start actor=%s using initial slots [0 1 2], next hit slot=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], blackjackNextHitIndex))
-		log.Printf("[BJ_DEBUG] turn start actor=%s using initial slots [0 1 2], next hit slot=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], blackjackNextHitIndex)
 		for _, index := range []int{0, 1, 2} {
 			diceList[index].Value = rand.Intn(6) + 1
 			diceList[index].IsClosed = false
@@ -7045,10 +6804,8 @@ func (a *App) rollBjDice() {
 			logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceList[index].ID, diceList[index].Value)
 			a.AddLogMsg(logRollResult)
 			a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] initial slot=%d diceID=%d value=%d runningSum=%d", index, diceList[index].ID, diceList[index].Value, currentSum))
-			log.Printf("[BJ_DEBUG] initial slot=%d diceID=%d value=%d runningSum=%d", index, diceList[index].ID, diceList[index].Value, currentSum)
 		}
 		a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] initial 3 complete total=%d (fake mode)", currentSum))
-		log.Printf("[BJ_DEBUG] initial 3 complete total=%d (fake mode)", currentSum)
 		mutex.Unlock()
 
 		a.evaluateBlackjackHand()
@@ -7068,7 +6825,6 @@ func (a *App) rollBjDice() {
 	blackjackNextHitIndex = 3
 	currentSum = 0 // Reset sum before starting
 	a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] turn start actor=%s using initial slots [0 1 2], next hit slot=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], blackjackNextHitIndex))
-	log.Printf("[BJ_DEBUG] turn start actor=%s using initial slots [0 1 2], next hit slot=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], blackjackNextHitIndex)
 	resultsWaitGroup.Add(3)
 	mutex.Unlock()
 
@@ -7087,10 +6843,8 @@ func (a *App) rollBjDice() {
 		currentSum += diceList[index].Value
 		values = append(values, diceList[index].Value)
 		a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] initial resolved slot=%d diceID=%d value=%d runningSum=%d", index, diceList[index].ID, diceList[index].Value, currentSum))
-		log.Printf("[BJ_DEBUG] initial resolved slot=%d diceID=%d value=%d runningSum=%d", index, diceList[index].ID, diceList[index].Value, currentSum)
 	}
 	a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] initial 3 complete values=%v total=%d", values, currentSum))
-	log.Printf("[BJ_DEBUG] initial 3 complete values=%v total=%d", values, currentSum)
 	mutex.Unlock()
 
 	a.evaluateBlackjackHand()
@@ -7102,7 +6856,6 @@ func (a *App) hitBjDice() {
 		blackjackHitInFlight = false
 		if r := recover(); r != nil {
 			a.AddLogMsg(fmt.Sprintf("[BJ_CRASH_GUARD] recovered panic in hitBjDice: %v", r))
-			log.Printf("[BJ_CRASH_GUARD] recovered panic in hitBjDice: %v", r)
 			resetBlackjackSequence()
 			isBJRolling = false
 			isHitting = false
@@ -7131,7 +6884,6 @@ func (a *App) hitBjDice() {
 		logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceList[slot].ID, diceList[slot].Value)
 		a.AddLogMsg(logRollResult)
 		a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] hit actor=%s slot=%d diceID=%d value=%d newTotal=%d nextSlot=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], slot, diceList[slot].ID, diceList[slot].Value, currentSum, blackjackNextHitIndex))
-		log.Printf("[BJ_DEBUG] hit actor=%s slot=%d diceID=%d value=%d newTotal=%d nextSlot=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], slot, diceList[slot].ID, diceList[slot].Value, currentSum, blackjackNextHitIndex)
 		mutex.Unlock()
 
 		blackjackHitInFlight = false
@@ -7159,7 +6911,6 @@ func (a *App) hitBjDice() {
 	blackjackNextHitIndex = nextSlot
 	diceID := diceList[slot].ID
 	a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] hit queued actor=%s slot=%d diceID=%d nextSlot=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], slot, diceID, nextSlot))
-	log.Printf("[BJ_DEBUG] hit queued actor=%s slot=%d diceID=%d nextSlot=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], slot, diceID, nextSlot)
 
 	resultsWaitGroup.Add(1)
 	mutex.Unlock()
@@ -7177,7 +6928,6 @@ func (a *App) hitBjDice() {
 
 	// Log the value of the dice rolled
 	a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] hit resolved actor=%s slot=%d diceID=%d value=%d newTotal=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], slot, diceID, newValue, newTotal))
-	log.Printf("[BJ_DEBUG] hit resolved actor=%s slot=%d diceID=%d value=%d newTotal=%d", map[bool]string{true: "player", false: "dealer"}[blackjackPlayerTurn], slot, diceID, newValue, newTotal)
 	// Re-evaluate the hand with the updated sum
 	blackjackHitInFlight = false
 	a.evaluateBlackjackHand()
@@ -7205,13 +6955,11 @@ func (a *App) waitForBlackjackDiceResults(slots []int, timeout time.Duration, re
 
 		if len(pending) == 0 {
 			a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] wait complete reason=%s slots=%v", reason, slots))
-			log.Printf("[BJ_DEBUG] wait complete reason=%s slots=%v", reason, slots)
 			return
 		}
 
 		if time.Now().After(deadline) {
 			a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] wait timeout reason=%s pendingSlots=%v; forcing unstick", reason, pending))
-			log.Printf("[BJ_DEBUG] wait timeout reason=%s pendingSlots=%v; forcing unstick", reason, pending)
 
 			mutex.Lock()
 			for _, slot := range pending {
@@ -7228,13 +6976,11 @@ func (a *App) waitForBlackjackDiceResults(slots []int, timeout time.Duration, re
 					defer func() {
 						if r := recover(); r != nil {
 							a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] forced unstick Done panic diceID=%d slot=%d: %v", diceID, slot, r))
-							log.Printf("[BJ_DEBUG] forced unstick Done panic diceID=%d slot=%d: %v", diceID, slot, r)
 						}
 					}()
 					resultsWaitGroup.Done()
 				}()
 				a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] forced unstick slot=%d diceID=%d retainedValue=%d", slot, diceID, diceValue))
-				log.Printf("[BJ_DEBUG] forced unstick slot=%d diceID=%d retainedValue=%d", slot, diceID, diceValue)
 			}
 			mutex.Unlock()
 			return
@@ -7334,7 +7080,6 @@ func (a *App) hit13Dice() {
 		logRollResult := fmt.Sprintf("Dice %d rolled: %d\n", diceList[slot].ID, diceList[slot].Value)
 		a.AddLogMsg(logRollResult)
 		a.AddLogMsg(fmt.Sprintf("[13_DEBUG] hit actor=%s slot=%d diceID=%d value=%d newTotal=%d nextSlot=%d", map[bool]string{true: "player", false: "dealer"}[thirteenPlayerTurn], slot, diceList[slot].ID, diceList[slot].Value, currentSum, thirteenNextHitIndex))
-		log.Printf("[13_DEBUG] hit actor=%s slot=%d diceID=%d value=%d newTotal=%d nextSlot=%d", map[bool]string{true: "player", false: "dealer"}[thirteenPlayerTurn], slot, diceList[slot].ID, diceList[slot].Value, currentSum, thirteenNextHitIndex)
 		mutex.Unlock()
 
 		a.evaluate13Hand()
@@ -7360,7 +7105,6 @@ func (a *App) hit13Dice() {
 	thirteenNextHitIndex = nextSlot
 	diceID := diceList[slot].ID
 	a.AddLogMsg(fmt.Sprintf("[13_DEBUG] hit queued actor=%s slot=%d diceID=%d nextSlot=%d", map[bool]string{true: "player", false: "dealer"}[thirteenPlayerTurn], slot, diceID, nextSlot))
-	log.Printf("[13_DEBUG] hit queued actor=%s slot=%d diceID=%d nextSlot=%d", map[bool]string{true: "player", false: "dealer"}[thirteenPlayerTurn], slot, diceID, nextSlot)
 
 	resultsWaitGroup.Add(1)
 	mutex.Unlock()
@@ -7377,7 +7121,6 @@ func (a *App) hit13Dice() {
 	mutex.Unlock()
 
 	a.AddLogMsg(fmt.Sprintf("[13_DEBUG] hit resolved actor=%s slot=%d diceID=%d value=%d newTotal=%d", map[bool]string{true: "player", false: "dealer"}[thirteenPlayerTurn], slot, diceID, newValue, newTotal))
-	log.Printf("[13_DEBUG] hit resolved actor=%s slot=%d diceID=%d value=%d newTotal=%d", map[bool]string{true: "player", false: "dealer"}[thirteenPlayerTurn], slot, diceID, newValue, newTotal)
 	// Re-evaluate the hand with the updated sum
 	a.evaluate13Hand()
 
@@ -7453,6 +7196,19 @@ func (a *App) AddLogMsg(msg string) {
 	runtime.EventsEmit(a.ctx, "debugLogUpdate", strings.Join(a.debugLog, "\n"))
 }
 
+func (a *App) AddErrorLog(msg string, err error) {
+	if err == nil {
+		a.AddLogMsg(msg)
+		return
+	}
+	a.AddLogMsg(fmt.Sprintf("%s: %v", msg, err))
+	log.Printf("[ERROR] %s: %v", msg, err)
+}
+
+func (a *App) AddDebugLog(format string, args ...interface{}) {
+	a.AddLogMsg(fmt.Sprintf(format, args...))
+}
+
 func appendCappedLog(lines []string, msg string, limit int) []string {
 	lines = append(lines, msg)
 	if len(lines) > limit {
@@ -7473,12 +7229,21 @@ func shouldShowInUserLog(msg string) bool {
 		"[TRADE_OPEN_DECODE]",
 		"[TRADE_ROOM]",
 		"[USERS28]",
+		"[USERS28_DEBUG]",
+		"[USERS28_FIX]",
 		"[ROOM_USERS]",
 		"[HEADER_SNIFF]",
 		"[TRADE_HEADERS]",
 		"[TRADE_ADDITEM #72]",
 		"[TRADE_ACCEPT #109]",
 		"[TRADE_CONFIRM #111]",
+		"[TRADE_LIMIT_DEBUG]",
+		"[TRADE_ITEMS_DEBUG]",
+		"[TRADE_COVERAGE_DEBUG]",
+		"[TRADE_BLOCK_DEBUG]",
+		"[TRI_DEBUG]",
+		"[GAME_HISTORY]",
+		"[PY_PARSE]",
 	}
 	for _, prefix := range blockedPrefixes {
 		if strings.HasPrefix(trimmed, prefix) {
@@ -7568,7 +7333,6 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 		decision, ok := normalizeBlackjackDecision(msg)
 		if !ok {
 			a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] awaiting decision from %q(index=%d), ignored non-decision message=%q", awaitingBlackjackDecisionPartnerName, awaitingBlackjackDecisionPartnerID, msg))
-			log.Printf("[BJ_DEBUG] awaiting decision from %q(index=%d), ignored non-decision message=%q", awaitingBlackjackDecisionPartnerName, awaitingBlackjackDecisionPartnerID, msg)
 			return
 		}
 
@@ -7587,24 +7351,20 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 
 		if !indexMatch && !nameMatch {
 			a.AddLogMsg(fmt.Sprintf("[BJ] ignoring decision %q from %q (index %d); waiting for %q (index %d)", decision, senderName, index, awaitingBlackjackDecisionPartnerName, awaitingBlackjackDecisionPartnerID))
-			log.Printf("[BJ] ignoring decision %q from %q (index %d); waiting for %q (index %d)", decision, senderName, index, awaitingBlackjackDecisionPartnerName, awaitingBlackjackDecisionPartnerID)
 			return
 		}
 
 		e.Block()
 		awaitingBlackjackDecision = false
 		a.AddLogMsg(fmt.Sprintf("[BJ_DEBUG] accepted decision=%q from sender=%q index=%d (expectedName=%q expectedIndex=%d)", decision, senderName, index, awaitingBlackjackDecisionPartnerName, awaitingBlackjackDecisionPartnerID))
-		log.Printf("[BJ_DEBUG] accepted decision=%q from sender=%q index=%d (expectedName=%q expectedIndex=%d)", decision, senderName, index, awaitingBlackjackDecisionPartnerName, awaitingBlackjackDecisionPartnerID)
 
 		if decision == "hit" {
 			a.AddLogMsg("[BJ] player chose hit")
-			log.Printf("[BJ] player chose hit")
 			isHitting = true
 			isBJRolling = true
 			go a.hitBjDice()
 		} else {
 			a.AddLogMsg("[BJ] player chose stay")
-			log.Printf("[BJ] player chose stay")
 			a.startBlackjackDealerTurn("player stayed")
 		}
 		return
@@ -7614,7 +7374,6 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 		decision, ok := normalizeBlackjackDecision(msg)
 		if !ok {
 			a.AddLogMsg(fmt.Sprintf("[13_DEBUG] awaiting decision from %q(index=%d), ignored non-decision message=%q", awaiting13DecisionPartnerName, awaiting13DecisionPartnerID, msg))
-			log.Printf("[13_DEBUG] awaiting decision from %q(index=%d), ignored non-decision message=%q", awaiting13DecisionPartnerName, awaiting13DecisionPartnerID, msg)
 			return
 		}
 
@@ -7633,25 +7392,21 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 
 		if !indexMatch && !nameMatch {
 			a.AddLogMsg(fmt.Sprintf("[13] ignoring decision %q from %q (index %d); waiting for %q (index %d)", decision, senderName, index, awaiting13DecisionPartnerName, awaiting13DecisionPartnerID))
-			log.Printf("[13] ignoring decision %q from %q (index %d); waiting for %q (index %d)", decision, senderName, index, awaiting13DecisionPartnerName, awaiting13DecisionPartnerID)
 			return
 		}
 
 		e.Block()
 		awaiting13Decision = false
 		a.AddLogMsg(fmt.Sprintf("[13_DEBUG] accepted decision=%q from sender=%q index=%d (expectedName=%q expectedIndex=%d)", decision, senderName, index, awaiting13DecisionPartnerName, awaiting13DecisionPartnerID))
-		log.Printf("[13_DEBUG] accepted decision=%q from sender=%q index=%d (expectedName=%q expectedIndex=%d)", decision, senderName, index, awaiting13DecisionPartnerName, awaiting13DecisionPartnerID)
 
 		if decision == "hit" {
 			a.AddLogMsg("[13] player chose hit")
-			log.Printf("[13] player chose hit")
 			is13Hitting = true
 			is13Rolling = true
 			thirteenHitInFlight = true
 			go a.hit13Dice()
 		} else {
 			a.AddLogMsg("[13] player chose stay")
-			log.Printf("[13] player chose stay")
 			a.start13DealerTurn("player stayed")
 		}
 		return
@@ -7662,7 +7417,6 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 		cleaned = gameChoiceCleanupRe.ReplaceAllString(cleaned, "")
 		if cleaned != "high" && cleaned != "low" {
 			a.AddLogMsg(fmt.Sprintf("[TRI_DEBUG] awaiting tri choice from %q(index=%d), ignored non-choice message=%q", awaitingTriChoicePartnerName, awaitingTriChoicePartnerID, msg))
-			log.Printf("[TRI_DEBUG] awaiting tri choice from %q(index=%d), ignored non-choice message=%q", awaitingTriChoicePartnerName, awaitingTriChoicePartnerID, msg)
 			return
 		}
 
@@ -7681,14 +7435,12 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 
 		if !indexMatch && !nameMatch {
 			a.AddLogMsg(fmt.Sprintf("[TRI] ignoring choice %q from %q (index %d); waiting for %q (index %d)", cleaned, senderName, index, awaitingTriChoicePartnerName, awaitingTriChoicePartnerID))
-			log.Printf("[TRI] ignoring choice %q from %q (index %d); waiting for %q (index %d)", cleaned, senderName, index, awaitingTriChoicePartnerName, awaitingTriChoicePartnerID)
 			return
 		}
 
 		e.Block()
 		awaitingTriChoice = false
 		a.AddLogMsg(fmt.Sprintf("[TRI_DEBUG] accepted choice=%q from sender=%q index=%d (expectedName=%q expectedIndex=%d)", cleaned, senderName, index, awaitingTriChoicePartnerName, awaitingTriChoicePartnerID))
-		log.Printf("[TRI_DEBUG] accepted choice=%q from sender=%q index=%d (expectedName=%q expectedIndex=%d)", cleaned, senderName, index, awaitingTriChoicePartnerName, awaitingTriChoicePartnerID)
 
 		if cleaned == "high" {
 			a.beginTriRound("high")
@@ -7721,7 +7473,6 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 				gameChoiceUnreadableWarned = true
 				warn := fmt.Sprintf("%q Please shout, I can not hear you.", playerName)
 				a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] unreadable game choice from %s: %q", playerName, msg))
-				log.Printf("[GAME_SELECT] unreadable game choice from %s: %q", playerName, msg)
 				ext.Send(out.SHOUT, warn)
 			}
 		}
@@ -7758,7 +7509,6 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 					nameMatch = true
 					senderName = mappedName
 					a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] accepted %q by partner-name match: index %d -> %q", choice, index, mappedName))
-					log.Printf("[GAME_SELECT] accepted %q by partner-name match: index %d -> %q", choice, index, mappedName)
 				}
 			}
 		}
@@ -7772,31 +7522,26 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 				awaitingGameChoicePartnerName = strings.TrimSpace(senderName)
 				lastTradePartnerName = strings.TrimSpace(senderName)
 				a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] accepted %q from resolved sender %q while partner name was unknown", choice, senderName))
-				log.Printf("[GAME_SELECT] accepted %q from resolved sender %q while partner name was unknown", choice, senderName)
 			} else if (awaitingGameChoicePartnerID <= 0 || awaitingGameChoicePartnerID > 512) && index > 0 && index <= 512 {
 				// Last-resort path when trade partner id is unresolved or in a different id space.
 				indexMatch = true
 				a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] accepted %q by index fallback (incoming=%d expected=%d partner=%q)", choice, index, awaitingGameChoicePartnerID, awaitingGameChoicePartnerName))
-				log.Printf("[GAME_SELECT] accepted %q by index fallback (incoming=%d expected=%d partner=%q)", choice, index, awaitingGameChoicePartnerID, awaitingGameChoicePartnerName)
 			}
 		}
 	}
 	if !indexMatch && !nameMatch {
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] ignoring %q from %q (index %d); waiting for %q (index %d)", choice, senderName, index, awaitingGameChoicePartnerName, awaitingGameChoicePartnerID))
-		log.Printf("[GAME_SELECT] ignoring %q from %q (index %d); waiting for %q (index %d)", choice, senderName, index, awaitingGameChoicePartnerName, awaitingGameChoicePartnerID)
 		return
 	}
 
 	if strings.TrimSpace(senderName) != "" && (strings.TrimSpace(lastTradePartnerName) == "" || strings.EqualFold(strings.TrimSpace(lastTradePartnerName), "Unknown")) {
 		lastTradePartnerName = strings.TrimSpace(senderName)
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] backfilled trade partner name from chat sender: %q", lastTradePartnerName))
-		log.Printf("[GAME_SELECT] backfilled trade partner name from chat sender: %q", lastTradePartnerName)
 	}
 
 	e.Block()
 	if isPokerRolling || isTriRolling || isBJRolling || is13Rolling || isHitting || is13Hitting || isClosing {
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %s selected but dice are busy", choice))
-		log.Printf("[GAME_SELECT] %s selected but dice are busy", choice)
 		return
 	}
 
@@ -7812,42 +7557,34 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 		ack := fmt.Sprintf("%s! Lets Play!", gameChoiceDisplay(choice))
 		a.setCurrentGameHistoryGame(gameChoiceDisplay(choice))
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] shouting: %q", ack))
-		log.Printf("[GAME_SELECT] shouting: %q", ack)
 		ext.Send(out.SHOUT, ack)
 	} else {
 		a.AddLogMsg("[GAME_SELECT] Tri selected; prompting for High/Low instead of immediate Lets Play")
-		log.Printf("[GAME_SELECT] Tri selected; prompting for High/Low instead of immediate Lets Play")
 	}
 
 	switch choice {
 	case "pkr":
 		resetBlackjackSequence()
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected Pkr; starting player/dealer poker sequence", index))
-		log.Printf("[GAME_SELECT] %d selected Pkr; starting player/dealer poker sequence", index)
 		a.beginPokerSequence()
 	case "21":
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected 21; starting player/dealer 21 sequence", index))
-		log.Printf("[GAME_SELECT] %d selected 21; starting player/dealer 21 sequence", index)
 		a.beginBlackjackSequence()
 	case "13":
 		// Start the 13-game sequence (similar flow to 21)
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected 13; starting 13 sequence", index))
-		log.Printf("[GAME_SELECT] %d selected 13; starting 13 sequence", index)
 		a.begin13Sequence()
 	case "tri":
 		// Two-step Tri selection: prompt player for High or Low
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected Tri; prompting for High/Low", index))
-		log.Printf("[GAME_SELECT] %d selected Tri; prompting for High/Low", index)
 		a.beginTriChoiceSequence()
 	case "trihigh":
 		// Direct Tri High selection
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected TriH; starting round", index))
-		log.Printf("[GAME_SELECT] %d selected TriH; starting round", index)
 		a.beginTriRound("high")
 	case "trilow":
 		// Direct Tri Low selection
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected TriL; starting round", index))
-		log.Printf("[GAME_SELECT] %d selected TriL; starting round", index)
 		a.beginTriRound("low")
 	}
 }

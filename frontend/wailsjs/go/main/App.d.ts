@@ -4,6 +4,10 @@ import {main} from '../models';
 
 export function AddChatLog(arg1:string):Promise<void>;
 
+export function AddDebugLog(arg1:string,arg2:Array<any>):Promise<void>;
+
+export function AddErrorLog(arg1:string,arg2:Error):Promise<void>;
+
 export function AddLogMsg(arg1:string):Promise<void>;
 
 export function BuildCasinoStats(arg1:string):Promise<main.CasinoStats>;

@@ -2760,7 +2760,7 @@ func (a *App) startGameChoiceTimeoutMonitor() {
 			return
 		}
 
-		reminder := "Shout Poker, 21, 13, Tri"
+		reminder := "Shout pkr, 21, 13, Tri"
 		a.AddLogMsg(fmt.Sprintf("[GAME_CHOICE_TIMEOUT] 30s no response, repeating prompt for %s", player))
 		log.Printf("[GAME_CHOICE_TIMEOUT] 30s no response, repeating prompt for %s", player)
 		ext.Send(out.SHOUT, reminder)
@@ -2849,7 +2849,7 @@ func startShortageMonitor(a *App, timeout time.Duration) {
 				}
 				a.AddLogMsg(fmt.Sprintf("[TRADE_COVERAGE] shortage unresolved; force-closing trade with %s", partnerName))
 				log.Printf("[TRADE_COVERAGE] shortage unresolved; force-closing trade with %s", partnerName)
-				ext.Send(out.SHOUT, "Closing trade due to unresolved shortage; please reopen if you still want to play")
+				ext.Send(out.SHOUT, "Sorry none avabile to see my hand - rollorigins.club")
 				ext.Send(out.TRADE_CLOSE)
 				stopShortageMonitor()
 				return
@@ -5050,14 +5050,17 @@ func (a *App) notifyTradeQuantityCoverage() {
 		lastTradeBlockNotice = ""
 		a.AddLogMsg("[TRADE_COVERAGE] sufficient stock for payout")
 		log.Printf("[TRADE_COVERAGE] sufficient stock for payout")
+
 		// Cancel any active shortage monitor since coverage is sufficient now.
 		stopShortageMonitor()
+
 		// If the partner had already accepted while we were resyncing the
 		// hand, attempt an immediate accept now the snapshot and coverage
 		// checks are clear.
 		go a.maybeAutoAcceptOnSnapshotReady("coverage")
 		return
 	}
+
 	// During an active payout flow we skip force-closing here; caller
 	// (payout logic) handles shortages differently.
 	if payoutTradeActive {
@@ -5065,45 +5068,37 @@ func (a *App) notifyTradeQuantityCoverage() {
 		log.Printf("[TRADE_COVERAGE] shortages detected but skipping enforcement during payout trade")
 		return
 	}
-	// Build a concise, human-friendly message listing each short item
-	// (explicitly showing 0 when the dealer has none) and shout it.
-	parts := make([]string, 0, len(shortages))
-	for _, s := range shortages {
-		// Show only how many the dealer has in-hand so the partner
-		// knows how many they can add. Preserve variant suffixes
-		// and format the internal name for readability.
-		displayName := s.Name
-		variant := ""
-		if star := strings.LastIndex(s.Name, "*"); star > 0 {
-			variant = s.Name[star+1:]
-			displayName = s.Name[:star]
-		}
-		display := formatTradeItemName(displayName)
-		if variant != "" {
-			display = fmt.Sprintf("%s*%s", display, variant)
-		}
-		parts = append(parts, fmt.Sprintf("%s x %d", display, s.HaveHand))
-	}
-	msg := fmt.Sprintf("I only have %s", strings.Join(parts, ", "))
-	// Only shout when the message changed since the last notice.
+
+	// No grace timer now — close immediately with fixed message.
+	stopShortageMonitor()
+
+	msg := "Sorry none avabile to see my hand - rollorigins.club"
 	changed := msg != lastTradeCoverageNotice
 	lastTradeCoverageNotice = msg
 	lastTradeBlockNotice = msg
 
-	a.AddLogMsg(fmt.Sprintf("[TRADE_COVERAGE] %s", msg))
-	log.Printf("[TRADE_COVERAGE] %s", msg)
-
-	if changed {
-		go func(m string) {
-			time.Sleep(350 * time.Millisecond)
-			ext.Send(out.SHOUT, m)
-		}(msg)
+	partnerName := strings.TrimSpace(lastTradePartnerName)
+	if partnerName == "" {
+		partnerName = "Player"
 	}
 
-	// Start or refresh a short-lived grace timer instead of closing immediately.
-	// This gives partners time to correct their offered items; repeated calls
-	// refresh the deadline via shortageMonitorID semantics.
-	startShortageMonitor(a, 12*time.Second)
+	a.AddLogMsg(fmt.Sprintf("[TRADE_COVERAGE] immediate shortage close with %s: %s", partnerName, msg))
+	log.Printf("[TRADE_COVERAGE] immediate shortage close with %s: %s", partnerName, msg)
+
+	go func(m string) {
+		if changed {
+			time.Sleep(350 * time.Millisecond)
+			ext.Send(out.SHOUT, m)
+		}
+
+		time.Sleep(1200 * time.Millisecond)
+		ext.Send(out.TRADE_CLOSE)
+
+		time.Sleep(1500 * time.Millisecond)
+		a.reopenDealerIdle("insufficient hand stock")
+	}(msg)
+
+	a.noteCurrentGameHistory("Trade closed immediately because dealer hand could not cover payout")
 }
 
 func (a *App) getTradeCoverageShortages() []tradeShortage {
@@ -5305,7 +5300,7 @@ func (a *App) sendTradeCompletionMessage() {
 	a.AddLogMsg("[TRADE_FLOW] beginGameHistory returned")
 
 	first := fmt.Sprintf("%s what game do you want to play?", partnerName)
-	second := "Shout Poker, 21, 13, TriH, TriL"
+	second := "Shout pkr, 21, 13, TriH, TriL"
 	awaitingGameChoice = true
 	gameChoiceUnreadableWarned = false
 	awaitingGameChoicePartnerName = strings.TrimSpace(lastTradePartnerName)
@@ -6347,6 +6342,15 @@ func (a *App) finalizeTriRound() {
 
 // Reset all saved dice states
 func resetDiceState() {
+	stopDealerOpenHeartbeat()
+	stopTradeWindowTimeoutMonitor()
+	stopGameChoiceTimeoutMonitor()
+	stopShortageMonitor()
+	stopUnderfundedTradeMonitor()
+	stopTradeLimitMonitor()
+	stopPayout()
+	resetPayoutRetryState()
+
 	mutex.Lock()
 	defer mutex.Unlock()
 	resultsWaitGroup.Wait() // Ensure all dice roll results are processed
@@ -6354,13 +6358,27 @@ func resetDiceState() {
 	casinoReady = false
 	awaitingTradeOpen = false
 	dealerTradeWindowOpen = false
-	stopTradeWindowTimeoutMonitor()
-	// Ensure any pending game-choice timeout is stopped when resetting dice.
-	stopGameChoiceTimeoutMonitor()
-	resetPokerSequence()
-	resetBlackjackSequence()
+	tradeOpen = false
+	dealerResyncInProgress = false
 	fakeDiceTestingMode = false
 	isPokerRolling, isTriRolling, isBJRolling, is13Rolling, isHitting, is13Hitting, isClosing = false, false, false, false, false, false, false
+
+	// Ensure any pending game-choice timeout is stopped when resetting dice.
+	resetTradeAutoFlow()
+	resetPokerSequence()
+	resetBlackjackSequence()
+	reset13Sequence()
+	resetTriSequence()
+	lastTradePartnerID = 0
+	lastTradePartnerName = ""
+	lastTradePartnerToken = ""
+	gameBetItems = nil
+	lastTradeCoverageNotice = ""
+	lastTradeBlockNotice = ""
+	tradeLimitWasActive = false
+	lastTradeLimitNotice = ""
+	partnerTradeAccepted = false
+	partnerAcceptedSnapshot = nil
 }
 
 // StartCasinoSetup enables dice setup recording. This must be called from the frontend
@@ -6406,8 +6424,9 @@ func (a *App) StartCasinoSetup(dealerName string, roomName string, maxUniqueItem
 
 	a.AddLogMsg("[DICE_SETUP] Dice setup mode enabled - roll all 5 dice now")
 	a.emitDiceSetupUpdate()
-	// Notify dashboard that dealer (casino) is open.
-	a.sendLiveDealerStatus(true, name)
+	// Dealer is not open yet here. It only becomes open after setup completes
+	// and a fresh hand snapshot has been captured.
+	a.sendLiveDealerStatus(false, name)
 }
 
 // PauseCasinoSetup temporarily disables dice setup recording without clearing
@@ -6515,29 +6534,70 @@ func rememberDiceID(diceID int) {
 	knownDiceIDs[diceID] = struct{}{}
 }
 
+func (a *App) openDealerAfterSetup(reason string) {
+	stopDealerOpenHeartbeat()
+	stopTradeWindowTimeoutMonitor()
+	stopGameChoiceTimeoutMonitor()
+	stopShortageMonitor()
+	stopUnderfundedTradeMonitor()
+	stopTradeLimitMonitor()
+
+	resetTradeAutoFlow()
+	tradeOpen = false
+	tradeLimitWasActive = false
+	lastTradeLimitNotice = ""
+	partnerTradeAccepted = false
+	partnerAcceptedSnapshot = nil
+	gameBetItems = nil
+	a.emitActiveGameBetItemsUpdate()
+	a.ClearTradeItems()
+
+	dealerResyncInProgress = true
+	requestRoomUsers(a)
+	ok := a.forceRefreshHandSnapshot("setup: " + reason)
+	dealerResyncInProgress = false
+	if shouldRefreshRoomUsers() {
+		requestRoomUsers(a)
+	}
+
+	if !ok {
+		awaitingTradeOpen = false
+		dealerTradeWindowOpen = false
+		a.AddLogMsg(fmt.Sprintf("[DEALER_SETUP] refusing to announce dealer open because forced hand refresh failed (%s)", reason))
+		log.Printf("[DEALER_SETUP] refusing to announce dealer open because forced hand refresh failed (%s)", reason)
+		a.sendLiveDealerStatus(false, a.getCurrentDealerName())
+		return
+	}
+
+	awaitingTradeOpen = true
+	if canAnnounceDealerOpen() {
+		dealerTradeWindowOpen = true
+		openMsg := a.dealerOpenMessage()
+		a.AddLogMsg(fmt.Sprintf("[DEALER_SETUP] shouting: %q (%s)", openMsg, reason))
+		log.Printf("[DEALER_SETUP] shouting: %q (%s)", openMsg, reason)
+		go sendMessageWithDelay(openMsg)
+	} else {
+		dealerTradeWindowOpen = false
+		messageQueue = append(messageQueue, a.dealerOpenMessage())
+		log.Printf("[DEALER_SETUP] dealer open queued because muted or dice not ready (%s)", reason)
+	}
+
+	startDealerOpenHeartbeat(a)
+	a.sendLiveDealerStatus(awaitingTradeOpen && dealerTradeWindowOpen, a.getCurrentDealerName())
+}
+
 func (a *App) SkipDiceSetupForTesting() {
 	mutex.Lock()
-	defer mutex.Unlock()
-
 	diceList = make([]*Dice, 0, 5)
 	for i := 1; i <= 5; i++ {
 		diceList = append(diceList, &Dice{ID: 100000 + i, Value: rand.Intn(6) + 1, IsRolling: false, IsClosed: false})
 	}
 	fakeDiceTestingMode = true
 	casinoReady = true
-	awaitingTradeOpen = true
-	if canAnnounceDealerOpenLocked() {
-		dealerTradeWindowOpen = true
-		stopDealerOpenHeartbeat()
-		startDealerOpenHeartbeat(a)
-		go sendMessageWithDelay(a.dealerOpenMessage())
-	} else {
-		dealerTradeWindowOpen = false
-		// Queue the dealer-open message so it will be announced when the mute clears.
-		messageQueue = append(messageQueue, a.dealerOpenMessage())
-		log.Printf("User is muted. Dealer open announcement skipped and queued; incoming trades will be blocked until unmute.")
-	}
+	mutex.Unlock()
+
 	a.AddLogMsg("Dice setup bypass enabled for testing. Using 5 fake dice values.")
+	go a.openDealerAfterSetup("skip dice setup")
 }
 
 func (a *App) handleThrowDice(e *g.Intercept) {
@@ -6565,6 +6625,7 @@ func (a *App) handleThrowDice(e *g.Intercept) {
 	}
 
 	needEmit := false
+	setupCompletedNow := false
 
 	// If not found and the list has fewer than 5 dice, create and add a new one
 	if existingDice == nil && len(diceList) < 5 {
@@ -6582,27 +6643,20 @@ func (a *App) handleThrowDice(e *g.Intercept) {
 		if len(diceList) == 5 {
 			message := "Dice setup sucessful! Run :roll to confirm"
 			a.AddLogMsg(message)
-			go requestRoomUsers(a)
-			awaitingTradeOpen = true
-			if canAnnounceDealerOpenLocked() {
-				dealerTradeWindowOpen = true
-				stopDealerOpenHeartbeat()
-				startDealerOpenHeartbeat(a)
-				go sendMessageWithDelay(a.dealerOpenMessage())
-			} else {
-				dealerTradeWindowOpen = false
-				// Queue the dealer-open prompt to be sent once mute clears
-				messageQueue = append(messageQueue, a.dealerOpenMessage())
-				log.Printf("User is muted. Skipping dealer open prompt message (queued)")
-			}
-			// Turn off setup mode once complete
+			// Turn off setup mode once complete and mark the casino ready.
 			diceSetupActive = false
+			casinoReady = true
+			setupCompletedNow = true
 		}
 	}
 	mutex.Unlock()
 
 	if needEmit {
 		a.emitDiceSetupUpdate()
+	}
+
+	if setupCompletedNow {
+		go a.openDealerAfterSetup("dice setup complete")
 	}
 }
 
@@ -7808,8 +7862,8 @@ func normalizeBlackjackDecision(msg string) (string, bool) {
 
 func gameChoiceDisplay(choice string) string {
 	switch choice {
-	case "poker":
-		return "Poker"
+	case "pkr":
+		return "Pkr"
 	case "21":
 		return "21"
 	case "13":

@@ -1135,6 +1135,16 @@ export default {
         }
       });
     },
+    setAutoShoutPreset(phrase) {
+      try {
+        this.autoShoutPhrase = String(phrase || '');
+        this.$nextTick(() => {
+          const el = document.querySelector('input[placeholder="Enter phrase to shout"]');
+          if (el && typeof el.focus === 'function') el.focus();
+        });
+      } catch (e) {}
+    },
+
     async saveAutoShout() {
       try {
         await window.go.main.App.SaveAutoShoutConfig(this.autoShoutPhrase || '', Number(this.autoShoutSeconds || 30));

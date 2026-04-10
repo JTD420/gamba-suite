@@ -734,7 +734,7 @@ func (a *App) runAutoShoutLoop(stopChan chan struct{}, phrase string, seconds in
 }
 
 func (a *App) dealerOpenMessage() string {
-	return "Dealer Open, Trade Away"
+	return "Dealer Open, See My Hand - rollorigins.club"
 }
 
 func dealerGameActive() bool {
@@ -1556,7 +1556,7 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			tradeItemsMu.Lock()
 			payoutItems := cloneTradeItems(currentOwnTradeItems)
 			tradeItemsMu.Unlock()
-			partnerName := strings.TrimSpace(lastTradePartnerName)
+			partnerName := normalizeUsername(strings.TrimSpace(lastTradePartnerName))
 			if partnerName == "" || partnerName == "Unknown" {
 				partnerName = strings.TrimSpace(payoutTargetName)
 			}
@@ -2935,7 +2935,7 @@ func startDealerOpenHeartbeat(a *App) {
 	dealerOpenHeartbeatID++
 	id := dealerOpenHeartbeatID
 	dealerOpenHeartbeatActive = true
-	dealerOpenMsg := "Dealer Open, Trade Away"
+	dealerOpenMsg := "Dealer Open, See My Hand - rollorigins.club"
 	if a != nil {
 		dealerOpenMsg = a.dealerOpenMessage()
 	}
@@ -3320,12 +3320,18 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 	parsedUserInfoMu.Unlock()
 
 	for _, u := range parsed.Users {
-		name := strings.TrimSpace(u.Name)
+		rawName := strings.TrimSpace(u.Name)
+		name := normalizeUsername(rawName)
 		token := strings.TrimSpace(u.TokenHex)
 		short := strings.TrimSpace(u.ShortToken)
 
 		if name == "" {
 			continue
+		}
+
+		if rawName != name {
+			a.AddLogMsg(fmt.Sprintf("[USERS28_FIX] cleaned name %q -> %q", rawName, name))
+			log.Printf("[USERS28_FIX] cleaned name %q -> %q", rawName, name)
 		}
 
 		// Determine chat index from short token if possible
@@ -3363,7 +3369,7 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 		if token != "" {
 			parsedUserInfoMu.Lock()
 			parsedUserInfoByToken[token] = map[string]interface{}{
-				"name":         u.Name,
+				"name":         name,
 				"token_hex":    u.TokenHex,
 				"short_token":  u.ShortToken,
 				"chat_id":      u.ChatID,
@@ -3414,11 +3420,12 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 	a.emitRoomIdentityUpdate()
 
 	for _, u := range parsed.Users {
-		a.AddLogMsg(fmt.Sprintf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, u.TokenHex, u.ShortToken, u.Name, u.RoomIndex))
-		log.Printf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, u.TokenHex, u.ShortToken, u.Name, u.RoomIndex)
+		cleanName := normalizeUsername(u.Name)
+		a.AddLogMsg(fmt.Sprintf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, u.TokenHex, u.ShortToken, cleanName, u.RoomIndex))
+		log.Printf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, u.TokenHex, u.ShortToken, cleanName, u.RoomIndex)
 		if chatIdx, ok := chatIndexFromShortToken(u.ShortToken); ok && chatIdx > 0 {
-			a.AddLogMsg(fmt.Sprintf("[USERS28_DEBUG] name=%q roomIndex=%d chatIndex=%d short=%q token=%q", u.Name, u.RoomIndex, chatIdx, u.ShortToken, u.TokenHex))
-			log.Printf("[USERS28_DEBUG] name=%q roomIndex=%d chatIndex=%d short=%q token=%q", u.Name, u.RoomIndex, chatIdx, u.ShortToken, u.TokenHex)
+			a.AddLogMsg(fmt.Sprintf("[USERS28_DEBUG] name=%q roomIndex=%d chatIndex=%d short=%q token=%q", cleanName, u.RoomIndex, chatIdx, u.ShortToken, u.TokenHex))
+			log.Printf("[USERS28_DEBUG] name=%q roomIndex=%d chatIndex=%d short=%q token=%q", cleanName, u.RoomIndex, chatIdx, u.ShortToken, u.TokenHex)
 		}
 	}
 }
@@ -3490,7 +3497,11 @@ func lookupUsers28Token(token string) (string, bool) {
 	users28Mu.Lock()
 	defer users28Mu.Unlock()
 	name, ok := users28ByToken[token]
-	return name, ok
+	name = normalizeUsername(name)
+	if !ok || strings.TrimSpace(name) == "" {
+		return "", false
+	}
+	return name, true
 }
 
 func lookupUsers28Index(index int) (string, bool) {
@@ -3508,7 +3519,7 @@ func lookupUsers28Index(index int) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	name = strings.TrimSpace(name)
+	name = normalizeUsername(name)
 	if name == "" {
 		return "", false
 	}
@@ -3527,7 +3538,7 @@ func waitForUsers28IndexName(index int, timeout time.Duration) (string, bool) {
 }
 
 func lookupUsers28NameIndex(name string) (int, bool) {
-	needle := strings.ToLower(strings.TrimSpace(name))
+	needle := strings.ToLower(normalizeUsername(name))
 	if needle == "" {
 		return 0, false
 	}
@@ -3551,7 +3562,7 @@ func lookupUsers28NameIndex(name string) (int, bool) {
 }
 
 func lookupUsers28RoomIndexByName(name string) (int, bool) {
-	needle := strings.ToLower(strings.TrimSpace(name))
+	needle := strings.ToLower(normalizeUsername(name))
 	if needle == "" {
 		return 0, false
 	}
@@ -3605,6 +3616,44 @@ func isLikelyChatToken(s string) bool {
 		}
 	}
 	return true
+}
+
+func normalizeUsername(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return raw
+	}
+
+	// Fix parser artefacts like "adfAmaver1995" or "fAmaver1995" without
+	// mangling normal lowercase usernames. Only strip a short leading run of
+	// lowercase junk when it is immediately followed by an uppercase-led name.
+	if len(raw) >= 4 {
+		maxPrefix := 4
+		if len(raw)-3 < maxPrefix {
+			maxPrefix = len(raw) - 3
+		}
+		for i := 1; i <= maxPrefix; i++ {
+			prefixOK := true
+			for j := 0; j < i; j++ {
+				if raw[j] < 'a' || raw[j] > 'z' {
+					prefixOK = false
+					break
+				}
+			}
+			if !prefixOK {
+				continue
+			}
+			if raw[i] < 'A' || raw[i] > 'Z' {
+				continue
+			}
+			if raw[i+1] < 'a' || raw[i+1] > 'z' {
+				continue
+			}
+			return raw[i:]
+		}
+	}
+
+	return raw
 }
 
 func decodeShortChatToken(token string) (idx int, ok bool) {
@@ -3799,7 +3848,7 @@ func runParseUsersScript(a *App, data []byte) (map[string]map[string]interface{}
 }
 
 func lookupRoomEntityIndexByName(name string) (int, bool) {
-	needle := strings.ToLower(strings.TrimSpace(name))
+	needle := strings.ToLower(normalizeUsername(name))
 	if needle == "" {
 		return 0, false
 	}
@@ -3842,9 +3891,9 @@ func lookupRoomEntityNameByIndex(index int) (string, bool) {
 		return "", false
 	}
 
-	name := strings.TrimSpace(entity.Name)
+	name := normalizeUsername(strings.TrimSpace(entity.Name))
 	if _, clean, hasToken := splitTokenAndName(name); hasToken {
-		name = strings.TrimSpace(clean)
+		name = normalizeUsername(strings.TrimSpace(clean))
 	}
 	if name == "" {
 		return "", false
@@ -5287,16 +5336,16 @@ func (a *App) sendTradeCompletionMessage() {
 		a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE] recorded %d bet item type(s) for payout", len(gameBetItems)))
 	}
 
-	partnerName := strings.TrimSpace(lastTradePartnerName)
+	partnerName := normalizeUsername(strings.TrimSpace(lastTradePartnerName))
 	if partnerName == "" || strings.EqualFold(partnerName, "Unknown") {
 		if resolved, ok := lookupUsers28Index(lastTradePartnerID); ok {
-			partnerName = strings.TrimSpace(resolved)
+			partnerName = normalizeUsername(strings.TrimSpace(resolved))
 			lastTradePartnerName = partnerName
 		} else if resolved, ok := lookupUsers28Token(lastTradePartnerToken); ok {
-			partnerName = strings.TrimSpace(resolved)
+			partnerName = normalizeUsername(strings.TrimSpace(resolved))
 			lastTradePartnerName = partnerName
 		} else if resolved, ok := lookupRoomEntityNameByIndex(lastTradePartnerID); ok {
-			partnerName = strings.TrimSpace(resolved)
+			partnerName = normalizeUsername(strings.TrimSpace(resolved))
 			lastTradePartnerName = partnerName
 		}
 	}
@@ -5311,7 +5360,7 @@ func (a *App) sendTradeCompletionMessage() {
 	second := "Shout pkr, 21, 13, TriH, TriL"
 	awaitingGameChoice = true
 	gameChoiceUnreadableWarned = false
-	awaitingGameChoicePartnerName = strings.TrimSpace(lastTradePartnerName)
+	awaitingGameChoicePartnerName = normalizeUsername(strings.TrimSpace(lastTradePartnerName))
 	// Prefer the live room entity index for chat sender matching.
 	// First try the immediate room entity cache, otherwise wait briefly
 	// for a USERS28 update (which may arrive asynchronously) before
@@ -5767,7 +5816,7 @@ func splitTokenAndName(s string) (token string, name string, ok bool) {
 		return "", "", false
 	}
 	token = s[:4]
-	name = s[4:]
+	name = normalizeUsername(s[4:])
 	if !isLikelyToken(token) || len(name) < 2 {
 		return "", "", false
 	}

@@ -66,6 +66,47 @@ def hex_from_hexdump(txt: str) -> bytes:
     return bytes.fromhex(cleaned)
 
 
+def is_likely_name_text(value: str) -> bool:
+    value = value.strip()
+    if len(value) < 2:
+        return False
+    return all(ch.isalnum() or ch in '_-' for ch in value)
+
+
+def normalize_detected_name(name: str) -> tuple[str, list[str]]:
+    name = name.strip()
+    if not name:
+        return "", []
+
+    aliases = []
+    seen = set()
+
+    def add(candidate: str):
+        candidate = candidate.strip()
+        if not is_likely_name_text(candidate):
+            return
+        key = candidate.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        aliases.append(candidate)
+
+    add(name)
+    for i in range(1, len(name) - 2):
+        prefix = name[:i]
+        if len(prefix) > 4:
+            continue
+        if not all(ch.islower() or ch.isdigit() or ch in '_-' for ch in prefix):
+            continue
+        if name[i].isupper() and name[i + 1].islower():
+            add(name[i + 1:])
+
+    if not aliases:
+        aliases = [name]
+    best = min(aliases, key=len)
+    return best, aliases
+
+
 def find_user_entries(data: bytes, window: int = 64):
     """Return list of detected entries with name, token, figureString and offsets."""
     entries = []
@@ -196,6 +237,7 @@ def find_user_entries(data: bytes, window: int = 64):
                 name = name_bytes.decode("utf-8")
             except Exception:
                 name = name_bytes.decode("latin-1", errors="replace")
+            name, aliases = normalize_detected_name(name)
 
         if not candidates:
             # Permissive fallback: accept visible name even if token/room not found
@@ -209,6 +251,7 @@ def find_user_entries(data: bytes, window: int = 64):
                 name = name_bytes.decode("utf-8")
             except Exception:
                 name = name_bytes.decode("latin-1", errors="replace")
+            name, aliases = normalize_detected_name(name)
 
         # Figure string: bytes from name_end+1 until next 0x02
         figure = None
@@ -255,6 +298,8 @@ def find_user_entries(data: bytes, window: int = 64):
 
         entries.append({
             "name": name,
+            "aliases": aliases,
+            "raw_name": data[adj_name_start:name_end].decode("latin-1", errors="replace"),
             "raw_name_start": raw_name_start,
             "adj_name_start": adj_name_start,
             "name_end": name_end,

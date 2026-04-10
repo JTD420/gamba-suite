@@ -126,6 +126,13 @@
           <input type="text" v-model="autoShoutPhrase" placeholder="Enter phrase to shout" />
         </div>
 
+        <div class="preset-row" style="margin-bottom:8px;">
+          <div class="game-guide-label" style="display:inline-block;margin-right:8px;margin-bottom:4px;">Presets</div>
+          <div style="display:inline-flex;gap:8px;flex-wrap:wrap;align-items:center;">
+            <button type="button" class="copy-btn preset-btn" @click="setAutoShoutPreset('See My Hand - rollorigins.club')">See My Hand - rollorigins.club</button>
+          </div>
+        </div>
+
         <div class="form-group">
           <label>Seconds</label>
           <input type="number" min="1" v-model.number="autoShoutSeconds" />
@@ -629,6 +636,20 @@
       </table>
     </div>
 
+  <!-- Users bottom bar (Home only) -->
+  <div v-if="activeTab === 'Home'" class="users-bottom-bar" aria-hidden="false">
+    <div class="users-bottom-inner">
+      <div v-if="roomIdentity.length === 0" class="users-empty">No users in room</div>
+      <div v-else class="users-list">
+        <div v-for="(u, idx) in roomIdentity" :key="`user-pill-${idx}`" :class="['user-pill', { trading: isUserTrading(u), 'in-game': isUserInGame(u) }]">
+          <span class="user-name">{{ u.name || 'Unknown' }}</span>
+          <span v-if="isUserTrading(u)" class="user-badge trading-badge">Trading</span>
+          <span v-else-if="isUserInGame(u)" class="user-badge game-badge">In Game</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
   </div>
 </template>
 
@@ -710,6 +731,9 @@ export default {
       autoShoutPhrase: '',
       autoShoutSeconds: 30,
       autoShoutEnabled: false,
+      // Live UI indicators for partner activity
+      currentTraderName: '',
+      currentGamePlayerName: '',
     };
   },
   computed: {
@@ -1079,6 +1103,20 @@ export default {
       if (Number.isNaN(n)) return String(value || '');
       return (n > 0 ? '+' : '') + String(n);
     },
+    isNameMatch(entry, name) {
+      if (!entry || !entry.name || !name) return false;
+      return String(entry.name).trim().toLowerCase() === String(name).trim().toLowerCase();
+    },
+    isUserTrading(entry) {
+      if (!entry) return false;
+      if (!this.currentTraderName) return false;
+      return this.isNameMatch(entry, this.currentTraderName) && (this.tradeItems && this.tradeItems.length > 0);
+    },
+    isUserInGame(entry) {
+      if (!entry) return false;
+      if (!this.currentGamePlayerName) return false;
+      return this.isNameMatch(entry, this.currentGamePlayerName) && (this.activeGameBetItems && this.activeGameBetItems.length > 0);
+    },
     async loadStats(rangeKey) {
       this.statsRangeKey = rangeKey;
       if (this.casinoStatsMap[rangeKey]) return;
@@ -1176,6 +1214,18 @@ export default {
       } catch (_) {
         this.tradeItems = [];
       }
+      // Update current trader name from backend when partner items present
+      try {
+        if (this.tradeItems && this.tradeItems.length > 0) {
+          window.go.main.App.GetLastTradePartnerName().then(name => {
+            this.currentTraderName = name || '';
+          }).catch(() => { this.currentTraderName = ''; });
+        } else {
+          this.currentTraderName = '';
+        }
+      } catch (e) {
+        this.currentTraderName = '';
+      }
     });
 
     window.runtime.EventsOn("activeGameBetItemsUpdate", (jsonStr) => {
@@ -1186,6 +1236,18 @@ export default {
         }));
       } catch (_) {
         this.activeGameBetItems = [];
+      }
+      // Update current game player (who is in-game with dealer)
+      try {
+        if (this.activeGameBetItems && this.activeGameBetItems.length > 0) {
+          window.go.main.App.GetLastTradePartnerName().then(name => {
+            this.currentGamePlayerName = name || '';
+          }).catch(() => { this.currentGamePlayerName = ''; });
+        } else {
+          this.currentGamePlayerName = '';
+        }
+      } catch (e) {
+        this.currentGamePlayerName = '';
       }
     });
 
@@ -2100,4 +2162,72 @@ input[type="text"]::placeholder {
 .monospace-wrap.small { max-height: 120px; }
 .py-stderr { background: #300; color: #f8d7da; }
 .py-stdout { background: #111; color: #dcdcdc; }
+
+/* Users bottom bar */
+.users-bottom-bar {
+  position: fixed;
+  left: 20px;
+  right: 20px;
+  bottom: 18px;
+  background: rgba(20,20,20,0.95);
+  border: 1px solid #2f2f2f;
+  border-radius: 10px;
+  padding: 10px 12px;
+  z-index: 900;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.6);
+  display: flex;
+  justify-content: center;
+}
+.users-bottom-inner {
+  width: 100%;
+  max-width: 1200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.users-list {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.user-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: #151515;
+  border: 1px solid #2b2b2b;
+  color: #e8e8e8;
+  border-radius: 18px;
+  font-size: 13px;
+  min-width: 88px;
+  justify-content: center;
+}
+.user-name {
+  font-weight: 700;
+  color: #fff;
+}
+.user-badge {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 12px;
+  color: #111;
+}
+.trading-badge {
+  background: #ffd36d;
+}
+.game-badge {
+  background: #8ef0aa;
+}
+.user-pill.trading {
+  border-color: #d9b363;
+}
+.user-pill.in-game {
+  border-color: #4bd07c;
+}
+.users-empty {
+  color: #bdbdbd;
+  font-size: 13px;
+}
 </style>

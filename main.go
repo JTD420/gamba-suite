@@ -118,7 +118,10 @@ var (
 	tradeLimitMonitorActive   bool
 	tradeLimitMonitorDeadline time.Time
 	lastTradeLimitNotice      string
-	// Whether the partner has accepted the current (possibly stale) trade state
+	// Whether the partner has accepted during the current open trade.
+	// Keep this sticky until the trade closes so we can re-arm auto-accept
+	// after temporary limit violations are corrected without forcing the
+	// player to toggle accept again.
 	partnerTradeAccepted bool
 	// Whether a trade-limit warning was previously active (used to detect
 	// transitions from invalid -> valid and to shout a one-time "now valid"
@@ -297,27 +300,25 @@ func formatTradeLimitViolationMessage(v *tradeLimitViolation) string {
 	if v == nil {
 		return ""
 	}
-	// Only unique-items violation
-	if v.TooManyUniqueItems && !v.TooMuchQuantity {
-		return fmt.Sprintf("Too many unique items. Max %d different item types per trade.", v.MaxUnique)
+
+	parts := []string{"Hey you have put too many items in - Check My Hand - rollorigins.club for trade limits"}
+
+	if v.TooManyUniqueItems {
+		parts = append(parts, fmt.Sprintf("max %d different item types", v.MaxUnique))
 	}
-	// Only per-item quantity violation
-	if v.TooMuchQuantity && !v.TooManyUniqueItems {
+	if v.TooMuchQuantity {
 		names := make([]string, 0, len(v.OverLimitItems))
 		for _, it := range v.OverLimitItems {
 			names = append(names, fmt.Sprintf("%s x %d", it.Name, it.Quantity))
 		}
-		return fmt.Sprintf("Quantity too high for: %s. Max %d per item.", strings.Join(names, ", "), v.MaxPerItem)
+		if len(names) > 0 {
+			parts = append(parts, fmt.Sprintf("max %d per item (%s)", v.MaxPerItem, strings.Join(names, ", ")))
+		} else {
+			parts = append(parts, fmt.Sprintf("max %d per item", v.MaxPerItem))
+		}
 	}
-	// Both violations
-	names := make([]string, 0, len(v.OverLimitItems))
-	for _, it := range v.OverLimitItems {
-		names = append(names, fmt.Sprintf("%s x %d", it.Name, it.Quantity))
-	}
-	if len(names) > 0 {
-		return fmt.Sprintf("Too many unique items and too much quantity. Max %d different item types and max %d per item. Quantity too high for: %s.", v.MaxUnique, v.MaxPerItem, strings.Join(names, ", "))
-	}
-	return fmt.Sprintf("Too many unique items. Max %d different item types and max %d per item.", v.MaxUnique, v.MaxPerItem)
+
+	return strings.Join(parts, " | ")
 }
 
 // equalTradeItemLists compares two slices of TradeItem for equality by
@@ -1368,24 +1369,16 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			copy(acceptedSnap, partnerAcceptedSnapshot)
 			tradeItemsMu.Unlock()
 
-			// Contents changed: only clear partner accept if the new full-state
-			// differs from the snapshot the partner previously accepted.
-			// If partnerAcceptedSnapshot matches the new items, keep the flag so
-			// we can re-arm auto-accept when limits recover.
+			// Snapshot the current parsed items for validation. Keep the partner's
+			// accept state sticky for this trade so the bot can recover cleanly
+			// after the player removes an over-limit item and comes back within
+			// limits, without getting stuck waiting for a fresh accept packet.
 			tradeItemsMu.Lock()
 			itemsCopy := make([]TradeItem, len(currentTradeItems))
 			copy(itemsCopy, currentTradeItems)
 			tradeItemsMu.Unlock()
 
-			// By default, assume accept is stale unless it matches the snapshot.
-			keepPartnerAccept := false
-			if len(acceptedSnap) > 0 && equalTradeItemLists(itemsCopy, acceptedSnap) {
-				keepPartnerAccept = true
-			}
-			if !keepPartnerAccept {
-				partnerTradeAccepted = false
-				partnerAcceptedSnapshot = nil
-			}
+			_ = acceptedSnap
 			// Debug: show parsed trade items prior to validation so we can see
 			// exactly what the bot thinks the partner is offering.
 			a.AddLogMsg(fmt.Sprintf("[TRADE_LIMIT_DEBUG] validating %d parsed trade items", len(itemsCopy)))
@@ -1407,9 +1400,9 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				stopTradeLimitMonitor()
 				lastTradeLimitNotice = ""
 				tradeLimitWasActive = false
-				a.AddLogMsg("[TRADE_LIMIT] violation resolved; resuming normal trade flow")
-				log.Printf("[TRADE_LIMIT] violation resolved; resuming normal trade flow")
-				ext.Send(out.SHOUT, "Trade limits OK now, you can accept")
+				a.AddLogMsg("[TRADE_LIMIT] violation resolved; trade is valid again")
+				log.Printf("[TRADE_LIMIT] violation resolved; trade is valid again")
+				ext.Send(out.SHOUT, "Trade is back within limits, accept again if needed")
 			}
 
 			// Regardless of whether a trade-limit monitor was active, if the
@@ -2908,7 +2901,7 @@ func startTradeLimitMonitor(a *App, timeout time.Duration) {
 				}
 				a.AddLogMsg(fmt.Sprintf("[TRADE_LIMIT] unresolved; force-closing trade with %s", partnerName))
 				log.Printf("[TRADE_LIMIT] unresolved; force-closing trade with %s", partnerName)
-				ext.Send(out.SHOUT, "Closing trade due to unresolved trade limits; please reopen if you still want to play")
+				ext.Send(out.SHOUT, "Trade still over the limit, closing it now - Check My Hand - rollorigins.club for trade limits")
 				ext.Send(out.TRADE_CLOSE)
 				stopTradeLimitMonitor()
 				return
@@ -7707,10 +7700,10 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 	}
 
 	switch choice {
-	case "poker":
+	case "pkr":
 		resetBlackjackSequence()
-		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected Poker; starting player/dealer poker sequence", index))
-		log.Printf("[GAME_SELECT] %d selected Poker; starting player/dealer poker sequence", index)
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected Pkr; starting player/dealer poker sequence", index))
+		log.Printf("[GAME_SELECT] %d selected Pkr; starting player/dealer poker sequence", index)
 		a.beginPokerSequence()
 	case "21":
 		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] %d selected 21; starting player/dealer 21 sequence", index))
@@ -7743,8 +7736,8 @@ func normalizeIncomingGameChoice(msg string) (string, bool) {
 	cleaned := strings.ToLower(strings.TrimSpace(msg))
 	cleaned = gameChoiceCleanupRe.ReplaceAllString(cleaned, "")
 	switch cleaned {
-	case "poker":
-		return "poker", true
+	case "pkr", "poker":
+		return "pkr", true
 	case "21":
 		return "21", true
 	case "13":
@@ -7780,8 +7773,8 @@ func normalizeLooseGameChoice(msg string) (string, bool) {
 	value := compact.String()
 
 	switch value {
-	case "poker":
-		return "poker", true
+	case "pkr", "poker":
+		return "pkr", true
 	case "21":
 		return "21", true
 	case "13":

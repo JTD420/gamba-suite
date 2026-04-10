@@ -143,10 +143,13 @@ func (a *App) evaluateBlackjackHand() {
 			return
 		}
 
-		if blackjackPlayerTotal == 21 {
-			a.AddLogMsg("[BJ] player total 21; auto-stay and moving to dealer roll")
-			log.Printf("[BJ] player total 21; auto-stay and moving to dealer roll")
-			a.startBlackjackDealerTurn("player reached 21 auto-stay")
+		// Once the player reaches 15 or more, auto-stay instead of prompting.
+		// With one remaining hit die capped at 6, any total from 15-21 can no
+		// longer improve without either staying on the current value or risking a bust.
+		if blackjackPlayerTotal >= 15 {
+			a.AddLogMsg(fmt.Sprintf("[BJ] player total %d; auto-stay and moving to dealer roll", blackjackPlayerTotal))
+			log.Printf("[BJ] player total %d; auto-stay and moving to dealer roll", blackjackPlayerTotal)
+			a.startBlackjackDealerTurn(fmt.Sprintf("player reached %d auto-stay", blackjackPlayerTotal))
 			isBJRolling = false
 			isHitting = false
 			return

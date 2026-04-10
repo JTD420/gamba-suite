@@ -734,7 +734,7 @@ func (a *App) runAutoShoutLoop(stopChan chan struct{}, phrase string, seconds in
 }
 
 func (a *App) dealerOpenMessage() string {
-	return "Dealer Open, See My Hand - rollorigins.club"
+	return "Dealer Open, See Whats in My Hand - rollorigins.club"
 }
 
 func dealerGameActive() bool {
@@ -1756,69 +1756,95 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		}
 
 		if len(e.Packet.Data) >= 1 {
-			// Decode the trader's room index from the VL64 at the start of the trade packet.
-			vlen := gencoding.VL64DecodeLen(e.Packet.Data[0])
-			if vlen > 0 && vlen <= len(e.Packet.Data) {
-				traderRoomIndex := gencoding.VL64Decode(e.Packet.Data[:vlen])
-				if traderRoomIndex > 0 {
-					lastTradePartnerID = traderRoomIndex
-					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] decoded trader room index %d from VL64", traderRoomIndex))
-					log.Printf("[TRADE_OPEN] decoded trader room index %d from VL64", traderRoomIndex)
+			// Refresh users immediately on every trade-open so token/name caches have
+			// a chance to populate before we decide the partner is unknown.
+			go requestRoomUsers(a)
 
-					// Refresh users every trade-open so we can map room index -> username reliably.
-					go requestRoomUsers(a)
-
-					// Look up name by room index from USERS28 cache.
-					indexName, indexOk := lookupUsers28Index(traderRoomIndex)
-					if !indexOk {
-						indexName, indexOk = waitForUsers28IndexName(traderRoomIndex, 900*time.Millisecond)
-					}
-					if indexOk {
-						lastTradePartnerName = indexName
-						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] resolved name %q from room index %d", indexName, traderRoomIndex))
-						log.Printf("[TRADE_OPEN] resolved name %q from room index %d", indexName, traderRoomIndex)
-					} else {
-						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] room index %d not in USERS28 index cache, name unknown", traderRoomIndex))
-						log.Printf("[TRADE_OPEN] room index %d not in USERS28 index cache, name unknown", traderRoomIndex)
-					}
-				}
-			}
-
-			// Keep token-based fallback for when index decode fails.
+			// Prefer token-based resolution first. In observed TRADE_OPEN packets the
+			// first 4 bytes reliably match the USERS28 token for the partner, while
+			// blindly decoding a leading VL64 can produce implausible values like
+			// 134636 and incorrectly mark real users as Unknown.
 			if len(e.Packet.Data) >= 4 {
 				rawToken := e.Packet.Data[:4]
 				tradeTokenHex := hex.EncodeToString(rawToken)
 				lastTradePartnerToken = tradeTokenHex
 
-				// Prefer resolving by token hex from the USERS28 cache.
-				if lastTradePartnerName == "" || lastTradePartnerName == "Unknown" {
-					if name, ok := lookupUsers28Token(tradeTokenHex); ok {
-						lastTradePartnerName = name
-						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] fallback token hex %q matched name %q", tradeTokenHex, name))
-						log.Printf("[TRADE_OPEN] fallback token hex %q matched name %q", tradeTokenHex, name)
-					} else {
-						// Try short-token (first 2 bytes) as a fallback
-						short := string(rawToken[:2])
-						if isLikelyChatToken(short) {
-							users28Mu.Lock()
-							if n, ok := users28ByShortToken[short]; ok {
-								lastTradePartnerName = n
-								a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] fallback short token %q matched name %q", short, n))
-								log.Printf("[TRADE_OPEN] fallback short token %q matched name %q", short, n)
-							}
-							users28Mu.Unlock()
+				if name, ok := lookupUsers28Token(tradeTokenHex); ok {
+					lastTradePartnerName = name
+					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] token hex %q matched name %q", tradeTokenHex, name))
+					log.Printf("[TRADE_OPEN] token hex %q matched name %q", tradeTokenHex, name)
+				} else if waitedName, waitedOk := waitForUsers28TokenName(tradeTokenHex, 1200*time.Millisecond); waitedOk {
+					lastTradePartnerName = waitedName
+					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] token hex %q matched name %q after wait", tradeTokenHex, waitedName))
+					log.Printf("[TRADE_OPEN] token hex %q matched name %q after wait", tradeTokenHex, waitedName)
+				} else {
+					// Try short-token (first 2 bytes) as a fallback.
+					short := string(rawToken[:2])
+					if isLikelyChatToken(short) {
+						users28Mu.Lock()
+						if n, ok := users28ByShortToken[short]; ok {
+							lastTradePartnerName = n
+							a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] short token %q matched name %q", short, n))
+							log.Printf("[TRADE_OPEN] short token %q matched name %q", short, n)
 						}
+						users28Mu.Unlock()
 					}
 				}
 
-				// If still unknown, attempt to resolve a room index by raw token
-				if lastTradePartnerID <= 0 {
-					if idx, name, ok := resolveTradeTokenToRoomIndex(string(rawToken)); ok {
+				// If we have a name but not a room index yet, reverse-resolve the room index.
+				if lastTradePartnerID <= 0 && lastTradePartnerName != "" && !strings.EqualFold(lastTradePartnerName, "Unknown") {
+					if idx, ok := waitForUsers28RoomIndexByName(lastTradePartnerName, 500*time.Millisecond); ok {
 						lastTradePartnerID = idx
-						if lastTradePartnerName == "" || lastTradePartnerName == "Unknown" {
+						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] resolved room index %d from token-matched name %q", idx, lastTradePartnerName))
+						log.Printf("[TRADE_OPEN] resolved room index %d from token-matched name %q", idx, lastTradePartnerName)
+					}
+				}
+
+				// Final token-based fallback that resolves both room index and name.
+				if lastTradePartnerName == "" || strings.EqualFold(lastTradePartnerName, "Unknown") || lastTradePartnerID <= 0 {
+					if idx, name, ok := resolveTradeTokenToRoomIndex(string(rawToken)); ok {
+						if lastTradePartnerID <= 0 {
+							lastTradePartnerID = idx
+						}
+						if lastTradePartnerName == "" || strings.EqualFold(lastTradePartnerName, "Unknown") {
 							lastTradePartnerName = name
 						}
+						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] resolved token to room index %d and name %q", idx, name))
+						log.Printf("[TRADE_OPEN] resolved token to room index %d and name %q", idx, name)
 					}
+				}
+			}
+
+			// Only trust the leading VL64 as the room index when it is plausible and
+			// can be confirmed by the USERS28 cache. Otherwise keep the token-based
+			// resolution above and ignore the implausible decode.
+			vlen := gencoding.VL64DecodeLen(e.Packet.Data[0])
+			if vlen > 0 && vlen <= len(e.Packet.Data) {
+				traderRoomIndex := gencoding.VL64Decode(e.Packet.Data[:vlen])
+				a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] leading VL64 candidate room index %d", traderRoomIndex))
+				log.Printf("[TRADE_OPEN] leading VL64 candidate room index %d", traderRoomIndex)
+				if isPlausibleTradeRoomIndex(traderRoomIndex) {
+					if indexName, indexOk := lookupUsers28Index(traderRoomIndex); indexOk {
+						lastTradePartnerID = traderRoomIndex
+						if lastTradePartnerName == "" || strings.EqualFold(lastTradePartnerName, "Unknown") {
+							lastTradePartnerName = indexName
+						}
+						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] confirmed room index %d as %q", traderRoomIndex, indexName))
+						log.Printf("[TRADE_OPEN] confirmed room index %d as %q", traderRoomIndex, indexName)
+					} else if waitedName, waitedOk := waitForUsers28IndexName(traderRoomIndex, 500*time.Millisecond); waitedOk {
+						lastTradePartnerID = traderRoomIndex
+						if lastTradePartnerName == "" || strings.EqualFold(lastTradePartnerName, "Unknown") {
+							lastTradePartnerName = waitedName
+						}
+						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] confirmed room index %d as %q after wait", traderRoomIndex, waitedName))
+						log.Printf("[TRADE_OPEN] confirmed room index %d as %q after wait", traderRoomIndex, waitedName)
+					} else {
+						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] plausible room index %d was not present in USERS28 cache", traderRoomIndex))
+						log.Printf("[TRADE_OPEN] plausible room index %d was not present in USERS28 cache", traderRoomIndex)
+					}
+				} else {
+					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] ignoring implausible leading VL64 room index %d", traderRoomIndex))
+					log.Printf("[TRADE_OPEN] ignoring implausible leading VL64 room index %d", traderRoomIndex)
 				}
 			}
 		}
@@ -2935,7 +2961,7 @@ func startDealerOpenHeartbeat(a *App) {
 	dealerOpenHeartbeatID++
 	id := dealerOpenHeartbeatID
 	dealerOpenHeartbeatActive = true
-	dealerOpenMsg := "Dealer Open, See My Hand - rollorigins.club"
+	dealerOpenMsg := "Dealer Open, See Whats in My Hand - rollorigins.club"
 	if a != nil {
 		dealerOpenMsg = a.dealerOpenMessage()
 	}
@@ -3535,6 +3561,21 @@ func waitForUsers28IndexName(index int, timeout time.Duration) (string, bool) {
 		time.Sleep(75 * time.Millisecond)
 	}
 	return "", false
+}
+
+func waitForUsers28TokenName(token string, timeout time.Duration) (string, bool) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if name, ok := lookupUsers28Token(token); ok {
+			return name, true
+		}
+		time.Sleep(75 * time.Millisecond)
+	}
+	return "", false
+}
+
+func isPlausibleTradeRoomIndex(index int) bool {
+	return index > 0 && index <= 512
 }
 
 func lookupUsers28NameIndex(name string) (int, bool) {

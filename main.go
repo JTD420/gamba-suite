@@ -5395,11 +5395,10 @@ func extractUsers28Entries(raw string) []user28Entry {
 				}
 			}
 		}
-		if roomIndex <= 0 {
+		token := string(b[tokenStart:adjNameStart])
+		if roomIndex <= 0 && !isLikelyToken(token) {
 			continue
 		}
-
-		token := string(b[tokenStart:adjNameStart])
 
 		shortToken := ""
 		if tokenStart >= 2 {
@@ -5409,7 +5408,7 @@ func extractUsers28Entries(raw string) []user28Entry {
 			}
 		}
 
-		key := fmt.Sprintf("%d|%s|%s", roomIndex, strings.ToLower(name), shortToken)
+		key := fmt.Sprintf("%d|%s|%s|%s", roomIndex, strings.ToLower(name), shortToken, token)
 		if _, ok := seen[key]; ok {
 			continue
 		}

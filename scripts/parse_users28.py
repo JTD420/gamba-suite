@@ -5,10 +5,11 @@ Usage examples:
   python scripts/parse_users28.py --hex "405c4b..."
   python scripts/parse_users28.py --file users28.bin
 
-The script looks for the '\x02hr-' marker, extracts the username immediately before it,
-reads the 4-byte token immediately before the username (adjusting for the uppercase marker
-rule), and pulls the in-packet figure string following the 'hr-' marker. It then queries
-the Origins public user API to compare the figureString and print results.
+The script scans for field separators (\x02), validates that the following bytes look like
+known figure prefixes such as 'hr-' or 'hd-', extracts the username immediately before the
+figure field, reads the 4-byte token immediately before the username (adjusting for the
+uppercase marker rule), and pulls the in-packet figure string. It then queries the Origins
+public user API to compare the figureString and print results.
 """
 import re
 import argparse
@@ -68,23 +69,24 @@ def hex_from_hexdump(txt: str) -> bytes:
 def find_user_entries(data: bytes, window: int = 64):
     """Return list of detected entries with name, token, figureString and offsets."""
     entries = []
-    delim = b"\x02hr-"
-    pos = 0
+    seen = set()
+    figure_prefixes = (b"hr-", b"hd-")
     name_pat = re.compile(r"([A-Za-z][A-Za-z0-9_-]{2,})$")
     fallback_pat = re.compile(r"([A-Za-z][A-Za-z0-9_-]{1,})$")
 
-    while True:
-        idx = data.find(delim, pos)
-        if idx == -1:
-            break
-        name_end = idx  # the 0x02 that precedes the 'hr-' marker
+    for idx in range(len(data) - 4):
+        if data[idx] != 0x02:
+            continue
+        if not any(data[idx + 1:idx + 1 + len(prefix)] == prefix for prefix in figure_prefixes):
+            continue
+
+        name_end = idx  # the 0x02 that precedes the figure marker
         pre_start = max(0, name_end - window)
         window_bytes = data[pre_start:name_end]
         window_str = window_bytes.decode("latin-1")
 
         m = name_pat.search(window_str) or fallback_pat.search(window_str)
         if not m:
-            pos = idx + 1
             continue
 
         raw_name_start = pre_start + m.start(1)
@@ -242,6 +244,11 @@ def find_user_entries(data: bytes, window: int = 64):
                     except Exception:
                         chat_id = None
 
+        key = (name, token_hex, room_index, name_end)
+        if key in seen:
+            continue
+        seen.add(key)
+
         entries.append({
             "name": name,
             "raw_name_start": raw_name_start,
@@ -255,8 +262,6 @@ def find_user_entries(data: bytes, window: int = 64):
             "figureString": figure,
             "motto": motto,
         })
-
-        pos = idx + 1
 
     return entries
 

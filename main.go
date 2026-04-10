@@ -389,13 +389,18 @@ type ParsedUsers28Result struct {
 }
 
 type ParsedUsers28User struct {
-	Name         string `json:"name"`
-	TokenHex     string `json:"token_hex"`
-	ShortToken   string `json:"short_token"`
-	ChatID       int    `json:"chat_id"`
-	RoomIndex    int    `json:"room_index"`
-	FigureString string `json:"figureString"`
-	Motto        string `json:"motto"`
+	Name         string                 `json:"name"`
+	DetectedName string                 `json:"detected_name"`
+	Aliases      []string               `json:"aliases"`
+	TokenHex     string                 `json:"token_hex"`
+	ShortToken   string                 `json:"short_token"`
+	ChatID       int                    `json:"chat_id"`
+	RoomIndex    int                    `json:"room_index"`
+	FigureString string                 `json:"figureString"`
+	Motto        string                 `json:"motto"`
+	FigureMatch  bool                   `json:"figure_match"`
+	MatchedAlias string                 `json:"matched_alias"`
+	Origins      map[string]interface{} `json:"origins"`
 }
 
 type ParsedUsers28Trade struct {
@@ -3346,8 +3351,14 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 	parsedUserInfoMu.Unlock()
 
 	for _, u := range parsed.Users {
-		rawName := strings.TrimSpace(u.Name)
-		name := normalizeUsername(rawName)
+		rawName := strings.TrimSpace(u.DetectedName)
+		if rawName == "" {
+			rawName = strings.TrimSpace(u.Name)
+		}
+		name := normalizeUsername(strings.TrimSpace(u.Name))
+		if name == "" {
+			name = normalizeUsername(rawName)
+		}
 		token := strings.TrimSpace(u.TokenHex)
 		short := strings.TrimSpace(u.ShortToken)
 
@@ -3355,9 +3366,9 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 			continue
 		}
 
-		if rawName != name {
-			a.AddLogMsg(fmt.Sprintf("[USERS28_FIX] cleaned name %q -> %q", rawName, name))
-			log.Printf("[USERS28_FIX] cleaned name %q -> %q", rawName, name)
+		if rawName != "" && rawName != name {
+			a.AddLogMsg(fmt.Sprintf("[USERS28_FIX] cleaned name %q -> %q figureMatch=%t alias=%q", rawName, name, u.FigureMatch, u.MatchedAlias))
+			log.Printf("[USERS28_FIX] cleaned name %q -> %q figureMatch=%t alias=%q", rawName, name, u.FigureMatch, u.MatchedAlias)
 		}
 
 		// Determine chat index from short token if possible
@@ -3395,24 +3406,28 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 		if token != "" {
 			parsedUserInfoMu.Lock()
 			parsedUserInfoByToken[token] = map[string]interface{}{
-				"name":         name,
-				"token_hex":    u.TokenHex,
-				"short_token":  u.ShortToken,
-				"chat_id":      u.ChatID,
-				"room_index":   u.RoomIndex,
-				"figureString": u.FigureString,
-				"motto":        u.Motto,
+				"name":          name,
+				"detected_name": rawName,
+				"token_hex":     u.TokenHex,
+				"short_token":   u.ShortToken,
+				"chat_id":       u.ChatID,
+				"room_index":    u.RoomIndex,
+				"figureString":  u.FigureString,
+				"motto":         u.Motto,
+				"figure_match":  u.FigureMatch,
+				"matched_alias": u.MatchedAlias,
+				"origins":       u.Origins,
 			}
 			parsedUserInfoMu.Unlock()
 		}
 
 		a.AddLogMsg(fmt.Sprintf(
-			"[USERS28_PY] stored name=%q roomIndex=%d chatID=%d short=%q token=%q",
-			name, u.RoomIndex, u.ChatID, short, token,
+			"[USERS28_PY] stored name=%q detected=%q roomIndex=%d chatID=%d short=%q token=%q figureMatch=%t alias=%q",
+			name, rawName, u.RoomIndex, u.ChatID, short, token, u.FigureMatch, u.MatchedAlias,
 		))
 		log.Printf(
-			"[USERS28_PY] stored name=%q roomIndex=%d chatID=%d short=%q token=%q",
-			name, u.RoomIndex, u.ChatID, short, token,
+			"[USERS28_PY] stored name=%q detected=%q roomIndex=%d chatID=%d short=%q token=%q figureMatch=%t alias=%q",
+			name, rawName, u.RoomIndex, u.ChatID, short, token, u.FigureMatch, u.MatchedAlias,
 		)
 	}
 

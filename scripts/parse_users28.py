@@ -16,6 +16,7 @@ import argparse
 import binascii
 import json
 import sys
+from typing import Any
 
 
 # --- Shockwave encoding helpers (VL64 / B64) ---
@@ -438,8 +439,21 @@ def main():
         out = {"users": [], "trades": []}
         # Prepare users (drop raw bytes, include token_hex)
         for e in entries:
+            try:
+                best_match = choose_best_origins_match(e, api_base=args.api)
+            except Exception:
+                best_match = None
+
+            origins = best_match["api"] if best_match else None
+            canonical_name = e.get("name")
+            if origins and origins.get("name"):
+                canonical_name = origins.get("name")
+
             ue = {
-                "name": e.get("name"),
+                "name": canonical_name,
+                "detected_name": e.get("name"),
+                "aliases": e.get("aliases") or [],
+                "raw_name": e.get("raw_name"),
                 "raw_name_start": e.get("raw_name_start"),
                 "adj_name_start": e.get("adj_name_start"),
                 "name_end": e.get("name_end"),
@@ -449,14 +463,11 @@ def main():
                 "room_index": e.get("room_index"),
                 "figureString": e.get("figureString"),
                 "motto": e.get("motto"),
+                "figure_match": bool(best_match and best_match.get("figure_match")),
+                "matched_alias": best_match.get("candidate") if best_match else None,
             }
-            # Attach Origins API result if available
-            try:
-                api = query_origins(ue["name"], api_base=args.api)
-            except Exception:
-                api = None
-            if api:
-                ue["origins"] = api
+            if origins:
+                ue["origins"] = origins
             out["users"].append(ue)
 
         trades_list = find_trade_entries(data)
@@ -468,21 +479,23 @@ def main():
 
     for i, e in enumerate(entries, 1):
         print(f"\nEntry {i}:")
-        print("  name:", e.get('name'))
+        print("  detected_name:", e.get('name'))
+        print("  aliases:", ", ".join(e.get('aliases') or []))
         print("  room_index:", e.get('room_index'))
         print("  chat_id:", e.get('chat_id'))
         print("  short_token:", e.get('short_token'))
         print("  token_hex:", e.get('token_hex'))
         print("  figureString(packet):", e.get('figureString'))
         print("  motto(packet):", e.get('motto'))
-        api = query_origins(e['name'], api_base=args.api)
-        if api:
+        best_match = choose_best_origins_match(e, api_base=args.api)
+        if best_match:
+            api = best_match.get("api") or {}
             print("  Origins API: found")
+            print("   matched_alias:", best_match.get("candidate"))
             print("   uniqueId:", api.get("uniqueId"))
             print("   name:", api.get("name"))
             print("   figureString(api):", api.get("figureString"))
-            match = (api.get("figureString") == e.get("figureString"))
-            print("   figure match:", match)
+            print("   figure match:", best_match.get("figure_match"))
         else:
             print("  Origins API: not found or request failed")
 

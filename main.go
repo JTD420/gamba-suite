@@ -117,6 +117,7 @@ var (
 	tradeLimitMonitorID       int
 	tradeLimitMonitorActive   bool
 	tradeLimitMonitorDeadline time.Time
+	tradeLimitGracePeriod     = 30 * time.Second
 	lastTradeLimitNotice      string
 	// Whether the partner has accepted during the current open trade.
 	// Keep this sticky until the trade closes so we can re-arm auto-accept
@@ -300,25 +301,20 @@ func formatTradeLimitViolationMessage(v *tradeLimitViolation) string {
 	if v == nil {
 		return ""
 	}
-
-	parts := []string{"Hey you have put too many items in - Check My Hand - rollorigins.club for trade limits"}
+	parts := []string{}
 
 	if v.TooManyUniqueItems {
-		parts = append(parts, fmt.Sprintf("max %d different item types", v.MaxUnique))
+		parts = append(parts, fmt.Sprintf("max %d types", v.MaxUnique))
 	}
 	if v.TooMuchQuantity {
-		names := make([]string, 0, len(v.OverLimitItems))
-		for _, it := range v.OverLimitItems {
-			names = append(names, fmt.Sprintf("%s x %d", it.Name, it.Quantity))
-		}
-		if len(names) > 0 {
-			parts = append(parts, fmt.Sprintf("max %d per item (%s)", v.MaxPerItem, strings.Join(names, ", ")))
-		} else {
-			parts = append(parts, fmt.Sprintf("max %d per item", v.MaxPerItem))
-		}
+		parts = append(parts, fmt.Sprintf("max %d each", v.MaxPerItem))
 	}
 
-	return strings.Join(parts, " | ")
+	base := fmt.Sprintf("Trade over limit — remove items within %ds", int(tradeLimitGracePeriod.Seconds()))
+	if len(parts) > 0 {
+		return base + ": " + strings.Join(parts, ", ")
+	}
+	return base
 }
 
 // equalTradeItemLists compares two slices of TradeItem for equality by
@@ -374,7 +370,7 @@ func (a *App) rejectTradeForLimitViolation(v *tradeLimitViolation) {
 	// Mark that a trade-limit warning is active so we can detect when it
 	// transitions back to a valid state.
 	tradeLimitWasActive = true
-	startTradeLimitMonitor(a, 12*time.Second)
+	startTradeLimitMonitor(a, tradeLimitGracePeriod)
 }
 
 type RoomIdentityEntry struct {
@@ -2920,7 +2916,7 @@ func startTradeLimitMonitor(a *App, timeout time.Duration) {
 				}
 				a.AddLogMsg(fmt.Sprintf("[TRADE_LIMIT] unresolved; force-closing trade with %s", partnerName))
 				log.Printf("[TRADE_LIMIT] unresolved; force-closing trade with %s", partnerName)
-				ext.Send(out.SHOUT, "Trade still over the limit, closing it now - Check My Hand - rollorigins.club for trade limits")
+				ext.Send(out.SHOUT, "Trade still over limit; closing now.")
 				ext.Send(out.TRADE_CLOSE)
 				stopTradeLimitMonitor()
 				return

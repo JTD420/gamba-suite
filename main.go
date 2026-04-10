@@ -1155,10 +1155,22 @@ func handleMuteEnd() {
 	if len(messageQueue) > 0 {
 		log.Printf("[MUTE_QUEUE] sending %d queued messages", len(messageQueue))
 
+		dealerOpenQueued := false
+		dealerOpenMsg := (&App{}).dealerOpenMessage()
+		for _, message := range messageQueue {
+			if strings.TrimSpace(message) == dealerOpenMsg {
+				dealerOpenQueued = true
+				break
+			}
+		}
+
 		// Ensure the dealer open flags reflect that we'll be announcing now.
-		awaitingTradeOpen = true
-		if canAnnounceDealerOpen() {
-			dealerTradeWindowOpen = true
+		if dealerOpenQueued {
+			awaitingTradeOpen = true
+			if canAnnounceDealerOpen() {
+				dealerTradeWindowOpen = true
+				startDealerOpenHeartbeat(nil)
+			}
 		}
 
 		// Send queued messages with small spacing so Habbo's flood control is less likely to trigger.
@@ -2915,8 +2927,17 @@ func startDealerOpenHeartbeat(a *App) {
 	dealerOpenHeartbeatID++
 	id := dealerOpenHeartbeatID
 	dealerOpenHeartbeatActive = true
+	dealerOpenMsg := "Dealer Open, Trade Away"
+	if a != nil {
+		dealerOpenMsg = a.dealerOpenMessage()
+	}
+	addLog := func(msg string) {
+		if a != nil {
+			a.AddLogMsg(msg)
+		}
+	}
 
-	go func(id int) {
+	go func(id int, openMsg string) {
 		// Initial 15s delay for the first re-announcement.
 		timer := time.NewTimer(15 * time.Second)
 		defer timer.Stop()
@@ -2932,7 +2953,7 @@ func startDealerOpenHeartbeat(a *App) {
 				return
 			}
 			if !dealerDiceReady() {
-				a.AddLogMsg("[TRADE_REOPEN] dice not ready; stopping reopen heartbeat (initial)")
+				addLog("[TRADE_REOPEN] dice not ready; stopping reopen heartbeat (initial)")
 				log.Printf("[TRADE_REOPEN] dice not ready; stopping reopen heartbeat (initial)")
 				dealerTradeWindowOpen = false
 				dealerOpenHeartbeatActive = false
@@ -2940,12 +2961,12 @@ func startDealerOpenHeartbeat(a *App) {
 			}
 			// First shout: only if not muted.
 			if isMuted {
-				a.AddLogMsg("[TRADE_REOPEN] initial 15s announcer skipped due to mute")
+				addLog("[TRADE_REOPEN] initial 15s announcer skipped due to mute")
 				log.Printf("[TRADE_REOPEN] initial 15s announcer skipped due to mute")
 			} else {
-				a.AddLogMsg("[TRADE_REOPEN] initial 15s re-announcing dealer open")
+				addLog("[TRADE_REOPEN] initial 15s re-announcing dealer open")
 				log.Printf("[TRADE_REOPEN] initial 15s re-announcing dealer open")
-				sendMessageWithDelay(a.dealerOpenMessage())
+				sendMessageWithDelay(openMsg)
 			}
 		}
 
@@ -2963,18 +2984,18 @@ func startDealerOpenHeartbeat(a *App) {
 				return
 			}
 			if !dealerDiceReady() {
-				a.AddLogMsg("[TRADE_REOPEN] dice not ready; stopping 45s announcer")
+				addLog("[TRADE_REOPEN] dice not ready; stopping 45s announcer")
 				log.Printf("[TRADE_REOPEN] dice not ready; stopping 45s announcer")
 				dealerTradeWindowOpen = false
 				dealerOpenHeartbeatActive = false
 				return
 			}
 
-			a.AddLogMsg("[TRADE_REOPEN] 30s periodic dealer-open announcer firing")
+			addLog("[TRADE_REOPEN] 30s periodic dealer-open announcer firing")
 			log.Printf("[TRADE_REOPEN] 30s periodic dealer-open announcer firing")
-			sendMessageWithDelay(a.dealerOpenMessage())
+			sendMessageWithDelay(openMsg)
 		}
-	}(id)
+	}(id, dealerOpenMsg)
 }
 
 func stopDealerOpenHeartbeat() {
@@ -6507,6 +6528,8 @@ func (a *App) SkipDiceSetupForTesting() {
 	awaitingTradeOpen = true
 	if canAnnounceDealerOpenLocked() {
 		dealerTradeWindowOpen = true
+		stopDealerOpenHeartbeat()
+		startDealerOpenHeartbeat(a)
 		go sendMessageWithDelay(a.dealerOpenMessage())
 	} else {
 		dealerTradeWindowOpen = false
@@ -6563,6 +6586,8 @@ func (a *App) handleThrowDice(e *g.Intercept) {
 			awaitingTradeOpen = true
 			if canAnnounceDealerOpenLocked() {
 				dealerTradeWindowOpen = true
+				stopDealerOpenHeartbeat()
+				startDealerOpenHeartbeat(a)
 				go sendMessageWithDelay(a.dealerOpenMessage())
 			} else {
 				dealerTradeWindowOpen = false

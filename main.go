@@ -3234,13 +3234,13 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 
 	for _, u := range parsed.Users {
 		rawName := strings.TrimSpace(u.DetectedName)
-		apiName := strings.TrimSpace(u.Name)
-		name := apiName
-		if name == "" {
-			name = rawName
+		if rawName == "" {
+			rawName = strings.TrimSpace(u.Name)
 		}
-		name = normalizeUsername(name)
-		rawName = normalizeUsername(rawName)
+		name := normalizeUsername(strings.TrimSpace(u.Name))
+		if name == "" {
+			name = normalizeUsername(rawName)
+		}
 		token := strings.TrimSpace(u.TokenHex)
 		short := strings.TrimSpace(u.ShortToken)
 
@@ -3249,7 +3249,7 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 		}
 
 		if rawName != "" && rawName != name {
-			a.AddLogMsg(fmt.Sprintf("[USERS28_API] resolved detected=%q -> api=%q figureMatch=%t alias=%q", rawName, name, u.FigureMatch, u.MatchedAlias))
+			a.AddLogMsg(fmt.Sprintf("[USERS28_FIX] cleaned name %q -> %q figureMatch=%t alias=%q", rawName, name, u.FigureMatch, u.MatchedAlias))
 		}
 
 		// Determine chat index from short token if possible
@@ -3340,13 +3340,10 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 	a.emitRoomIdentityUpdate()
 
 	for _, u := range parsed.Users {
-		resolvedName := normalizeUsername(strings.TrimSpace(u.Name))
-		if resolvedName == "" {
-			resolvedName = normalizeUsername(strings.TrimSpace(u.DetectedName))
-		}
-		a.AddLogMsg(fmt.Sprintf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, u.TokenHex, u.ShortToken, resolvedName, u.RoomIndex))
+		cleanName := normalizeUsername(u.Name)
+		a.AddLogMsg(fmt.Sprintf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, u.TokenHex, u.ShortToken, cleanName, u.RoomIndex))
 		if chatIdx, ok := chatIndexFromShortToken(u.ShortToken); ok && chatIdx > 0 {
-			a.AddLogMsg(fmt.Sprintf("[USERS28_DEBUG] name=%q roomIndex=%d chatIndex=%d short=%q token=%q", resolvedName, u.RoomIndex, chatIdx, u.ShortToken, u.TokenHex))
+			a.AddLogMsg(fmt.Sprintf("[USERS28_DEBUG] name=%q roomIndex=%d chatIndex=%d short=%q token=%q", cleanName, u.RoomIndex, chatIdx, u.ShortToken, u.TokenHex))
 		}
 	}
 }
@@ -3559,6 +3556,36 @@ func normalizeUsername(raw string) string {
 	if raw == "" {
 		return raw
 	}
+
+	// Fix parser artefacts like "adfAmaver1995" or "fAmaver1995" without
+	// mangling normal lowercase usernames. Only strip a short leading run of
+	// lowercase junk when it is immediately followed by an uppercase-led name.
+	if len(raw) >= 4 {
+		maxPrefix := 4
+		if len(raw)-3 < maxPrefix {
+			maxPrefix = len(raw) - 3
+		}
+		for i := 1; i <= maxPrefix; i++ {
+			prefixOK := true
+			for j := 0; j < i; j++ {
+				if raw[j] < 'a' || raw[j] > 'z' {
+					prefixOK = false
+					break
+				}
+			}
+			if !prefixOK {
+				continue
+			}
+			if raw[i] < 'A' || raw[i] > 'Z' {
+				continue
+			}
+			if raw[i+1] < 'a' || raw[i+1] > 'z' {
+				continue
+			}
+			return raw[i:]
+		}
+	}
+
 	return raw
 }
 

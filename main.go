@@ -1887,9 +1887,10 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		}
 
 		handItemsMu.Lock()
-		// Under strict lifecycle we keep the snapshot taken before Dealer Open
-		// so it remains stable for the whole round. Only clear when not
-		// enforcing the strict lifecycle.
+		// Under strict lifecycle we normally keep the snapshot captured before
+		// Dealer Open. However, once the trade actually opens we must stop using
+		// that old frozen view immediately so coverage checks cannot race against
+		// stale inventory while the forced strip refresh is starting.
 		if !strictTradeSnapshotLifecycle {
 			tradeHandSnapshot = []TradeItem{}
 			tradeHandSnapshotReady = false
@@ -1898,6 +1899,11 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			log.Printf("[TRADE_HAND_SNAPSHOT] cleared snapshot due to non-strict lifecycle on TRADE_OPEN")
 		}
 		handItemsMu.Unlock()
+
+		// Always invalidate immediately on incoming trade open before the async
+		// forced refresh goroutine starts. This prevents TRADE_ITEMS coverage
+		// checks from using the previous round snapshot for even a single packet.
+		a.invalidateTradeHandSnapshot("incoming trade open: awaiting forced refresh")
 
 		// Mark trade as open so background hand rescans are skipped while
 		// a frozen trade snapshot is being prepared.
@@ -2336,6 +2342,16 @@ func startPayout(a *App, targetID int, targetName string) {
 func (a *App) autoAddPayoutItems() {
 	time.Sleep(600 * time.Millisecond) // settle time after trade opens
 
+	// Always begin payout selection from a fresh completed strip scan so we do
+	// not choose ids from a stale or partial hand snapshot from the previous
+	// round. This is the critical guard for cases where the dealer just lost or
+	// re-added the same item type and the live hand cache has not caught up yet.
+	if ok := a.forceRefreshHandSnapshot("payout auto-add start"); !ok {
+		a.AddLogMsg("[PAYOUT] aborting auto-add because forced hand refresh failed at payout start")
+		log.Printf("[PAYOUT] aborting auto-add because forced hand refresh failed at payout start")
+		return
+	}
+
 	betItems := gameBetItems
 	if len(betItems) == 0 {
 		a.AddLogMsg("[PAYOUT] no bet items recorded, skipping auto-add")
@@ -2392,10 +2408,13 @@ func (a *App) autoAddPayoutItems() {
 		}
 
 		if attempt < 3 {
-			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] payout still short after hand scan attempt %d, requesting next hand scan: %s", attempt, formatMissingCounts(missing)))
-			log.Printf("[PAYOUT_DEBUG] payout still short after hand scan attempt %d, requesting next hand scan: %s", attempt, formatMissingCounts(missing))
-			go a.requestPlayerStrip(true)
-			time.Sleep(8 * time.Second)
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] payout still short after hand scan attempt %d, forcing full rescan: %s", attempt, formatMissingCounts(missing)))
+			log.Printf("[PAYOUT_DEBUG] payout still short after hand scan attempt %d, forcing full rescan: %s", attempt, formatMissingCounts(missing))
+			if ok := a.forceRefreshHandSnapshot(fmt.Sprintf("payout auto-add retry %d", attempt+1)); !ok {
+				a.AddLogMsg(fmt.Sprintf("[PAYOUT] forced hand refresh failed during payout retry %d", attempt+1))
+				log.Printf("[PAYOUT] forced hand refresh failed during payout retry %d", attempt+1)
+				break
+			}
 		} else {
 			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] payout still short after final hand scan attempt: %s", formatMissingCounts(missing)))
 			log.Printf("[PAYOUT_DEBUG] payout still short after final hand scan attempt: %s", formatMissingCounts(missing))

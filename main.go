@@ -5676,6 +5676,17 @@ func (a *App) sendTradeCompletionMessage() {
 		lastTradePartnerToken = partnerToken
 	}
 
+	// Keep the stable copy alive for payout and post-round reopen.
+	if stableTradePartnerID <= 0 && partnerID > 0 {
+		stableTradePartnerID = partnerID
+	}
+	if strings.TrimSpace(stableTradePartnerName) == "" || strings.EqualFold(stableTradePartnerName, "Unknown") {
+		stableTradePartnerName = partnerName
+	}
+	if strings.TrimSpace(stableTradePartnerToken) == "" {
+		stableTradePartnerToken = partnerToken
+	}
+
 	a.AddLogMsg("[TRADE_FLOW] calling beginGameHistory")
 	a.beginGameHistory(partnerName, gameBetItems)
 	a.AddLogMsg("[TRADE_FLOW] beginGameHistory returned")
@@ -8023,6 +8034,9 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 				nameMatch = true
 				awaitingGameChoicePartnerName = strings.TrimSpace(senderName)
 				lastTradePartnerName = strings.TrimSpace(senderName)
+				if strings.TrimSpace(stableTradePartnerName) == "" || strings.EqualFold(stableTradePartnerName, "Unknown") {
+					stableTradePartnerName = strings.TrimSpace(senderName)
+				}
 				a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] accepted %q from resolved sender %q while partner name was unknown", choice, senderName))
 			} else if (awaitingGameChoicePartnerID <= 0 || awaitingGameChoicePartnerID > 512) && index > 0 && index <= 512 {
 				// Last-resort path when trade partner id is unresolved or in a different id space.
@@ -8034,8 +8048,25 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 	if !indexMatch && !nameMatch {
 		if awaitingGameChoice && awaitingGameChoicePartnerID == 0 && index > 0 && index <= 512 {
 			awaitingGameChoicePartnerID = index
+			lastTradePartnerID = index
+			if stableTradePartnerID <= 0 {
+				stableTradePartnerID = index
+			}
 			if strings.TrimSpace(senderName) != "" && !strings.EqualFold(strings.TrimSpace(senderName), "Unknown") {
-				awaitingGameChoicePartnerName = normalizeUsername(strings.TrimSpace(senderName))
+				resolvedName := normalizeUsername(strings.TrimSpace(senderName))
+				awaitingGameChoicePartnerName = resolvedName
+				lastTradePartnerName = resolvedName
+				if strings.TrimSpace(stableTradePartnerName) == "" || strings.EqualFold(stableTradePartnerName, "Unknown") {
+					stableTradePartnerName = resolvedName
+				}
+				if token, ok := lookupTokenByName(resolvedName); ok {
+					if strings.TrimSpace(lastTradePartnerToken) == "" {
+						lastTradePartnerToken = token
+					}
+					if strings.TrimSpace(stableTradePartnerToken) == "" {
+						stableTradePartnerToken = token
+					}
+				}
 			}
 			a.AddLogMsg(fmt.Sprintf("[GAME_SELECT_BIND] bound partner=%q to chat index %d from live chat", awaitingGameChoicePartnerName, awaitingGameChoicePartnerID))
 			indexMatch = true

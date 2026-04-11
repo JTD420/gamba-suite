@@ -156,11 +156,14 @@ var (
 	roomUsersReqMu         sync.Mutex
 	roomReadySeen          bool
 	// Canonical USERS28 registry: single source-of-truth for parsed users
-	users28Canonical         = map[string]ParsedUsers28User{}
-	users28ByToken           = map[string]string{}
-	users28ByIndex           = map[int]string{} // roomIndex -> name
-	users28ByShortToken      = map[string]string{}
-	roomIdentityByShortToken = map[string]RoomIdentityEntry{}
+	users28Canonical          = map[string]ParsedUsers28User{}
+	users28ByToken            = map[string]string{}
+	users28ByIndex            = map[int]string{} // roomIndex -> name
+	users28ByShortToken       = map[string]string{}
+	roomIdentityByShortToken  = map[string]RoomIdentityEntry{}
+	recentTradePartnerByToken = map[string]string{}
+	recentTradePartnerSeenAt  = map[string]time.Time{}
+	recentTradePartnerMu      sync.Mutex
 	// parsedUserInfoByToken stores parsed JSON returned by the Python helper
 	parsedUserInfoByToken = map[string]map[string]interface{}{}
 	parsedUserInfoMu      sync.Mutex
@@ -1928,16 +1931,29 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		if partnerName == "" {
 			partnerName = "Unknown"
 		}
-		// If the incoming trade partner is unknown, cancel the trade and notify.
+		// If the incoming trade partner is unknown, try a short recovery window before rejecting.
 		if !isPayoutTradeOpen && !matchedRecentOutgoing {
 			if partnerName == "" || strings.EqualFold(partnerName, "Unknown") {
-				notify := "Sorry canno't see you, please try again or rejoin room"
-				a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] unknown partner, cancelling trade: %s", notify))
-				e.Block()
-				ext.Send(out.TRADE_CLOSE)
-				ext.Send(out.SHOUT, notify)
-				return
+				a.AddLogMsg("[TRADE_OPEN] partner unresolved on first pass, attempting recovery")
+				if recoveredName, recoveredID, ok := a.recoverUnknownTradePartner(e.Packet.Data, 2*time.Second); ok {
+					partnerName = normalizeUsername(strings.TrimSpace(recoveredName))
+					lastTradePartnerName = partnerName
+					if recoveredID > 0 {
+						lastTradePartnerID = recoveredID
+					}
+					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] recovered unknown partner as %q (id=%d)", partnerName, lastTradePartnerID))
+				} else {
+					notify := "Sorry can't see you right now, please try again or rejoin room"
+					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] unknown partner after recovery window, cancelling trade: %s", notify))
+					e.Block()
+					ext.Send(out.TRADE_CLOSE)
+					ext.Send(out.SHOUT, notify)
+					return
+				}
 			}
+		}
+		if partnerName != "" && !strings.EqualFold(partnerName, "Unknown") && strings.TrimSpace(lastTradePartnerToken) != "" {
+			rememberRecentTradePartner(lastTradePartnerToken, partnerName)
 		}
 		openMsg := fmt.Sprintf("Trade Opened: \"%s\"", partnerName)
 		shouldAnnounceTradeOpen := true
@@ -3363,6 +3379,9 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 		if name == "" {
 			continue
 		}
+		if token != "" {
+			rememberRecentTradePartner(token, name)
+		}
 
 		if rawName != "" && rawName != name {
 			a.AddLogMsg(fmt.Sprintf("[USERS28_FIX] cleaned name %q -> %q figureMatch=%t alias=%q", rawName, name, u.FigureMatch, u.MatchedAlias))
@@ -3635,6 +3654,118 @@ func waitForUsers28TokenName(token string, timeout time.Duration) (string, bool)
 		time.Sleep(75 * time.Millisecond)
 	}
 	return "", false
+}
+
+func rememberRecentTradePartner(token string, name string) {
+	token = strings.TrimSpace(token)
+	name = normalizeUsername(strings.TrimSpace(name))
+	if token == "" || name == "" {
+		return
+	}
+	recentTradePartnerMu.Lock()
+	recentTradePartnerByToken[token] = name
+	recentTradePartnerSeenAt[token] = time.Now()
+	recentTradePartnerMu.Unlock()
+}
+
+func lookupRecentTradePartner(token string, maxAge time.Duration) (string, bool) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return "", false
+	}
+	recentTradePartnerMu.Lock()
+	defer recentTradePartnerMu.Unlock()
+	name, ok := recentTradePartnerByToken[token]
+	if !ok {
+		return "", false
+	}
+	seenAt := recentTradePartnerSeenAt[token]
+	if maxAge > 0 && !seenAt.IsZero() && time.Since(seenAt) > maxAge {
+		delete(recentTradePartnerByToken, token)
+		delete(recentTradePartnerSeenAt, token)
+		return "", false
+	}
+	name = normalizeUsername(name)
+	if name == "" {
+		return "", false
+	}
+	return name, true
+}
+
+func (a *App) recoverUnknownTradePartner(packetData []byte, timeout time.Duration) (string, int, bool) {
+	deadline := time.Now().Add(timeout)
+	tradeTokenHex := ""
+	tradeShort := ""
+	if len(packetData) >= 4 {
+		rawToken := packetData[:4]
+		tradeTokenHex = hex.EncodeToString(rawToken)
+		tradeShort = string(rawToken[:2])
+	}
+
+	for {
+		go requestRoomUsers(a)
+
+		if tradeTokenHex != "" {
+			if name, ok := lookupUsers28Token(tradeTokenHex); ok {
+				idx := 0
+				if resolvedIdx, ok := waitForUsers28RoomIndexByName(name, 250*time.Millisecond); ok {
+					idx = resolvedIdx
+				}
+				rememberRecentTradePartner(tradeTokenHex, name)
+				return name, idx, true
+			}
+			if name, ok := lookupRecentTradePartner(tradeTokenHex, 10*time.Minute); ok {
+				idx := 0
+				if resolvedIdx, ok := waitForUsers28RoomIndexByName(name, 250*time.Millisecond); ok {
+					idx = resolvedIdx
+				}
+				return name, idx, true
+			}
+			if idx, name, ok := resolveTradeTokenToRoomIndex(string(packetData[:4])); ok {
+				rememberRecentTradePartner(tradeTokenHex, name)
+				return normalizeUsername(name), idx, true
+			}
+		}
+
+		if tradeShort != "" && isLikelyChatToken(tradeShort) {
+			users28Mu.Lock()
+			name, ok := users28ByShortToken[tradeShort]
+			users28Mu.Unlock()
+			name = normalizeUsername(name)
+			if ok && name != "" {
+				idx := 0
+				if resolvedIdx, ok := waitForUsers28RoomIndexByName(name, 250*time.Millisecond); ok {
+					idx = resolvedIdx
+				}
+				if tradeTokenHex != "" {
+					rememberRecentTradePartner(tradeTokenHex, name)
+				}
+				return name, idx, true
+			}
+		}
+
+		if len(packetData) > 0 {
+			vlen := gencoding.VL64DecodeLen(packetData[0])
+			if vlen > 0 && vlen <= len(packetData) {
+				idx := gencoding.VL64Decode(packetData[:vlen])
+				if isPlausibleTradeRoomIndex(idx) {
+					if name, ok := lookupUsers28Index(idx); ok {
+						if tradeTokenHex != "" {
+							rememberRecentTradePartner(tradeTokenHex, name)
+						}
+						return name, idx, true
+					}
+				}
+			}
+		}
+
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(125 * time.Millisecond)
+	}
+
+	return "", 0, false
 }
 
 func isPlausibleTradeRoomIndex(index int) bool {

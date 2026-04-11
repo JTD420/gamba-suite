@@ -16,6 +16,7 @@ import argparse
 import binascii
 import json
 import sys
+import unicodedata
 from typing import Any
 
 
@@ -69,9 +70,13 @@ def hex_from_hexdump(txt: str) -> bytes:
 
 def is_likely_name_text(value: str) -> bool:
     value = value.strip()
-    if len(value) < 2:
+    if len(value) < 1:
         return False
-    return all(ch.isalnum() or ch in '_-' for ch in value)
+    if any(ord(ch) < 32 for ch in value):
+        return False
+    # Habbo names can contain more than simple alnum/_/-. Accept any visible
+    # non-control text and let the API decide the canonical match.
+    return "\x02" not in value
 
 
 def normalize_detected_name(name: str) -> tuple[str, list[str]]:
@@ -123,6 +128,18 @@ def is_plausible_room_index(value: int) -> bool:
     return 1 <= value <= 5000
 
 
+def fallback_display_name(name: str, token_hex: str | None, room_index: int | None) -> str:
+    name = (name or "").strip()
+    if name:
+        return name
+    token_hex = (token_hex or "").strip()
+    if token_hex:
+        return f"unknown_{token_hex[:8]}"
+    if room_index and room_index > 0:
+        return f"unknown_room_{room_index}"
+    return "unknown_user"
+
+
 def score_candidate(candidate: dict) -> tuple[int, int, int]:
     name_len = len(candidate.get('name_bytes') or b'')
     room_index = int(candidate.get('room_index') or 0)
@@ -153,8 +170,8 @@ def find_user_entries(data: bytes, window: int = 64):
         b"ha-", b"he-", b"ea-", b"fa-", b"ca-",
         b"cc-", b"wa-", b"cp-"
     )
-    name_pat = re.compile(r"([A-Za-z][A-Za-z0-9_-]{2,})$")
-    fallback_pat = re.compile(r"([A-Za-z][A-Za-z0-9_-]{1,})$")
+    name_pat = re.compile(r"([^\x00-\x1f\x02]{2,})$")
+    fallback_pat = re.compile(r"([^\x00-\x1f\x02]{1,})$")
 
     for idx in range(len(data) - 4):
         if data[idx] != 0x02:
@@ -192,7 +209,7 @@ def find_user_entries(data: bytes, window: int = 64):
         # Determine the contiguous run of name-like characters and test
         # candidate starts from the right (closest to the hr- marker) leftwards.
         run_start = name_end - 1
-        while run_start >= pre_start and (data[run_start:run_start+1].decode('latin-1', errors='ignore') != '' ) and ((65 <= data[run_start] <= 90) or (97 <= data[run_start] <= 122) or (48 <= data[run_start] <= 57) or data[run_start] in (95, 45)):
+        while run_start >= pre_start and 32 <= data[run_start] <= 126 and data[run_start] != 0x02:
             run_start -= 1
         run_start += 1
 
@@ -328,6 +345,8 @@ def find_user_entries(data: bytes, window: int = 64):
                     except Exception:
                         chat_id = None
 
+        name = fallback_display_name(name, token_hex, room_index)
+
         key = (name, token_hex, room_index, name_end)
         if key in seen:
             continue
@@ -400,25 +419,106 @@ def find_trade_entries(data: bytes):
     return entries
 
 
+def username_search_variants(username: str) -> list[str]:
+    username = (username or "").strip()
+    if not username:
+        return []
+
+    variants = []
+    seen = set()
+
+    def add(value: str):
+        value = (value or "").strip()
+        if not value or value in seen:
+            return
+        seen.add(value)
+        variants.append(value)
+
+    add(username)
+    add(unicodedata.normalize("NFC", username))
+    add(unicodedata.normalize("NFKC", username))
+    add(username.casefold())
+    add(username.lower())
+
+    trimmed = username.strip(" .,:;|/\\\"'`~!@#$%^&*()[]{}+=<>?")
+    if trimmed != username:
+        add(trimmed)
+        add(unicodedata.normalize("NFKC", trimmed))
+
+    return variants
+
+
+def _names_equal(left: str, right: str) -> bool:
+    return unicodedata.normalize("NFKC", (left or "")).casefold() == unicodedata.normalize("NFKC", (right or "")).casefold()
+
+
+def choose_best_origins_match(entry: dict, api_base: str = "https://origins.habbo.com/api/public/users"):
+    candidates = []
+    seen = set()
+
+    for base in [entry.get("name")] + list(entry.get("aliases") or []):
+        for variant in username_search_variants(base):
+            if variant in seen:
+                continue
+            seen.add(variant)
+            api = query_origins(variant, api_base=api_base)
+            if not api:
+                continue
+
+            packet_figure = (entry.get("figureString") or "").strip()
+            api_figure = (api.get("figureString") or "").strip()
+            figure_match = bool(packet_figure and api_figure and packet_figure == api_figure)
+            exact_name = _names_equal(api.get("name"), base)
+
+            score = 0
+            if figure_match:
+                score += 100
+            if exact_name:
+                score += 40
+            if _names_equal(api.get("name"), variant):
+                score += 20
+
+            candidates.append({
+                "candidate": variant,
+                "api": api,
+                "figure_match": figure_match,
+                "score": score,
+            })
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item["score"])
+
+
 def query_origins(username: str, api_base: str = "https://origins.habbo.com/api/public/users"):
     """Query the Origins public users endpoint. Returns parsed JSON or None."""
+    username = (username or "").strip()
+    if not username:
+        return None
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "habbo-users28-parser/1.0",
+    }
+
     try:
         import requests
     except Exception:
-        # fallback to urllib
         from urllib import request, parse
 
-        url = f"{api_base}?name={parse.quote(username)}"
+        query = parse.urlencode({"name": username}, quote_via=parse.quote, safe="")
+        url = f"{api_base}?{query}"
+        req = request.Request(url, headers=headers)
         try:
-            with request.urlopen(url, timeout=10) as r:
+            with request.urlopen(req, timeout=10) as r:
                 if r.status == 200:
-                    return json.loads(r.read().decode())
+                    return json.loads(r.read().decode("utf-8", errors="replace"))
         except Exception:
             return None
         return None
 
     try:
-        r = requests.get(api_base, params={"name": username}, timeout=8)
+        r = requests.get(api_base, params={"name": username}, headers=headers, timeout=8)
         if r.status_code == 200:
             return r.json()
     except Exception:
@@ -486,7 +586,7 @@ def main():
                 canonical_name = origins.get("name")
 
             ue = {
-                "name": canonical_name,
+                "name": fallback_display_name(canonical_name, e.get("token_hex"), e.get("room_index")),
                 "detected_name": e.get("name"),
                 "aliases": e.get("aliases") or [],
                 "raw_name": e.get("raw_name"),

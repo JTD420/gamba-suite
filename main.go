@@ -128,32 +128,35 @@ var (
 	// Whether a trade-limit warning was previously active (used to detect
 	// transitions from invalid -> valid and to shout a one-time "now valid"
 	// message).
-	tradeLimitWasActive      bool
-	lastTradeOpenData        string
-	lastTradeOpen            string
-	tradeOpen                bool
-	messageQueue             []string
-	isPokerRolling           bool
-	isTriRolling             bool
-	isBJRolling              bool
-	is13Rolling              bool
-	is13Hitting              bool
-	isHitting                bool
-	isClosing                bool
-	ChatIsDisabled           bool
-	mutex                    sync.Mutex
-	resultsWaitGroup         sync.WaitGroup
-	rollDelay                = 550 * time.Millisecond
-	stripNextDelay           = 2250 * time.Millisecond
-	stripGetNewPayload       = "new"
-	stripGetNextPayload      = "next"
-	tradeUserPattern         = regexp.MustCompile(`\[(\d+)\]`)
-	stripItemNameRe          = regexp.MustCompile(`(?:CF_\d+_[a-z][a-z_]*|[a-z][a-z0-9_]*_[a-z0-9_]+)(?:\*\d+)?`)
-	gameChoiceCleanupRe      = regexp.MustCompile(`[^a-z0-9]+`)
-	roomEntities             = map[int]room.Entity{}
-	roomMu                   sync.Mutex
-	lastRoomUsersRequestAt   time.Time
-	roomUsersReqMu           sync.Mutex
+	tradeLimitWasActive    bool
+	lastTradeOpenData      string
+	lastTradeOpen          string
+	tradeOpen              bool
+	messageQueue           []string
+	isPokerRolling         bool
+	isTriRolling           bool
+	isBJRolling            bool
+	is13Rolling            bool
+	is13Hitting            bool
+	isHitting              bool
+	isClosing              bool
+	ChatIsDisabled         bool
+	mutex                  sync.Mutex
+	resultsWaitGroup       sync.WaitGroup
+	rollDelay              = 550 * time.Millisecond
+	stripNextDelay         = 2250 * time.Millisecond
+	stripGetNewPayload     = "new"
+	stripGetNextPayload    = "next"
+	tradeUserPattern       = regexp.MustCompile(`\[(\d+)\]`)
+	stripItemNameRe        = regexp.MustCompile(`(?:CF_\d+_[a-z][a-z_]*|[a-z][a-z0-9_]*_[a-z0-9_]+)(?:\*\d+)?`)
+	gameChoiceCleanupRe    = regexp.MustCompile(`[^a-z0-9]+`)
+	roomEntities           = map[int]room.Entity{}
+	roomMu                 sync.Mutex
+	lastRoomUsersRequestAt time.Time
+	roomUsersReqMu         sync.Mutex
+	roomReadySeen          bool
+	// Canonical USERS28 registry: single source-of-truth for parsed users
+	users28Canonical         = map[string]ParsedUsers28User{}
 	users28ByToken           = map[string]string{}
 	users28ByIndex           = map[int]string{} // roomIndex -> name
 	users28ByShortToken      = map[string]string{}
@@ -199,6 +202,8 @@ var (
 	stripScanActive            bool
 	stripScanSessionID         = 0
 	stripScanPageCount         = 0
+	stripScanLastPacketAt      time.Time
+	stripScanStartedAt         time.Time
 	stripScanSeenItemIDs       = map[int]struct{}{}
 	stripScanCounts            = map[string]int{}
 	stripScanItemIDs           = map[string][]int{}
@@ -530,7 +535,17 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}()
 	go func() {
-		time.Sleep(1500 * time.Millisecond)
+		deadline := time.Now().Add(12 * time.Second)
+		for time.Now().Before(deadline) {
+			roomMu.Lock()
+			ready := roomReadySeen
+			roomMu.Unlock()
+			if ready {
+				break
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+
 		scanID := a.requestPlayerStrip(true)
 		if ok := waitForStripScanCompletion(scanID, 20*time.Second); ok {
 			a.AddLogMsg(fmt.Sprintf("[STRIP] initial hand sync complete (session=%d)", scanID))
@@ -541,11 +556,15 @@ func (a *App) startup(ctx context.Context) {
 			}
 		} else {
 			a.AddLogMsg(fmt.Sprintf("[STRIP] initial hand sync timeout (session=%d)", scanID))
+			a.finalizeStripScan(scanID, "startup timeout")
 		}
 
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
+			if !casinoActive && !dealerAcceptingTrades && !tradeOpen {
+				continue
+			}
 			a.requestPlayerStrip(false)
 		}
 	}()
@@ -1310,68 +1329,149 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		allItems := a.parseTradeItemsPacket(e.Packet.Data)
 
 		if !payoutTradeActive {
-			// Non-payout: partner offer is the full list. We'll update the
-			// tracked current/last-state below once we've captured the
-			// previous state for transition detection.
+			// Non-payout: maintain both sides of the trade window as items are
+			// added so the dealer side appears in the UI too. We still validate
+			// only the partner side against trade limits.
 
-			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] partner=%d all=%d (non-payout)", len(currentTradeItems), len(allItems)))
+			// Snapshot outgoing-add state and timestamp for debugging/race detection.
+			addItemMu.Lock()
+			wasOurs := lastAddItemWasOurs
+			lastAddItemWasOurs = false
+			lastAddAt := lastAddItemByUsAt
+			addItemMu.Unlock()
 
-			// When parser returns zero items, record the raw payload for debugging
+			prevAllLen := 0
+			tradeItemsMu.Lock()
+			prevAllLen = len(lastAllTradeItems)
+			prevAllCopy := make([]TradeItem, len(lastAllTradeItems))
+			copy(prevAllCopy, lastAllTradeItems)
+			partnerMap := map[string]int{}
+			for _, it := range currentTradeItems {
+				partnerMap[it.Name] = it.Quantity
+			}
+			ownMap := map[string]int{}
+			for _, it := range currentOwnTradeItems {
+				ownMap[it.Name] = it.Quantity
+			}
+			acceptedSnap := make([]TradeItem, len(partnerAcceptedSnapshot))
+			copy(acceptedSnap, partnerAcceptedSnapshot)
+			tradeItemsMu.Unlock()
+
+			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS_DEBUG] incoming TRADE_ITEMS all=%d prevAll=%d wasOursFlag=%t lastAddAt=%s (non-payout)", len(allItems), prevAllLen, wasOurs, lastAddAt.Format(time.RFC3339Nano)))
+
 			if len(allItems) == 0 {
 				a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS_DEBUG] zero parsed items, raw=%q", string(e.Packet.Data)))
 			}
-
 			for i, item := range allItems {
 				a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] raw[%d] name=%q quantity=%d", i, item.Name, item.Quantity))
 			}
 
-			a.emitTradeItemsUpdate("partner")
-
-			// Extend the trade-window timeout on any incoming TRADE_ITEMS packet
-			// payload, even if parsing returned zero parsed items. This avoids
-			// killing valid but unparseable trades while debugging.
 			if len(e.Packet.Data) > 0 {
 				extendTradeWindowTimeoutForPartnerActivity(a)
 			}
 
-			// Determine previous validity so we can detect invalid->valid
-			// transitions and re-arm auto-accept if the partner had already
-			// accepted before the invalid state.
+			prevAll := map[string]int{}
+			for _, it := range prevAllCopy {
+				prevAll[it.Name] = it.Quantity
+			}
+			allMap := map[string]int{}
+			for _, it := range allItems {
+				allMap[it.Name] += it.Quantity
+			}
+
+			// Attribute positive deltas to the side that most recently sent
+			// TRADE_ADDITEM. First packet with no previous baseline defaults to
+			// the partner side.
+			added := map[string]int{}
+			for name, q := range allMap {
+				if q > prevAll[name] {
+					added[name] = q - prevAll[name]
+				}
+			}
+			if len(prevAllCopy) == 0 && len(allItems) > 0 {
+				for name, q := range allMap {
+					partnerMap[name] = q
+				}
+			} else if len(added) > 0 {
+				if wasOurs {
+					for name, q := range added {
+						ownMap[name] += q
+					}
+				} else {
+					for name, q := range added {
+						partnerMap[name] += q
+					}
+				}
+			}
+
+			// Keep the UI consistent when items are removed by clamping each side
+			// back down to the current server total if our attributed totals drift.
+			for name, total := range allMap {
+				combined := partnerMap[name] + ownMap[name]
+				if combined > total {
+					over := combined - total
+					if ownMap[name] >= over {
+						ownMap[name] -= over
+					} else {
+						over -= ownMap[name]
+						ownMap[name] = 0
+						if partnerMap[name] >= over {
+							partnerMap[name] -= over
+						} else {
+							partnerMap[name] = 0
+						}
+					}
+				}
+			}
+			for name := range partnerMap {
+				if _, ok := allMap[name]; !ok {
+					partnerMap[name] = 0
+				}
+			}
+			for name := range ownMap {
+				if _, ok := allMap[name]; !ok {
+					ownMap[name] = 0
+				}
+			}
+
+			mapToItems := func(m map[string]int) []TradeItem {
+				names := make([]string, 0, len(m))
+				for n := range m {
+					names = append(names, n)
+				}
+				sort.Strings(names)
+				out := make([]TradeItem, 0, len(names))
+				for _, n := range names {
+					if m[n] <= 0 {
+						continue
+					}
+					out = append(out, TradeItem{Name: n, Quantity: m[n]})
+				}
+				return out
+			}
+
+			currentPartnerItems := mapToItems(partnerMap)
+			currentOwnItems := mapToItems(ownMap)
+
 			tradeItemsMu.Lock()
-			prevAllCopy := make([]TradeItem, len(lastAllTradeItems))
-			copy(prevAllCopy, lastAllTradeItems)
+			currentTradeItems = currentPartnerItems
+			currentOwnTradeItems = currentOwnItems
+			lastAllTradeItems = make([]TradeItem, len(allItems))
+			copy(lastAllTradeItems, allItems)
 			tradeItemsMu.Unlock()
+
+			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS #108] partner=%d own=%d all=%d wasOurs=%t (non-payout)", len(currentPartnerItems), len(currentOwnItems), len(allItems), wasOurs))
+			a.emitTradeItemsUpdate("both")
 
 			wasValid := true
 			if len(prevAllCopy) > 0 {
 				wasValid = getTradeLimitViolation(prevAllCopy) == nil
 			}
 
-			// Update current/tracking state (atomic under lock as before).
-			tradeItemsMu.Lock()
-			currentTradeItems = make([]TradeItem, len(allItems))
-			copy(currentTradeItems, allItems)
-			currentOwnTradeItems = []TradeItem{}
-			// Save baseline full-state
-			lastAllTradeItems = make([]TradeItem, len(allItems))
-			copy(lastAllTradeItems, allItems)
-			// Capture accepted-snapshot locally for comparison
-			acceptedSnap := make([]TradeItem, len(partnerAcceptedSnapshot))
-			copy(acceptedSnap, partnerAcceptedSnapshot)
-			tradeItemsMu.Unlock()
-
-			// Snapshot the current parsed items for validation. Keep the partner's
-			// accept state sticky for this trade so the bot can recover cleanly
-			// after the player removes an over-limit item and comes back within
-			// limits, without getting stuck waiting for a fresh accept packet.
-			tradeItemsMu.Lock()
-			itemsCopy := make([]TradeItem, len(currentTradeItems))
-			copy(itemsCopy, currentTradeItems)
-			tradeItemsMu.Unlock()
+			itemsCopy := make([]TradeItem, len(currentPartnerItems))
+			copy(itemsCopy, currentPartnerItems)
 
 			_ = acceptedSnap
-			// Debug: show parsed trade items prior to validation so we can see
-			// exactly what the bot thinks the partner is offering.
 			a.AddLogMsg(fmt.Sprintf("[TRADE_LIMIT_DEBUG] validating %d parsed trade items", len(itemsCopy)))
 			for i, it := range itemsCopy {
 				a.AddLogMsg(fmt.Sprintf("[TRADE_LIMIT_DEBUG] parsed[%d] name=%q qty=%d", i, it.Name, it.Quantity))
@@ -1384,8 +1484,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				return
 			}
 
-			// If we previously had an active trade-limit warning or monitor,
-			// stop it now that the offer is valid again and notify the player.
 			if tradeLimitWasActive || tradeLimitMonitorActive {
 				stopTradeLimitMonitor()
 				lastTradeLimitNotice = ""
@@ -1394,10 +1492,6 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				ext.Send(out.SHOUT, "Trade is back within limits, accept again if needed")
 			}
 
-			// Regardless of whether a trade-limit monitor was active, if the
-			// canonical previous state was invalid but the new state is valid,
-			// consider re-arming auto-accept when the partner had earlier
-			// accepted the same state.
 			if !wasValid && isValid {
 				a.AddLogMsg(fmt.Sprintf("[TRADE_LIMIT] transition invalid->valid detected prevPartnerAccepted=%t", partnerTradeAccepted))
 				if partnerTradeAccepted && !tradeAutoAccepted && !tradeAutoAcceptPending {
@@ -3217,20 +3311,42 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 		return
 	}
 
+	// Build a single canonical users map for this packet, then atomically
+	// replace the global registry and derived caches. This ensures a single
+	// authoritative source for user lookups and avoids scattered updates.
 	users28Mu.Lock()
 	prev := map[string]RoomIdentityEntry{}
 	for k, v := range roomIdentityByShortToken {
 		prev[k] = v
 	}
-	users28ByToken = map[string]string{}
-	users28ByIndex = map[int]string{}
-	users28ByShortToken = map[string]string{}
-	roomIdentityByShortToken = map[string]RoomIdentityEntry{}
+	oldCanonical := map[string]ParsedUsers28User{}
+	for k, v := range users28Canonical {
+		oldCanonical[k] = v
+	}
+	oldByToken := map[string]string{}
+	for k, v := range users28ByToken {
+		oldByToken[k] = v
+	}
+	oldByIndex := map[int]string{}
+	for k, v := range users28ByIndex {
+		oldByIndex[k] = v
+	}
+	oldByShort := map[string]string{}
+	for k, v := range users28ByShortToken {
+		oldByShort[k] = v
+	}
+	oldRoomIdentity := map[string]RoomIdentityEntry{}
+	for k, v := range roomIdentityByShortToken {
+		oldRoomIdentity[k] = v
+	}
 	users28Mu.Unlock()
 
-	parsedUserInfoMu.Lock()
-	parsedUserInfoByToken = map[string]map[string]interface{}{}
-	parsedUserInfoMu.Unlock()
+	canonicalLocal := map[string]ParsedUsers28User{}
+	byTokenLocal := map[string]string{}
+	byIndexLocal := map[int]string{}
+	byShortLocal := map[string]string{}
+	roomIdentityLocal := map[string]RoomIdentityEntry{}
+	parsedInfoLocal := map[string]map[string]interface{}{}
 
 	for _, u := range parsed.Users {
 		rawName := strings.TrimSpace(u.DetectedName)
@@ -3258,35 +3374,19 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 			chatIndex = idx
 		}
 
-		users28Mu.Lock()
-		if token != "" {
-			users28ByToken[token] = name
-			// Keep backwards-compat mapping from raw 4-byte token -> name
-			if decoded, err := hex.DecodeString(token); err == nil && len(decoded) == 4 {
-				users28ByToken[string(decoded)] = name
-			}
+		// canonical key: prefer token_hex, otherwise a name-based key
+		key := token
+		if key == "" {
+			key = "name:" + strings.ToLower(name)
 		}
-		if u.RoomIndex > 0 {
-			users28ByIndex[u.RoomIndex] = name
-		}
-		if chatIndex > 0 {
-			users28ByIndex[chatIndex] = name
-		}
-		if short != "" {
-			users28ByShortToken[short] = name
-			roomIdentityByShortToken[short] = RoomIdentityEntry{
-				Name:      name,
-				Token:     token,
-				Short:     short,
-				ChatIndex: u.ChatID,
-				RoomIndex: u.RoomIndex,
-			}
-		}
-		users28Mu.Unlock()
+		canonicalLocal[key] = u
 
 		if token != "" {
-			parsedUserInfoMu.Lock()
-			parsedUserInfoByToken[token] = map[string]interface{}{
+			byTokenLocal[token] = name
+			if decoded, err := hex.DecodeString(token); err == nil && len(decoded) == 4 {
+				byTokenLocal[string(decoded)] = name
+			}
+			parsedInfoLocal[token] = map[string]interface{}{
 				"name":          name,
 				"detected_name": rawName,
 				"token_hex":     u.TokenHex,
@@ -3299,7 +3399,23 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 				"matched_alias": u.MatchedAlias,
 				"origins":       u.Origins,
 			}
-			parsedUserInfoMu.Unlock()
+		}
+
+		if u.RoomIndex > 0 {
+			byIndexLocal[u.RoomIndex] = name
+		}
+		if chatIndex > 0 {
+			byIndexLocal[chatIndex] = name
+		}
+		if short != "" {
+			byShortLocal[short] = name
+			roomIdentityLocal[short] = RoomIdentityEntry{
+				Name:      name,
+				Token:     token,
+				Short:     short,
+				ChatIndex: u.ChatID,
+				RoomIndex: u.RoomIndex,
+			}
 		}
 
 		a.AddLogMsg(fmt.Sprintf(
@@ -3311,6 +3427,58 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 			name, rawName, u.RoomIndex, u.ChatID, short, token, u.FigureMatch, u.MatchedAlias,
 		)
 	}
+
+	partialUsers28Update := len(canonicalLocal) > 0 && len(oldCanonical) >= 3 && len(canonicalLocal) < len(oldCanonical)/2 && len(e.Packet.Data) < 300
+	if partialUsers28Update {
+		a.AddLogMsg(fmt.Sprintf("[USERS28_PARTIAL] merge-only update len=%d parsed=%d prev=%d", len(e.Packet.Data), len(canonicalLocal), len(oldCanonical)))
+		for k, v := range oldCanonical {
+			if _, ok := canonicalLocal[k]; !ok {
+				canonicalLocal[k] = v
+			}
+		}
+		for k, v := range oldByToken {
+			if _, ok := byTokenLocal[k]; !ok {
+				byTokenLocal[k] = v
+			}
+		}
+		for k, v := range oldByIndex {
+			if _, ok := byIndexLocal[k]; !ok {
+				byIndexLocal[k] = v
+			}
+		}
+		for k, v := range oldByShort {
+			if _, ok := byShortLocal[k]; !ok {
+				byShortLocal[k] = v
+			}
+		}
+		for k, v := range oldRoomIdentity {
+			if _, ok := roomIdentityLocal[k]; !ok {
+				roomIdentityLocal[k] = v
+			}
+		}
+	}
+
+	// Detect changes vs previous canonical registry for diagnostics
+	for k, newU := range canonicalLocal {
+		if oldU, ok := oldCanonical[k]; ok {
+			if oldU.FigureString != newU.FigureString || oldU.RoomIndex != newU.RoomIndex || normalizeUsername(oldU.Name) != normalizeUsername(newU.Name) {
+				a.AddLogMsg(fmt.Sprintf("[USERS28_CHANGE] token=%q name %q->%q room %d->%d figureChanged=%t", k, oldU.Name, newU.Name, oldU.RoomIndex, newU.RoomIndex, oldU.FigureString != newU.FigureString))
+			}
+		}
+	}
+
+	// Atomically replace global registries with local built maps
+	users28Mu.Lock()
+	users28Canonical = canonicalLocal
+	users28ByToken = byTokenLocal
+	users28ByIndex = byIndexLocal
+	users28ByShortToken = byShortLocal
+	roomIdentityByShortToken = roomIdentityLocal
+	users28Mu.Unlock()
+
+	parsedUserInfoMu.Lock()
+	parsedUserInfoByToken = parsedInfoLocal
+	parsedUserInfoMu.Unlock()
 
 	// Compute joined / left based on short-token identity snapshot
 	joined := make([]string, 0)
@@ -3328,6 +3496,9 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 	}
 	users28Mu.Unlock()
 
+	if partialUsers28Update {
+		left = nil
+	}
 	sort.Strings(joined)
 	sort.Strings(left)
 	if len(joined) > 0 {
@@ -4249,6 +4420,8 @@ func (a *App) requestPlayerStrip(force bool) int {
 	stripScanActive = true
 	stripScanSessionID++
 	stripScanPageCount = 0
+	stripScanStartedAt = time.Now()
+	stripScanLastPacketAt = stripScanStartedAt
 	stripScanSeenItemIDs = map[int]struct{}{}
 	stripScanCounts = map[string]int{}
 	stripScanItemIDs = map[string][]int{}
@@ -4267,10 +4440,14 @@ func (a *App) requestPlayerStrip(force bool) int {
 func waitForStripScanCompletion(sessionID int, timeout time.Duration) bool {
 	log.Printf("[STRIP_WAIT] waiting for strip scan completion session=%d timeout=%s", sessionID, timeout)
 	deadline := time.Now().Add(timeout)
+	inactivityLimit := stripNextDelay + 1500*time.Millisecond
 	for time.Now().Before(deadline) {
 		stripScanMu.Lock()
 		active := stripScanActive
 		current := stripScanSessionID
+		lastPacketAt := stripScanLastPacketAt
+		startedAt := stripScanStartedAt
+		pages := stripScanPageCount
 		stripScanMu.Unlock()
 
 		if current > sessionID {
@@ -4281,6 +4458,14 @@ func waitForStripScanCompletion(sessionID int, timeout time.Duration) bool {
 			log.Printf("[STRIP_WAIT] session=%d complete: scan finished (active=false)", sessionID)
 			return true
 		}
+		if current == sessionID && active && pages > 0 && !lastPacketAt.IsZero() && time.Since(lastPacketAt) > inactivityLimit {
+			log.Printf("[STRIP_WAIT] session=%d inactive for %s after %d page(s); forcing finalize", sessionID, time.Since(lastPacketAt), pages)
+			return false
+		}
+		if current == sessionID && active && pages == 0 && !startedAt.IsZero() && time.Since(startedAt) > timeout {
+			log.Printf("[STRIP_WAIT] session=%d saw no strip pages within %s", sessionID, timeout)
+			return false
+		}
 
 		time.Sleep(150 * time.Millisecond)
 	}
@@ -4288,8 +4473,9 @@ func waitForStripScanCompletion(sessionID int, timeout time.Duration) bool {
 	stripScanMu.Lock()
 	active := stripScanActive
 	current := stripScanSessionID
+	pages := stripScanPageCount
 	stripScanMu.Unlock()
-	log.Printf("[STRIP_WAIT] timeout waiting for session=%d (current=%d active=%t)", sessionID, current, active)
+	log.Printf("[STRIP_WAIT] timeout waiting for session=%d (current=%d active=%t pages=%d)", sessionID, current, active, pages)
 	return false
 }
 
@@ -4518,6 +4704,7 @@ func handleStripPacket(a *App, e *g.Intercept) {
 	}
 	scanID := stripScanSessionID
 	stripScanPageCount++
+	stripScanLastPacketAt = time.Now()
 	currentPage := stripScanPageCount
 
 	firstMainID, pageRecords, classQtys, classItemIDs := parseStripInfoPageRaw(rawData)
@@ -4577,6 +4764,8 @@ func (a *App) finalizeStripScan(sessionID int, reason string) {
 	itemIDs := stripScanItemIDs
 	pagesScanned := stripScanPageCount
 	stripScanActive = false
+	stripScanLastPacketAt = time.Time{}
+	stripScanStartedAt = time.Time{}
 	stripScanMu.Unlock()
 	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] finalize session=%d reason=%s pages=%d", sessionID, reason, pagesScanned))
 
@@ -4971,7 +5160,20 @@ func (a *App) forceRefreshHandSnapshot(reason string) bool {
 	a.AddLogMsg(fmt.Sprintf("[STRIP_DEBUG] forced strip requested session=%d reason=%s", scanID, reason))
 	if ok := waitForStripScanCompletion(scanID, 20*time.Second); !ok {
 		a.AddLogMsg(fmt.Sprintf("[TRADE_HAND_SNAPSHOT] forced hand sync timeout (session=%d reason=%s)", scanID, reason))
-		return false
+		a.finalizeStripScan(scanID, "timeout fallback")
+
+		handItemsMu.Lock()
+		haveHand := len(currentHandItems) > 0
+		handItemsMu.Unlock()
+		if !haveHand {
+			a.AddLogMsg(fmt.Sprintf("[TRADE_HAND_SNAPSHOT] no hand items available after timeout (session=%d reason=%s); proceeding with empty snapshot", scanID, reason))
+			handItemsMu.Lock()
+			currentHandItems = []TradeItem{}
+			currentHandItemIDs = map[string][]int{}
+			handItemsMu.Unlock()
+		} else {
+			a.AddLogMsg(fmt.Sprintf("[TRADE_HAND_SNAPSHOT] using timeout fallback hand snapshot (session=%d reason=%s)", scanID, reason))
+		}
 	}
 
 	// Always overwrite with the latest current hand after a forced scan.
@@ -5401,7 +5603,11 @@ func isLikelyToken(s string) bool {
 }
 
 func (a *App) handleRoomReady(e *g.Intercept) {
+	roomMu.Lock()
+	roomReadySeen = true
+	roomMu.Unlock()
 	clearRoomUserCaches(a)
+	a.AddLogMsg("[ROOM_READY] room ready received")
 	a.AddLogMsg("[ROOM_USERS] cleared cached room users")
 	go requestRoomUsers(a)
 }
@@ -6507,6 +6713,10 @@ func (a *App) handleThrowDice(e *g.Intercept) {
 	logrus.WithFields(logrus.Fields{"raw_data": rawData}).Debug("Raw packet data")
 
 	diceData := strings.Fields(rawData)
+	if len(diceData) == 0 {
+		a.AddLogMsg("[DICE_SETUP] ignored THROW_DICE with empty payload")
+		return
+	}
 	diceIDStr := diceData[0]
 	diceID, err := strconv.Atoi(diceIDStr)
 	if err != nil {
@@ -6586,6 +6796,7 @@ func (a *App) handleDiceOff(e *g.Intercept) {
 	}
 
 	needEmit := false
+	setupCompletedNow := false
 	if existingDice == nil && len(diceList) < 5 {
 		if !diceSetupActive {
 			mutex.Unlock()
@@ -6595,11 +6806,22 @@ func (a *App) handleDiceOff(e *g.Intercept) {
 		diceList = append(diceList, newDice)
 		log.Printf("Dice %d added\n", diceID)
 		needEmit = true
+		if len(diceList) == 5 {
+			message := "Dice setup sucessful! Run :roll to confirm"
+			a.AddLogMsg(message)
+			diceSetupActive = false
+			casinoReady = true
+			setupCompletedNow = true
+		}
 	}
 	mutex.Unlock()
 
 	if needEmit {
 		a.emitDiceSetupUpdate()
+	}
+
+	if setupCompletedNow {
+		go a.openDealerAfterSetup("dice setup complete (dice off)")
 	}
 }
 

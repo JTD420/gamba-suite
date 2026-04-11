@@ -102,10 +102,46 @@ def normalize_detected_name(name: str) -> tuple[str, list[str]]:
         if name[i].isupper() and name[i + 1].islower():
             add(name[i + 1:])
 
+    # Strip obvious token-like garbage prefixes that appear when the parser
+    # starts too early inside the preceding short/token bytes. Example:
+    # RatWGCornHole -> CornHole.
+    m = re.match(r'^([A-Za-z]{3,6})([A-Z][a-z][A-Za-z0-9_-]{2,})$', name)
+    if m:
+        prefix, tail = m.groups()
+        upper_count = sum(1 for ch in prefix if ch.isupper())
+        lower_count = sum(1 for ch in prefix if ch.islower())
+        if upper_count >= 3 or (upper_count >= 2 and lower_count >= 1):
+            add(tail)
+
     if not aliases:
         aliases = [name]
     best = min(aliases, key=len)
     return best, aliases
+
+
+def is_plausible_room_index(value: int) -> bool:
+    return 1 <= value <= 5000
+
+
+def score_candidate(candidate: dict) -> tuple[int, int, int]:
+    name_len = len(candidate.get('name_bytes') or b'')
+    room_index = int(candidate.get('room_index') or 0)
+    short_bytes = candidate.get('short_token_bytes')
+    short_ok = bool(short_bytes) and len(short_bytes) == 2 and all(65 <= c <= 90 for c in short_bytes)
+    score = 0
+    if is_plausible_room_index(room_index):
+        score += 50
+    elif room_index > 0:
+        score -= 50
+    if short_ok:
+        score += 20
+    if 2 <= name_len <= 24:
+        score += 15
+    elif name_len > 32:
+        score -= 25
+    # Prefer candidates that start closer to the figure field only after the
+    # basic sanity checks above; this helps avoid glued prefixes.
+    return (score, -name_len, candidate.get('cand_adj', 0))
 
 
 def find_user_entries(data: bytes, window: int = 64):
@@ -217,9 +253,9 @@ def find_user_entries(data: bytes, window: int = 64):
             # fall back to the longest username overall.
             upper_candidates = [c for c in candidates if len(c['name_bytes']) > 0 and 65 <= c['name_bytes'][0] <= 90]
             if upper_candidates:
-                best = max(upper_candidates, key=lambda c: len(c['name_bytes']))
+                best = max(upper_candidates, key=score_candidate)
             else:
-                best = max(candidates, key=lambda c: len(c['name_bytes']))
+                best = max(candidates, key=score_candidate)
             adj_name_start = best['cand_adj']
             token_bytes = best['token_bytes']
             token_start_idx = best['cand_token_start']

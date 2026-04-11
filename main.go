@@ -43,6 +43,9 @@ var (
 	lastTradePartnerID                   int
 	lastTradePartnerName                 string
 	lastTradePartnerToken                string
+	stableTradePartnerID                 int
+	stableTradePartnerName               string
+	stableTradePartnerToken              string
 	tradeAutoFlowID                      int
 	tradeAutoAccepted                    bool
 	tradeAutoConfirmed                   bool
@@ -382,6 +385,39 @@ func (a *App) rejectTradeForLimitViolation(v *tradeLimitViolation) {
 	startTradeLimitMonitor(a, tradeLimitGracePeriod)
 }
 
+func normalizeUsers28Name(name string, tokenHex string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return name
+	}
+	if tokenHex != "" {
+		if tokenBytes, err := hex.DecodeString(tokenHex); err == nil {
+			tokenText := string(tokenBytes)
+			if strings.HasPrefix(name, tokenText) && len(name) > len(tokenText) {
+				return strings.TrimSpace(name[len(tokenText):])
+			}
+		}
+	}
+	if len(name) >= 5 {
+		prefix := name[:4]
+		tail := name[4:]
+		printable := true
+		for _, ch := range prefix {
+			if ch < 64 || ch > 125 {
+				printable = false
+				break
+			}
+		}
+		if printable && len(tail) > 0 {
+			r := rune(tail[0])
+			if r >= 'A' && r <= 'Z' {
+				return strings.TrimSpace(tail)
+			}
+		}
+	}
+	return name
+}
+
 type RoomIdentityEntry struct {
 	Name      string `json:"name"`
 	Token     string `json:"token"`
@@ -390,8 +426,7 @@ type RoomIdentityEntry struct {
 	RoomIndex int    `json:"roomIndex"`
 }
 
-// ParsedUsers28Result represents the JSON output produced by
-// scripts/parse_users28.py when invoked with --json.
+// ParsedUsers28Result represents the parsed USERS28 result built directly in Go.
 type ParsedUsers28Result struct {
 	Users  []ParsedUsers28User  `json:"users"`
 	Trades []ParsedUsers28Trade `json:"trades"`
@@ -407,6 +442,13 @@ type ParsedUsers28User struct {
 	RoomIndex    int                    `json:"room_index"`
 	FigureString string                 `json:"figureString"`
 	Motto        string                 `json:"motto"`
+	Gender       string                 `json:"gender"`
+	X            int                    `json:"x"`
+	Y            int                    `json:"y"`
+	Z            string                 `json:"z"`
+	PoolFigure   string                 `json:"poolFigure"`
+	BadgeCode    string                 `json:"badgeCode"`
+	EntityType   int                    `json:"entityType"`
 	FigureMatch  bool                   `json:"figure_match"`
 	MatchedAlias string                 `json:"matched_alias"`
 	Origins      map[string]interface{} `json:"origins"`
@@ -1926,6 +1968,10 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		dealerTradeWindowOpen = false
 		log.Printf("[TRADE_OPEN #%d] %s", tradeOpenCount, lastTradeOpen)
 		a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #%d] %s", tradeOpenCount, lastTradeOpen))
+		stableTradePartnerID = lastTradePartnerID
+		stableTradePartnerName = strings.TrimSpace(lastTradePartnerName)
+		stableTradePartnerToken = strings.TrimSpace(lastTradePartnerToken)
+		a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN_STABLE] name=%q id=%d token=%q", stableTradePartnerName, stableTradePartnerID, stableTradePartnerToken))
 
 		partnerName := strings.TrimSpace(lastTradePartnerName)
 		if partnerName == "" {
@@ -3359,6 +3405,9 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 
 	canonicalLocal := map[string]ParsedUsers28User{}
 	byTokenLocal := map[string]string{}
+	// Origins USERS28 sometimes yields one good room index followed by garbage for later users.
+	// When that happens, keep the valid index and infer subsequent nearby indices sequentially.
+	prevValidRoomIndex := 0
 	byIndexLocal := map[int]string{}
 	byShortLocal := map[string]string{}
 	roomIdentityLocal := map[string]RoomIdentityEntry{}
@@ -3387,11 +3436,33 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 			a.AddLogMsg(fmt.Sprintf("[USERS28_FIX] cleaned name %q -> %q figureMatch=%t alias=%q", rawName, name, u.FigureMatch, u.MatchedAlias))
 		}
 
-		// Determine chat index from short token if possible
-		chatIndex := 0
-		if idx, ok := chatIndexFromShortToken(short); ok && idx > 0 {
-			chatIndex = idx
+		roomIndex := u.RoomIndex
+		if !isPlausibleUsers28RoomIndex(roomIndex) {
+			if prevValidRoomIndex > 0 {
+				roomIndex = prevValidRoomIndex + 1
+				a.AddLogMsg(fmt.Sprintf("[USERS28_FIX] inferred room index %d for %q from previous valid index %d", roomIndex, name, prevValidRoomIndex))
+			} else {
+				roomIndex = 0
+			}
 		}
+		if roomIndex > 0 {
+			prevValidRoomIndex = roomIndex
+		}
+
+		// In Origins chat packets, the speaking index matches the room index.
+		// Do not derive this from short tokens like "R]" because that creates fake ids such as 1181.
+		chatIndex := 0
+		if isPlausibleUsers28RoomIndex(roomIndex) {
+			chatIndex = roomIndex
+		} else if isPlausibleUsers28RoomIndex(u.ChatID) {
+			chatIndex = u.ChatID
+		}
+		if short == "" && roomIndex > 0 {
+			short = shortTokenFromIndex(roomIndex)
+		}
+
+		u.RoomIndex = roomIndex
+		u.ChatID = chatIndex
 
 		// canonical key: prefer token_hex, otherwise a name-based key
 		key := token
@@ -3410,7 +3481,7 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 				"detected_name": rawName,
 				"token_hex":     u.TokenHex,
 				"short_token":   u.ShortToken,
-				"chat_id":       u.ChatID,
+				"chat_id":       chatIndex,
 				"room_index":    u.RoomIndex,
 				"figureString":  u.FigureString,
 				"motto":         u.Motto,
@@ -3420,10 +3491,10 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 			}
 		}
 
-		if u.RoomIndex > 0 {
+		if isPlausibleUsers28RoomIndex(u.RoomIndex) {
 			byIndexLocal[u.RoomIndex] = name
 		}
-		if chatIndex > 0 {
+		if isPlausibleUsers28RoomIndex(chatIndex) {
 			byIndexLocal[chatIndex] = name
 		}
 		if short != "" {
@@ -3432,18 +3503,18 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 				Name:      name,
 				Token:     token,
 				Short:     short,
-				ChatIndex: u.ChatID,
+				ChatIndex: chatIndex,
 				RoomIndex: u.RoomIndex,
 			}
 		}
 
 		a.AddLogMsg(fmt.Sprintf(
-			"[USERS28_PY] stored name=%q detected=%q roomIndex=%d chatID=%d short=%q token=%q figureMatch=%t alias=%q",
-			name, rawName, u.RoomIndex, u.ChatID, short, token, u.FigureMatch, u.MatchedAlias,
+			"[USERS28_PY] stored name=%q detected=%q roomIndex=%d chatID=%d short=%q token=%q gender=%q x=%d y=%d figureMatch=%t alias=%q",
+			name, rawName, u.RoomIndex, chatIndex, short, token, u.Gender, u.X, u.Y, u.FigureMatch, u.MatchedAlias,
 		))
 		log.Printf(
-			"[USERS28_PY] stored name=%q detected=%q roomIndex=%d chatID=%d short=%q token=%q figureMatch=%t alias=%q",
-			name, rawName, u.RoomIndex, u.ChatID, short, token, u.FigureMatch, u.MatchedAlias,
+			"[USERS28_PY] stored name=%q detected=%q roomIndex=%d chatID=%d short=%q token=%q gender=%q x=%d y=%d figureMatch=%t alias=%q",
+			name, rawName, u.RoomIndex, chatIndex, short, token, u.Gender, u.X, u.Y, u.FigureMatch, u.MatchedAlias,
 		)
 	}
 
@@ -3532,8 +3603,8 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 	for _, u := range parsed.Users {
 		cleanName := normalizeUsername(u.Name)
 		a.AddLogMsg(fmt.Sprintf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, u.TokenHex, u.ShortToken, cleanName, u.RoomIndex))
-		if chatIdx, ok := chatIndexFromShortToken(u.ShortToken); ok && chatIdx > 0 {
-			a.AddLogMsg(fmt.Sprintf("[USERS28_DEBUG] name=%q roomIndex=%d chatIndex=%d short=%q token=%q", cleanName, u.RoomIndex, chatIdx, u.ShortToken, u.TokenHex))
+		if isPlausibleUsers28RoomIndex(u.ChatID) {
+			a.AddLogMsg(fmt.Sprintf("[USERS28_DEBUG] name=%q roomIndex=%d chatIndex=%d short=%q token=%q", cleanName, u.RoomIndex, u.ChatID, u.ShortToken, u.TokenHex))
 		}
 	}
 }
@@ -3576,6 +3647,9 @@ func (a *App) resetDealerSessionState(reason string) {
 	lastTradePartnerID = 0
 	lastTradePartnerName = ""
 	lastTradePartnerToken = ""
+	stableTradePartnerID = 0
+	stableTradePartnerName = ""
+	stableTradePartnerToken = ""
 	gameBetItems = nil
 	lastAddItemWasOurs = false
 	lastTradeCoverageNotice = ""
@@ -3772,6 +3846,10 @@ func isPlausibleTradeRoomIndex(index int) bool {
 	return index > 0 && index <= 512
 }
 
+func isPlausibleUsers28RoomIndex(index int) bool {
+	return index > 0 && index <= 512
+}
+
 func lookupUsers28NameIndex(name string) (int, bool) {
 	needle := strings.ToLower(normalizeUsername(name))
 	if needle == "" {
@@ -3781,15 +3859,18 @@ func lookupUsers28NameIndex(name string) (int, bool) {
 	users28Mu.Lock()
 	defer users28Mu.Unlock()
 	for _, entry := range roomIdentityByShortToken {
-		if entry.ChatIndex > 0 && strings.ToLower(strings.TrimSpace(entry.Name)) == needle {
-			return entry.ChatIndex, true
-		}
-	}
-	for short, cachedName := range users28ByShortToken {
-		if strings.ToLower(strings.TrimSpace(cachedName)) != needle {
+		if strings.ToLower(strings.TrimSpace(entry.Name)) != needle {
 			continue
 		}
-		if idx, ok := chatIndexFromShortToken(short); ok && idx > 0 {
+		if isPlausibleUsers28RoomIndex(entry.ChatIndex) {
+			return entry.ChatIndex, true
+		}
+		if isPlausibleUsers28RoomIndex(entry.RoomIndex) {
+			return entry.RoomIndex, true
+		}
+	}
+	for idx, cachedName := range users28ByIndex {
+		if strings.ToLower(strings.TrimSpace(cachedName)) == needle && isPlausibleUsers28RoomIndex(idx) {
 			return idx, true
 		}
 	}
@@ -3920,8 +4001,15 @@ func lookupRoomIdentityByChatIndex(index int) (string, bool) {
 	users28Mu.Lock()
 	defer users28Mu.Unlock()
 
-	for short, entry := range roomIdentityByShortToken {
-		if idx, ok := chatIndexFromShortToken(short); ok && idx == index {
+	if name, ok := users28ByIndex[index]; ok {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			return name, true
+		}
+	}
+
+	for _, entry := range roomIdentityByShortToken {
+		if entry.ChatIndex == index || entry.RoomIndex == index {
 			name := strings.TrimSpace(entry.Name)
 			if name != "" {
 				return name, true
@@ -3956,6 +4044,45 @@ func shortTokenCandidates(token string) []string {
 // invokes the Python parser with --file <tmp> --json, returning typed
 // ParsedUsers28Result.
 func runUsers28PythonParser(a *App, packetData []byte) (*ParsedUsers28Result, error) {
+	entries := extractUsers28Entries(string(packetData))
+	if len(entries) > 0 {
+		result := &ParsedUsers28Result{
+			Users:  make([]ParsedUsers28User, 0, len(entries)),
+			Trades: []ParsedUsers28Trade{},
+		}
+		for _, entry := range entries {
+			cleanName := strings.TrimSpace(entry.Name)
+			if cleanName == "" {
+				continue
+			}
+			tokenHex := ""
+			if entry.Token != "" {
+				tokenHex = hex.EncodeToString([]byte(entry.Token))
+			}
+			shortToken := strings.TrimSpace(entry.ShortToken)
+			if shortToken == "" && entry.RoomIndex > 0 {
+				shortToken = shortTokenFromIndex(entry.RoomIndex)
+			}
+			result.Users = append(result.Users, ParsedUsers28User{
+				Name:         cleanName,
+				DetectedName: cleanName,
+				Aliases:      []string{cleanName},
+				TokenHex:     tokenHex,
+				ShortToken:   shortToken,
+				ChatID:       entry.RoomIndex,
+				RoomIndex:    entry.RoomIndex,
+			})
+		}
+		if len(result.Users) > 0 {
+			return result, nil
+		}
+	}
+
+	scriptPath := filepath.Join("scripts", "parse_users28.py")
+	if _, err := os.Stat(scriptPath); err != nil {
+		return nil, fmt.Errorf("users28 parser produced no users and %s is unavailable", scriptPath)
+	}
+
 	tmpFile, err := os.CreateTemp("", "users28_*.bin")
 	if err != nil {
 		return nil, err
@@ -3969,8 +4096,6 @@ func runUsers28PythonParser(a *App, packetData []byte) (*ParsedUsers28Result, er
 	}
 	tmpFile.Close()
 
-	// prefer pythonw on Windows to avoid flashing a console window, then
-	// fall back to python / python3.
 	py := "python"
 	if p, err := exec.LookPath("pythonw"); err == nil {
 		py = p
@@ -3982,7 +4107,7 @@ func runUsers28PythonParser(a *App, packetData []byte) (*ParsedUsers28Result, er
 		return nil, fmt.Errorf("python not found in PATH")
 	}
 
-	cmd := exec.Command(py, "scripts/parse_users28.py", "--file", tmpPath, "--json")
+	cmd := exec.Command(py, scriptPath, "--file", tmpPath, "--json")
 	cmd.Dir = "."
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -3998,7 +4123,6 @@ func runUsers28PythonParser(a *App, packetData []byte) (*ParsedUsers28Result, er
 	}
 
 	if a != nil && a.ctx != nil {
-		// Emit captured output to the frontend so the UI can show parser activity.
 		if stdout.Len() > 0 {
 			runtime.EventsEmit(a.ctx, "pyParserStdout", stdout.String())
 		}
@@ -4018,63 +4142,34 @@ func runUsers28PythonParser(a *App, packetData []byte) (*ParsedUsers28Result, er
 // runParseUsersScript invokes the Python helper to parse a USERS/TRade blob
 // and returns a map keyed by token_hex (or name) -> parsed JSON object.
 func runParseUsersScript(a *App, data []byte) (map[string]map[string]interface{}, error) {
-	// prefer pythonw on Windows to avoid flashing a console window, then
-	// fall back to python / python3.
-	py := "python"
-	if p, err := exec.LookPath("pythonw"); err == nil {
-		py = p
-	} else if p, err := exec.LookPath("python"); err == nil {
-		py = p
-	} else if p, err := exec.LookPath("python3"); err == nil {
-		py = p
-	} else {
-		return nil, fmt.Errorf("python not found in PATH")
-	}
-
-	hexArg := fmt.Sprintf("%x", data)
-	cmd := exec.Command(py, "scripts/parse_users28.py", "--hex", hexArg, "--json")
-	// run from repo root so script relative path resolves
-	cmd.Dir = "."
-	var outBuf bytes.Buffer
-	var errBuf bytes.Buffer
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
-	if err := cmd.Run(); err != nil {
-		a.AddLogMsg(fmt.Sprintf("[PY_PARSE] script failed: %v stderr=%s", err, errBuf.String()))
-		if a != nil && a.ctx != nil {
-			runtime.EventsEmit(a.ctx, "pyParserStdout", outBuf.String())
-			runtime.EventsEmit(a.ctx, "pyParserStderr", errBuf.String())
-		}
-		return nil, err
-	}
-
-	// Emit the parser output to the frontend for visibility when available.
-	if a != nil && a.ctx != nil {
-		if outBuf.Len() > 0 {
-			runtime.EventsEmit(a.ctx, "pyParserStdout", outBuf.String())
-		}
-		if errBuf.Len() > 0 {
-			runtime.EventsEmit(a.ctx, "pyParserStderr", errBuf.String())
-		}
-	}
-
-	var raw struct {
-		Users  []map[string]interface{} `json:"users"`
-		Trades []map[string]interface{} `json:"trades"`
-	}
-	if err := json.Unmarshal(outBuf.Bytes(), &raw); err != nil {
-		a.AddLogMsg(fmt.Sprintf("[PY_PARSE] json unmarshal failed: %v", err))
+	parsed, err := runUsers28PythonParser(a, data)
+	if err != nil {
 		return nil, err
 	}
 
 	res := map[string]map[string]interface{}{}
-	for _, u := range raw.Users {
-		if tok, ok := u["token_hex"].(string); ok && tok != "" {
-			res[tok] = u
-			continue
+	for _, u := range parsed.Users {
+		key := strings.TrimSpace(u.TokenHex)
+		if key == "" {
+			key = strings.ToLower(strings.TrimSpace(u.Name))
 		}
-		if name, ok := u["name"].(string); ok && name != "" {
-			res[name] = u
+		res[key] = map[string]interface{}{
+			"name":          u.Name,
+			"detected_name": u.DetectedName,
+			"aliases":       u.Aliases,
+			"token_hex":     u.TokenHex,
+			"short_token":   u.ShortToken,
+			"chat_id":       u.ChatID,
+			"room_index":    u.RoomIndex,
+			"figureString":  u.FigureString,
+			"motto":         u.Motto,
+			"gender":        u.Gender,
+			"x":             u.X,
+			"y":             u.Y,
+			"z":             u.Z,
+			"poolFigure":    u.PoolFigure,
+			"badgeCode":     u.BadgeCode,
+			"entityType":    u.EntityType,
 		}
 	}
 	return res, nil
@@ -4678,6 +4773,9 @@ func (a *App) reopenDealerIdle(reason string) {
 	lastTradePartnerID = 0
 	lastTradePartnerName = ""
 	lastTradePartnerToken = ""
+	stableTradePartnerID = 0
+	stableTradePartnerName = ""
+	stableTradePartnerToken = ""
 	gameBetItems = nil
 	a.emitActiveGameBetItemsUpdate()
 
@@ -5543,14 +5641,29 @@ func (a *App) sendTradeCompletionMessage() {
 	}
 
 	partnerName := normalizeUsername(strings.TrimSpace(lastTradePartnerName))
+	partnerID := lastTradePartnerID
+	partnerToken := strings.TrimSpace(lastTradePartnerToken)
+
+	if partnerID <= 0 && stableTradePartnerID > 0 {
+		partnerID = stableTradePartnerID
+	}
 	if partnerName == "" || strings.EqualFold(partnerName, "Unknown") {
-		if resolved, ok := lookupUsers28Index(lastTradePartnerID); ok {
+		if stableName := normalizeUsername(strings.TrimSpace(stableTradePartnerName)); stableName != "" {
+			partnerName = stableName
+		}
+	}
+	if partnerToken == "" {
+		partnerToken = strings.TrimSpace(stableTradePartnerToken)
+	}
+
+	if partnerName == "" || strings.EqualFold(partnerName, "Unknown") {
+		if resolved, ok := lookupUsers28Index(partnerID); ok {
 			partnerName = normalizeUsername(strings.TrimSpace(resolved))
 			lastTradePartnerName = partnerName
-		} else if resolved, ok := lookupUsers28Token(lastTradePartnerToken); ok {
+		} else if resolved, ok := lookupUsers28Token(partnerToken); ok {
 			partnerName = normalizeUsername(strings.TrimSpace(resolved))
 			lastTradePartnerName = partnerName
-		} else if resolved, ok := lookupRoomEntityNameByIndex(lastTradePartnerID); ok {
+		} else if resolved, ok := lookupRoomEntityNameByIndex(partnerID); ok {
 			partnerName = normalizeUsername(strings.TrimSpace(resolved))
 			lastTradePartnerName = partnerName
 		}
@@ -5558,6 +5671,11 @@ func (a *App) sendTradeCompletionMessage() {
 	if partnerName == "" || strings.EqualFold(partnerName, "Unknown") {
 		partnerName = "Player"
 	}
+	lastTradePartnerID = partnerID
+	if strings.TrimSpace(lastTradePartnerToken) == "" {
+		lastTradePartnerToken = partnerToken
+	}
+
 	a.AddLogMsg("[TRADE_FLOW] calling beginGameHistory")
 	a.beginGameHistory(partnerName, gameBetItems)
 	a.AddLogMsg("[TRADE_FLOW] beginGameHistory returned")
@@ -5567,24 +5685,28 @@ func (a *App) sendTradeCompletionMessage() {
 	awaitingGameChoice = true
 	gameChoiceUnreadableWarned = false
 	awaitingGameChoicePartnerName = normalizeUsername(strings.TrimSpace(lastTradePartnerName))
-	// Prefer the live room entity index for chat sender matching.
-	// First try the immediate room entity cache, otherwise wait briefly
-	// for a USERS28 update (which may arrive asynchronously) before
-	// falling back to the raw lastTradePartnerID.
-	if chatIdx, ok := lookupRoomEntityIndexByName(awaitingGameChoicePartnerName); ok && chatIdx > 0 {
-		awaitingGameChoicePartnerID = chatIdx
-	} else {
-		// Wait up to 900ms for USERS28 name->index mapping to arrive.
-		if chatIdx, ok := waitForUsers28NameIndex(awaitingGameChoicePartnerName, 900*time.Millisecond); ok && chatIdx > 0 {
-			awaitingGameChoicePartnerID = chatIdx
-		} else if chatIdx, ok := lookupUsers28NameIndex(awaitingGameChoicePartnerName); ok && chatIdx > 0 {
-			awaitingGameChoicePartnerID = chatIdx
-		} else {
-			awaitingGameChoicePartnerID = lastTradePartnerID
-		}
+	if awaitingGameChoicePartnerName == "" || strings.EqualFold(awaitingGameChoicePartnerName, "Unknown") {
+		awaitingGameChoicePartnerName = normalizeUsername(strings.TrimSpace(stableTradePartnerName))
 	}
 
-	// Start the game-choice timeout monitor to handle non-responsive partners.
+	awaitingGameChoicePartnerID = 0
+	if isPlausibleUsers28RoomIndex(lastTradePartnerID) {
+		awaitingGameChoicePartnerID = lastTradePartnerID
+	} else if isPlausibleUsers28RoomIndex(stableTradePartnerID) {
+		awaitingGameChoicePartnerID = stableTradePartnerID
+	}
+
+	if chatIdx, ok := lookupRoomEntityIndexByName(awaitingGameChoicePartnerName); ok && chatIdx > 0 {
+		awaitingGameChoicePartnerID = chatIdx
+	} else if chatIdx, ok := waitForUsers28RoomIndexByName(awaitingGameChoicePartnerName, 900*time.Millisecond); ok && chatIdx > 0 {
+		awaitingGameChoicePartnerID = chatIdx
+	} else if chatIdx, ok := lookupUsers28RoomIndexByName(awaitingGameChoicePartnerName); ok && chatIdx > 0 {
+		awaitingGameChoicePartnerID = chatIdx
+	}
+
+	a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE_DEBUG] partner=%q lastTradePartnerID=%d stableTradePartnerID=%d awaitingGameChoicePartnerID=%d",
+		awaitingGameChoicePartnerName, lastTradePartnerID, stableTradePartnerID, awaitingGameChoicePartnerID))
+
 	a.startGameChoiceTimeoutMonitor()
 
 	a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE] shouting: %q", first))
@@ -7907,6 +8029,16 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 				indexMatch = true
 				a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] accepted %q by index fallback (incoming=%d expected=%d partner=%q)", choice, index, awaitingGameChoicePartnerID, awaitingGameChoicePartnerName))
 			}
+		}
+	}
+	if !indexMatch && !nameMatch {
+		if awaitingGameChoice && awaitingGameChoicePartnerID == 0 && index > 0 && index <= 512 {
+			awaitingGameChoicePartnerID = index
+			if strings.TrimSpace(senderName) != "" && !strings.EqualFold(strings.TrimSpace(senderName), "Unknown") {
+				awaitingGameChoicePartnerName = normalizeUsername(strings.TrimSpace(senderName))
+			}
+			a.AddLogMsg(fmt.Sprintf("[GAME_SELECT_BIND] bound partner=%q to chat index %d from live chat", awaitingGameChoicePartnerName, awaitingGameChoicePartnerID))
+			indexMatch = true
 		}
 	}
 	if !indexMatch && !nameMatch {

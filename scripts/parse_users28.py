@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
-"""Parse a Habbo USERS (header 28) blob, extract usernames + tokens, and query Origins API.
+"""Debug parser for Habbo Origins USERS(28).
 
-Usage examples:
-  python scripts/parse_users28.py --hex "405c4b..."
-  python scripts/parse_users28.py --file users28.bin
+This is now optional/debug-only.
+The Go app should no longer depend on this script for live trade/chat identity.
 
-The script scans for field separators (\x02), validates that the following bytes look like
-known Habbo figure prefixes such as 'hd-', 'hr-', 'ch-', 'lg-' or 'sh-', extracts the
-username immediately before the figure field, reads the 4-byte token immediately before the
-username (adjusting for the uppercase marker rule), and pulls the in-packet figure string.
-It then queries the Origins public user API to compare the figureString and print results.
+It parses:
+[count:int]
+repeat count times:
+  [roomIndex:int]
+  [name:string]
+  [figure:string]
+  [gender:string]
+  [motto:string]
+  [x:int]
+  [y:int]
+  [z:string]
+  [poolFigure:string]
+  [badgeCode:string]
+  [entityType:int]
 """
-import re
 import argparse
 import binascii
 import json
+import re
 import sys
-import unicodedata
-from typing import Any
+from pathlib import Path
 
 
-# --- Shockwave encoding helpers (VL64 / B64) ---
 def vl64_decode_len(first_byte: int) -> int:
     return (first_byte >> 3) & 7
 
@@ -52,588 +58,115 @@ def b64_decode(b: bytes) -> int:
     return v
 
 
-
-
 def hex_from_hexdump(txt: str) -> bytes:
-    """Convert either a plain hex string or a hexdump (with offsets) into bytes."""
-    import re
-    # Try to find spaced hex byte pairs in the text (hexdump style)
     pairs = re.findall(r"\b[0-9a-fA-F]{2}\b", txt)
     if pairs:
         return bytes(int(x, 16) for x in pairs)
-    # Otherwise strip non-hex and decode
     cleaned = re.sub(r"[^0-9a-fA-F]", "", txt)
     if len(cleaned) % 2 == 1:
         cleaned = cleaned[:-1]
     return bytes.fromhex(cleaned)
 
 
-def is_likely_name_text(value: str) -> bool:
-    value = value.strip()
-    if len(value) < 1:
-        return False
-    if any(ord(ch) < 32 for ch in value):
-        return False
-    # Habbo names can contain more than simple alnum/_/-. Accept any visible
-    # non-control text and let the API decide the canonical match.
-    return "\x02" not in value
+class Reader:
+    def __init__(self, data: bytes):
+        self.data = data
+        self.pos = 0
+
+    def read_integer(self) -> int:
+        if self.pos >= len(self.data):
+            raise ValueError("integer: out of data")
+        n = vl64_decode_len(self.data[self.pos])
+        if n <= 0 or self.pos + n > len(self.data):
+            raise ValueError(f"integer: invalid length {n} at {self.pos}")
+        chunk = self.data[self.pos:self.pos+n]
+        self.pos += n
+        return vl64_decode(chunk)
+
+    def read_string(self) -> str:
+        end = self.data.find(b"\x02", self.pos)
+        if end == -1:
+            raise ValueError(f"string terminator not found from {self.pos}")
+        raw = self.data[self.pos:end]
+        self.pos = end + 1
+        return raw.decode("latin-1", errors="replace")
 
 
-def normalize_detected_name(name: str) -> tuple[str, list[str]]:
-    name = name.strip()
-    if not name:
-        return "", []
+def parse_users28(data: bytes):
+    if len(data) >= 2:
+        try:
+            if b64_decode(data[:2]) == 28:
+                data = data[2:]
+        except Exception:
+            pass
 
-    aliases = []
-    seen = set()
+    r = Reader(data)
+    count = r.read_integer()
+    users = []
+    for _ in range(count):
+        room_index = r.read_integer()
+        name = r.read_string()
+        figure = r.read_string()
+        gender = r.read_string()
+        motto = r.read_string()
+        x = r.read_integer()
+        y = r.read_integer()
+        z = r.read_string()
+        pool_figure = r.read_string()
+        badge_code = r.read_string()
+        entity_type = r.read_integer()
 
-    def add(candidate: str):
-        candidate = candidate.strip()
-        if not is_likely_name_text(candidate):
-            return
-        key = candidate.lower()
-        if key in seen:
-            return
-        seen.add(key)
-        aliases.append(candidate)
-
-    add(name)
-    for i in range(1, len(name) - 2):
-        prefix = name[:i]
-        if len(prefix) > 4:
-            continue
-        if not all(ch.islower() or ch.isdigit() or ch in '_-' for ch in prefix):
-            continue
-        if name[i].isupper() and name[i + 1].islower():
-            add(name[i + 1:])
-
-    # Strip obvious token-like garbage prefixes that appear when the parser
-    # starts too early inside the preceding short/token bytes. Example:
-    # RatWGCornHole -> CornHole.
-    m = re.match(r'^([A-Za-z]{3,6})([A-Z][a-z][A-Za-z0-9_-]{2,})$', name)
-    if m:
-        prefix, tail = m.groups()
-        upper_count = sum(1 for ch in prefix if ch.isupper())
-        lower_count = sum(1 for ch in prefix if ch.islower())
-        if upper_count >= 3 or (upper_count >= 2 and lower_count >= 1):
-            add(tail)
-
-    if not aliases:
-        aliases = [name]
-    best = min(aliases, key=len)
-    return best, aliases
-
-
-def is_plausible_room_index(value: int) -> bool:
-    return 1 <= value <= 5000
-
-
-def fallback_display_name(name: str, token_hex: str | None, room_index: int | None) -> str:
-    name = (name or "").strip()
-    if name:
-        return name
-    token_hex = (token_hex or "").strip()
-    if token_hex:
-        return f"unknown_{token_hex[:8]}"
-    if room_index and room_index > 0:
-        return f"unknown_room_{room_index}"
-    return "unknown_user"
-
-
-def score_candidate(candidate: dict) -> tuple[int, int, int]:
-    name_len = len(candidate.get('name_bytes') or b'')
-    room_index = int(candidate.get('room_index') or 0)
-    short_bytes = candidate.get('short_token_bytes')
-    short_ok = bool(short_bytes) and len(short_bytes) == 2 and all(65 <= c <= 90 for c in short_bytes)
-    score = 0
-    if is_plausible_room_index(room_index):
-        score += 50
-    elif room_index > 0:
-        score -= 50
-    if short_ok:
-        score += 20
-    if 2 <= name_len <= 24:
-        score += 15
-    elif name_len > 32:
-        score -= 25
-    # Prefer candidates that start closer to the figure field only after the
-    # basic sanity checks above; this helps avoid glued prefixes.
-    return (score, -name_len, candidate.get('cand_adj', 0))
-
-
-def find_user_entries(data: bytes, window: int = 64):
-    """Return list of detected entries with name, token, figureString and offsets."""
-    entries = []
-    seen = set()
-    figure_prefixes = (
-        b"hd-", b"hr-", b"ch-", b"lg-", b"sh-",
-        b"ha-", b"he-", b"ea-", b"fa-", b"ca-",
-        b"cc-", b"wa-", b"cp-"
-    )
-    name_pat = re.compile(r"([^\x00-\x1f\x02]{2,})$")
-    fallback_pat = re.compile(r"([^\x00-\x1f\x02]{1,})$")
-
-    for idx in range(len(data) - 4):
-        if data[idx] != 0x02:
-            continue
-        if not any(data[idx + 1:idx + 1 + len(prefix)] == prefix for prefix in figure_prefixes):
-            continue
-
-        name_end = idx  # the 0x02 that precedes the figure marker
-        pre_start = max(0, name_end - window)
-        window_bytes = data[pre_start:name_end]
-        window_str = window_bytes.decode("latin-1")
-
-        m = name_pat.search(window_str) or fallback_pat.search(window_str)
-        if not m:
-            continue
-
-        raw_name_start = pre_start + m.start(1)
-
-        # Try multiple candidate starts within the matched window in case
-        # preceding printable bytes confuse the marker-detection heuristic.
-        name = None
         token_hex = None
-        token_bytes = None
-        token_start_idx = None
-        short_token = None
-        chat_id = None
-        room_index = 0
+        if len(name) >= 5:
+            prefix = name[:4]
+            tail = name[4:]
+            if all(64 <= ord(c) <= 125 for c in prefix) and tail and tail[0].isupper():
+                token_hex = prefix.encode("latin-1").hex()
+                name = tail
 
-        # Try multiple candidate starts within the matched window in case
-        # preceding printable bytes confuse the marker-detection heuristic.
-        # Collect all valid candidates and pick the one that yields the
-        # longest username (to avoid splitting names like 'Fireman' into
-        # a token + short tail).
-        candidates = []
-        # Determine the contiguous run of name-like characters and test
-        # candidate starts from the right (closest to the hr- marker) leftwards.
-        run_start = name_end - 1
-        while run_start >= pre_start and 32 <= data[run_start] <= 126 and data[run_start] != 0x02:
-            run_start -= 1
-        run_start += 1
-
-        max_backtrack = min(32, name_end - run_start)
-        for offset in range(0, max_backtrack):
-            cand_raw = name_end - 2 - offset
-            if cand_raw < run_start:
-                break
-            cand_adj = cand_raw
-            if cand_raw + 1 < len(data) and (name_end - cand_raw) >= 3:
-                b0, b1 = data[cand_raw], data[cand_raw + 1]
-                if 65 <= b0 <= 90 and 65 <= b1 <= 90:
-                    cand_adj = cand_raw + 1
-
-            if cand_adj < 4:
-                continue
-
-            cand_token_start = cand_adj - 4
-            scan_start = max(0, cand_token_start - 6)
-            for start_off in range(scan_start, cand_token_start):
-                try:
-                    vlen = vl64_decode_len(data[start_off])
-                except Exception:
-                    continue
-                if vlen > 0 and vlen <= 6 and start_off + vlen == cand_token_start:
-                    try:
-                        v = vl64_decode(data[start_off:cand_token_start])
-                    except Exception:
-                        continue
-                    if v > 0:
-                        token_b = data[cand_token_start:cand_adj]
-                        name_b = data[cand_adj:name_end]
-                        sc = None
-                        chat = None
-                        if cand_token_start >= 2:
-                            sc = data[cand_token_start - 2:cand_token_start]
-                            if len(sc) == 2 and all(32 <= c <= 126 for c in sc):
-                                try:
-                                    chat = b64_decode(sc)
-                                except Exception:
-                                    chat = None
-                        candidates.append({
-                            'cand_adj': cand_adj,
-                            'cand_token_start': cand_token_start,
-                            'room_index': v,
-                            'token_bytes': token_b,
-                            'token_hex': binascii.hexlify(token_b).decode(),
-                            'name_bytes': name_b,
-                            'short_token_bytes': sc,
-                            'chat_id': chat,
-                        })
-                        break
-
-        if candidates:
-            # Prefer candidates whose username starts with an uppercase
-            # letter (more likely to be the real display name). Among
-            # those pick the one yielding the longest username. Otherwise
-            # fall back to the longest username overall.
-            upper_candidates = [c for c in candidates if len(c['name_bytes']) > 0 and 65 <= c['name_bytes'][0] <= 90]
-            if upper_candidates:
-                best = max(upper_candidates, key=score_candidate)
-            else:
-                best = max(candidates, key=score_candidate)
-            adj_name_start = best['cand_adj']
-            token_bytes = best['token_bytes']
-            token_start_idx = best['cand_token_start']
-            token_hex = best['token_hex']
-            room_index = best['room_index']
-            name_bytes = best['name_bytes']
-            if best['short_token_bytes'] is not None:
-                sc = best['short_token_bytes']
-                if len(sc) == 2 and all(32 <= c <= 126 for c in sc):
-                    short_token = sc.decode("latin-1", errors="replace")
-                    try:
-                        chat_id = b64_decode(sc)
-                    except Exception:
-                        chat_id = None
-            try:
-                name = name_bytes.decode("utf-8")
-            except Exception:
-                name = name_bytes.decode("latin-1", errors="replace")
-            name, aliases = normalize_detected_name(name)
-
-        if not candidates:
-            # Permissive fallback: accept visible name even if token/room not found
-            adj_name_start = raw_name_start
-            if raw_name_start + 1 < len(data):
-                b0, b1 = data[raw_name_start], data[raw_name_start + 1]
-                if 65 <= b0 <= 90 and 65 <= b1 <= 90:
-                    adj_name_start = raw_name_start + 1
-            name_bytes = data[adj_name_start:name_end]
-            try:
-                name = name_bytes.decode("utf-8")
-            except Exception:
-                name = name_bytes.decode("latin-1", errors="replace")
-            name, aliases = normalize_detected_name(name)
-
-        # Figure string: bytes from name_end+1 until next 0x02
-        figure = None
-        fig_start = name_end + 1
-        fig_end = data.find(b"\x02", fig_start)
-        if fig_end != -1 and fig_end > fig_start:
-            figure = data[fig_start:fig_end].decode("latin-1", errors="replace")
-
-        # Motto heuristic: skip a single 'm' marker (0x6d) if present,
-        # then read until the next 0x02 (optional)
-        motto = None
-        if fig_end != -1:
-            p = fig_end + 1
-            if p < len(data) and data[p] == 0x6d:  # 'm' marker
-                # skip marker and the following 0x02 if present
-                if p + 1 < len(data) and data[p + 1] == 0x02:
-                    mot_start = p + 2
-                    mot_end = data.find(b"\x02", mot_start)
-                    if mot_end != -1 and mot_end > mot_start:
-                        motto = data[mot_start:mot_end].decode("latin-1", errors="replace")
-            else:
-                mot_start = fig_end + 1
-                mot_end = data.find(b"\x02", mot_start)
-                if mot_end != -1 and mot_end > mot_start:
-                    motto = data[mot_start:mot_end].decode("latin-1", errors="replace")
-
-        # Short token is the two bytes immediately before the 4-byte token
-        # Use the discovered token_start_idx when available; otherwise rely on
-        # any short_token found during candidate scanning.
-        if short_token is None:
-            if 'token_start_idx' in locals() and token_start_idx is not None and token_start_idx >= 2:
-                short_candidate = data[token_start_idx - 2:token_start_idx]
-                if len(short_candidate) == 2 and all(32 <= c <= 126 for c in short_candidate):
-                    short_token = short_candidate.decode("latin-1", errors="replace")
-                    try:
-                        chat_id = b64_decode(short_candidate)
-                    except Exception:
-                        chat_id = None
-
-        name = fallback_display_name(name, token_hex, room_index)
-
-        key = (name, token_hex, room_index, name_end)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        entries.append({
+        users.append({
             "name": name,
-            "aliases": aliases,
-            "raw_name": data[adj_name_start:name_end].decode("latin-1", errors="replace"),
-            "raw_name_start": raw_name_start,
-            "adj_name_start": adj_name_start,
-            "name_end": name_end,
+            "detected_name": name,
+            "aliases": [name] if name else [],
             "token_hex": token_hex,
-            "token_bytes": token_bytes,
-            "short_token": short_token,
-            "chat_id": chat_id,
+            "short_token": None,
+            "chat_id": room_index,
             "room_index": room_index,
             "figureString": figure,
             "motto": motto,
+            "gender": gender,
+            "x": x,
+            "y": y,
+            "z": z,
+            "poolFigure": pool_figure,
+            "badgeCode": badge_code,
+            "entityType": entity_type,
+            "figure_match": False,
+            "matched_alias": None,
         })
-
-    return entries
-
-
-def find_trade_entries(data: bytes):
-    """Extract traded items from a TRADE packet blob.
-
-    Returns a list of dicts: {item, colors, field_index, fields, raw}
-    The function splits on 0x02 and searches each field for a lowercase
-    item token (e.g. 'redhologram'). It also captures a following
-    color palette field when present (comma-separated #RRGGBB values).
-    """
-    entries = []
-    try:
-        s = data.decode('latin-1')
-    except Exception:
-        s = data.decode('latin-1', errors='replace')
-
-    parts = s.split('\x02')
-    # require a minimum length (4 chars) to avoid short token false-positives
-    lower_re = re.compile(r'([a-z][a-z0-9_]{3,})')
-    color_re = re.compile(r'(?:#(?:[0-9A-Fa-f]{6})(?:,#(?:[0-9A-Fa-f]{6}))*)')
-
-    for i, p in enumerate(parts):
-        # skip the first field (usually the trade token/prefix)
-        if i == 0:
-            continue
-        m = lower_re.search(p)
-        if not m:
-            continue
-        item = m.group(1)
-        colors = None
-        # check the next field for a color palette
-        if i + 1 < len(parts) and '#' in parts[i + 1]:
-            # keep raw palette text
-            colors = parts[i + 1]
-        else:
-            cm = color_re.search(p)
-            if cm:
-                colors = cm.group(0)
-
-        entries.append({
-            'item': item,
-            'colors': colors,
-            'field_index': i,
-            'fields': parts,
-            'raw': s,
-        })
-
-    return entries
-
-
-def username_search_variants(username: str) -> list[str]:
-    username = (username or "").strip()
-    if not username:
-        return []
-
-    variants = []
-    seen = set()
-
-    def add(value: str):
-        value = (value or "").strip()
-        if not value or value in seen:
-            return
-        seen.add(value)
-        variants.append(value)
-
-    add(username)
-    add(unicodedata.normalize("NFC", username))
-    add(unicodedata.normalize("NFKC", username))
-    add(username.casefold())
-    add(username.lower())
-
-    trimmed = username.strip(" .,:;|/\\\"'`~!@#$%^&*()[]{}+=<>?")
-    if trimmed != username:
-        add(trimmed)
-        add(unicodedata.normalize("NFKC", trimmed))
-
-    return variants
-
-
-def _names_equal(left: str, right: str) -> bool:
-    return unicodedata.normalize("NFKC", (left or "")).casefold() == unicodedata.normalize("NFKC", (right or "")).casefold()
-
-
-def choose_best_origins_match(entry: dict, api_base: str = "https://origins.habbo.com/api/public/users"):
-    candidates = []
-    seen = set()
-
-    for base in [entry.get("name")] + list(entry.get("aliases") or []):
-        for variant in username_search_variants(base):
-            if variant in seen:
-                continue
-            seen.add(variant)
-            api = query_origins(variant, api_base=api_base)
-            if not api:
-                continue
-
-            packet_figure = (entry.get("figureString") or "").strip()
-            api_figure = (api.get("figureString") or "").strip()
-            figure_match = bool(packet_figure and api_figure and packet_figure == api_figure)
-            exact_name = _names_equal(api.get("name"), base)
-
-            score = 0
-            if figure_match:
-                score += 100
-            if exact_name:
-                score += 40
-            if _names_equal(api.get("name"), variant):
-                score += 20
-
-            candidates.append({
-                "candidate": variant,
-                "api": api,
-                "figure_match": figure_match,
-                "score": score,
-            })
-
-    if not candidates:
-        return None
-    return max(candidates, key=lambda item: item["score"])
-
-
-def query_origins(username: str, api_base: str = "https://origins.habbo.com/api/public/users"):
-    """Query the Origins public users endpoint. Returns parsed JSON or None."""
-    username = (username or "").strip()
-    if not username:
-        return None
-
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "habbo-users28-parser/1.0",
-    }
-
-    try:
-        import requests
-    except Exception:
-        from urllib import request, parse
-
-        query = parse.urlencode({"name": username}, quote_via=parse.quote, safe="")
-        url = f"{api_base}?{query}"
-        req = request.Request(url, headers=headers)
-        try:
-            with request.urlopen(req, timeout=10) as r:
-                if r.status == 200:
-                    return json.loads(r.read().decode("utf-8", errors="replace"))
-        except Exception:
-            return None
-        return None
-
-    try:
-        r = requests.get(api_base, params={"name": username}, headers=headers, timeout=8)
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        return None
-    return None
+    return {"users": users, "trades": []}
 
 
 def main():
-    p = argparse.ArgumentParser(description="Parse USERS(28) blob and query Origins API for usernames.")
-    p.add_argument("--hex", "-x", help="Hex string or hexdump text containing the packet")
-    p.add_argument("--file", "-f", help="Path to binary USERS28 packet file")
-    p.add_argument("--api", default="https://origins.habbo.com/api/public/users", help="Origins API base URL")
-    p.add_argument("--window", type=int, default=64, help="Bytes to look back when extracting username")
-    p.add_argument("--trade", action="store_true", help="Extract trade item(s) from packet and print them")
-    p.add_argument("--json", action="store_true", help="Output results as JSON (users + trades)")
+    p = argparse.ArgumentParser()
+    p.add_argument("--hex", "-x")
+    p.add_argument("--file", "-f")
+    p.add_argument("--json", action="store_true")
     args = p.parse_args()
 
     if args.hex:
         data = hex_from_hexdump(args.hex)
     elif args.file:
-        with open(args.file, "rb") as fh:
-            data = fh.read()
+        data = Path(args.file).read_bytes()
     else:
-        # Example sample (concise hex blob). Replace or pass --hex for real data.
-        SAMPLE_HEX = (
-            "405c4b4a615a774d466972656d616e0268722d3131352d313033352e68642d3138302d313032352e63682d3235352d313231382e6c672d3238302d313138392e73682d3330352d313236372e65612d313430342d31313839026d02533e206f73727320677020666f72206f726967696e730251415142302e30020202497374640273746402504148534e5041606d7b4d57656273656469740268722d3130352d313135352e68642d3139352d313031312e63682d3837372d313235352e6c672d3238312d313231332e73682d3330302d31323438026d020250415341302e30020202497374640273746402504148485141607f7b4d546f6d6164616368690268722d3130352d313034322e68642d3138352d313032352e63682d3231302d313238372e6c672d3238302d313238392e73682d3239302d31323632026d024f4320363433320250415341302e3002020249737464027374640250414848"
-        )
-        data = bytes.fromhex(SAMPLE_HEX)
+        print("Need --hex or --file", file=sys.stderr)
+        sys.exit(1)
 
-    entries = find_user_entries(data, window=args.window)
-    # If the user asked only for trade extraction, don't exit when no usernames
-    if not entries and not args.trade:
-        print("No username entries found.")
-        sys.exit(0)
-
-    if args.trade:
-        trades = find_trade_entries(data)
-        if not trades:
-            print("No trade items found.")
-        else:
-            for j, t in enumerate(trades, 1):
-                print(f"\nTrade {j}:")
-                print("  item:", t.get('item'))
-                print("  colors:", t.get('colors'))
-                print("  field_index:", t.get('field_index'))
-                # print the neighbouring fields for context
-                nearby = []
-                for k in range(max(0, t['field_index'] - 1), min(len(t['fields']), t['field_index'] + 3)):
-                    nearby.append(f"[{k}] {t['fields'][k]}")
-                print("  context:", " | ".join(nearby))
-
-    # JSON output mode: emit both parsed users and trades as JSON and exit
+    out = parse_users28(data)
     if args.json:
-        out = {"users": [], "trades": []}
-        # Prepare users (drop raw bytes, include token_hex)
-        for e in entries:
-            try:
-                best_match = choose_best_origins_match(e, api_base=args.api)
-            except Exception:
-                best_match = None
-
-            origins = best_match["api"] if best_match else None
-            canonical_name = e.get("name")
-            if origins and origins.get("name"):
-                canonical_name = origins.get("name")
-
-            ue = {
-                "name": fallback_display_name(canonical_name, e.get("token_hex"), e.get("room_index")),
-                "detected_name": e.get("name"),
-                "aliases": e.get("aliases") or [],
-                "raw_name": e.get("raw_name"),
-                "raw_name_start": e.get("raw_name_start"),
-                "adj_name_start": e.get("adj_name_start"),
-                "name_end": e.get("name_end"),
-                "token_hex": e.get("token_hex"),
-                "short_token": e.get("short_token"),
-                "chat_id": e.get("chat_id"),
-                "room_index": e.get("room_index"),
-                "figureString": e.get("figureString"),
-                "motto": e.get("motto"),
-                "figure_match": bool(best_match and best_match.get("figure_match")),
-                "matched_alias": best_match.get("candidate") if best_match else None,
-            }
-            if origins:
-                ue["origins"] = origins
-            out["users"].append(ue)
-
-        trades_list = find_trade_entries(data)
-        for t in trades_list:
-            out["trades"].append({"item": t.get("item"), "colors": t.get("colors"), "field_index": t.get("field_index")})
-
         print(json.dumps(out, ensure_ascii=False))
-        sys.exit(0)
-
-    for i, e in enumerate(entries, 1):
-        print(f"\nEntry {i}:")
-        print("  detected_name:", e.get('name'))
-        print("  aliases:", ", ".join(e.get('aliases') or []))
-        print("  room_index:", e.get('room_index'))
-        print("  chat_id:", e.get('chat_id'))
-        print("  short_token:", e.get('short_token'))
-        print("  token_hex:", e.get('token_hex'))
-        print("  figureString(packet):", e.get('figureString'))
-        print("  motto(packet):", e.get('motto'))
-        best_match = choose_best_origins_match(e, api_base=args.api)
-        if best_match:
-            api = best_match.get("api") or {}
-            print("  Origins API: found")
-            print("   matched_alias:", best_match.get("candidate"))
-            print("   uniqueId:", api.get("uniqueId"))
-            print("   name:", api.get("name"))
-            print("   figureString(api):", api.get("figureString"))
-            print("   figure match:", best_match.get("figure_match"))
-        else:
-            print("  Origins API: not found or request failed")
+    else:
+        print(json.dumps(out, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

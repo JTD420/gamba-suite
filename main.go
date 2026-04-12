@@ -1077,9 +1077,12 @@ func (a *App) setCurrentGameHistoryGame(game string) {
 	a.AddLogMsg("[GAME_HISTORY] setCurrentGameHistoryGame start")
 	a.gameHistoryMu.Lock()
 	if !a.updateCurrentGameHistoryLocked(func(entry *GameHistoryEntry) {
+		changed := !strings.EqualFold(strings.TrimSpace(entry.Game), strings.TrimSpace(game))
 		entry.Game = game
 		entry.Status = "In Progress"
-		entry.Notes = append(entry.Notes, fmt.Sprintf("Game selected: %s", game))
+		if changed {
+			entry.Notes = append(entry.Notes, fmt.Sprintf("Game selected: %s", game))
+		}
 	}) {
 		a.gameHistoryMu.Unlock()
 		return
@@ -1740,10 +1743,15 @@ func handleTradePacket(a *App, e *g.Intercept) {
 				payoutPred = append(payoutPred, TradeItem{Name: it.Name, Quantity: it.Quantity * 2, RawData: it.RawData})
 			}
 			if len(payoutPred) > 0 {
-				a.captureCurrentGameHistoryPayoutItems(payoutPred, "Predicted payout (2x bet)", true)
+				// Keep the round open after the bet trade completes. At this point the
+				// player still has to choose a game and the app still needs to record the
+				// actual game, winner and results. We only persist a predicted payout so
+				// the history modal can show the expected return while the round is live.
+				a.captureCurrentGameHistoryPayoutItems(payoutPred, "Predicted payout (2x bet)", false)
 			} else {
-				// Still mark history complete even if no payout items were found
-				a.captureCurrentGameHistoryPayoutItems([]TradeItem{}, "No payout items recorded", true)
+				// Do not complete the round here. A missing prediction should not clear
+				// currentGameHistoryID before the game result is recorded.
+				a.captureCurrentGameHistoryPayoutItems([]TradeItem{}, "No payout items recorded yet", false)
 			}
 			go func() {
 				if ok := a.forceRefreshHandSnapshot("trade completed"); ok {

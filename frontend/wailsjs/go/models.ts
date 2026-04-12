@@ -92,39 +92,21 @@ export namespace main {
 	        this.tradeConfirmTimeouts = source["tradeConfirmTimeouts"];
 	    }
 	}
-	export class StreakStats {
-	    currentDealerWinStreak: number;
-	    currentPlayerWinStreak: number;
-	    longestDealerWinStreak: number;
-	    longestPlayerWinStreak: number;
-	
-	    static createFrom(source: any = {}) {
-	        return new StreakStats(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.currentDealerWinStreak = source["currentDealerWinStreak"];
-	        this.currentPlayerWinStreak = source["currentPlayerWinStreak"];
-	        this.longestDealerWinStreak = source["longestDealerWinStreak"];
-	        this.longestPlayerWinStreak = source["longestPlayerWinStreak"];
-	    }
-	}
 	export class PlayerStats {
 	    playerName: string;
 	    totalRounds: number;
 	    playerWins: number;
 	    dealerWins: number;
-	    issueRounds: number;
+	    playerWinRate: number;
 	    betItemsIn: number;
 	    payoutItemsOut: number;
 	    netAgainstCasino: number;
+	    averageNetPerGame: number;
+	    isProfitable: boolean;
 	    byGameRounds: Record<string, number>;
-	    playerWinRate: number;
-	    issueRatePercent: number;
-	    averageBetSize: number;
-	    averagePayoutSize: number;
-	    netSharePercent: number;
+	    byGameWins: Record<string, number>;
+	    byGameLosses: Record<string, number>;
+	    byGameWinRate: Record<string, number>;
 	
 	    static createFrom(source: any = {}) {
 	        return new PlayerStats(source);
@@ -136,16 +118,16 @@ export namespace main {
 	        this.totalRounds = source["totalRounds"];
 	        this.playerWins = source["playerWins"];
 	        this.dealerWins = source["dealerWins"];
-	        this.issueRounds = source["issueRounds"];
+	        this.playerWinRate = source["playerWinRate"];
 	        this.betItemsIn = source["betItemsIn"];
 	        this.payoutItemsOut = source["payoutItemsOut"];
 	        this.netAgainstCasino = source["netAgainstCasino"];
+	        this.averageNetPerGame = source["averageNetPerGame"];
+	        this.isProfitable = source["isProfitable"];
 	        this.byGameRounds = source["byGameRounds"];
-	        this.playerWinRate = source["playerWinRate"];
-	        this.issueRatePercent = source["issueRatePercent"];
-	        this.averageBetSize = source["averageBetSize"];
-	        this.averagePayoutSize = source["averagePayoutSize"];
-	        this.netSharePercent = source["netSharePercent"];
+	        this.byGameWins = source["byGameWins"];
+	        this.byGameLosses = source["byGameLosses"];
+	        this.byGameWinRate = source["byGameWinRate"];
 	    }
 	}
 	export class ItemStats {
@@ -153,12 +135,14 @@ export namespace main {
 	    betIn: number;
 	    payoutOut: number;
 	    net: number;
+	    gamesPlayed: number;
+	    casinoWins: number;
+	    casinoLosses: number;
+	    casinoWinRate: number;
+	    status: string;
 	    byGameBetIn: Record<string, number>;
 	    byGamePayoutOut: Record<string, number>;
 	    byGameNet: Record<string, number>;
-	    betSharePercent: number;
-	    payoutSharePercent: number;
-	    netSharePercent: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new ItemStats(source);
@@ -170,12 +154,14 @@ export namespace main {
 	        this.betIn = source["betIn"];
 	        this.payoutOut = source["payoutOut"];
 	        this.net = source["net"];
+	        this.gamesPlayed = source["gamesPlayed"];
+	        this.casinoWins = source["casinoWins"];
+	        this.casinoLosses = source["casinoLosses"];
+	        this.casinoWinRate = source["casinoWinRate"];
+	        this.status = source["status"];
 	        this.byGameBetIn = source["byGameBetIn"];
 	        this.byGamePayoutOut = source["byGamePayoutOut"];
 	        this.byGameNet = source["byGameNet"];
-	        this.betSharePercent = source["betSharePercent"];
-	        this.payoutSharePercent = source["payoutSharePercent"];
-	        this.netSharePercent = source["netSharePercent"];
 	    }
 	}
 	export class GameStats {
@@ -185,22 +171,14 @@ export namespace main {
 	    issueRounds: number;
 	    playerWins: number;
 	    dealerWins: number;
-	    pushes: number;
 	    playerWinRate: number;
 	    dealerWinRate: number;
 	    totalBetItemsIn: number;
 	    totalPayoutItemsOut: number;
 	    netItems: number;
-	    averageBetSize: number;
-	    issueRatePercent: number;
 	    rtpPercent: number;
-	    profitMarginPercent: number;
-	    payoutSuccessPercent: number;
-	    averagePayoutSize: number;
+	    casinoEdgePercent: number;
 	    averageNetPerRound: number;
-	    roundSharePercent: number;
-	    profitSharePercent: number;
-	    healthLabel: string;
 	    largestBet: number;
 	    largestPayout: number;
 	    worstCasinoLoss: number;
@@ -221,22 +199,14 @@ export namespace main {
 	        this.issueRounds = source["issueRounds"];
 	        this.playerWins = source["playerWins"];
 	        this.dealerWins = source["dealerWins"];
-	        this.pushes = source["pushes"];
 	        this.playerWinRate = source["playerWinRate"];
 	        this.dealerWinRate = source["dealerWinRate"];
 	        this.totalBetItemsIn = source["totalBetItemsIn"];
 	        this.totalPayoutItemsOut = source["totalPayoutItemsOut"];
 	        this.netItems = source["netItems"];
-	        this.averageBetSize = source["averageBetSize"];
-	        this.issueRatePercent = source["issueRatePercent"];
 	        this.rtpPercent = source["rtpPercent"];
-	        this.profitMarginPercent = source["profitMarginPercent"];
-	        this.payoutSuccessPercent = source["payoutSuccessPercent"];
-	        this.averagePayoutSize = source["averagePayoutSize"];
+	        this.casinoEdgePercent = source["casinoEdgePercent"];
 	        this.averageNetPerRound = source["averageNetPerRound"];
-	        this.roundSharePercent = source["roundSharePercent"];
-	        this.profitSharePercent = source["profitSharePercent"];
-	        this.healthLabel = source["healthLabel"];
 	        this.largestBet = source["largestBet"];
 	        this.largestPayout = source["largestPayout"];
 	        this.worstCasinoLoss = source["worstCasinoLoss"];
@@ -252,7 +222,6 @@ export namespace main {
 	    issueRounds: number;
 	    playerWins: number;
 	    dealerWins: number;
-	    pushes: number;
 	    playerWinRate: number;
 	    dealerWinRate: number;
 	    issueRate: number;
@@ -261,15 +230,8 @@ export namespace main {
 	    netItems: number;
 	    rtpPercent: number;
 	    profitMarginPercent: number;
-	    financiallyCountableRounds: number;
-	    completedRoundPercent: number;
-	    payoutSuccessPercent: number;
-	    payoutFailurePercent: number;
-	    averageBetSize: number;
-	    averagePayoutSize: number;
+	    casinoEdgePercent: number;
 	    averageNetPerRound: number;
-	    averageRoundsPerDay: number;
-	    averageRoundDurationS: number;
 	    uniquePlayers: number;
 	    bestGameByNet: string;
 	    worstGameByNet: string;
@@ -294,7 +256,6 @@ export namespace main {
 	        this.issueRounds = source["issueRounds"];
 	        this.playerWins = source["playerWins"];
 	        this.dealerWins = source["dealerWins"];
-	        this.pushes = source["pushes"];
 	        this.playerWinRate = source["playerWinRate"];
 	        this.dealerWinRate = source["dealerWinRate"];
 	        this.issueRate = source["issueRate"];
@@ -303,15 +264,8 @@ export namespace main {
 	        this.netItems = source["netItems"];
 	        this.rtpPercent = source["rtpPercent"];
 	        this.profitMarginPercent = source["profitMarginPercent"];
-	        this.financiallyCountableRounds = source["financiallyCountableRounds"];
-	        this.completedRoundPercent = source["completedRoundPercent"];
-	        this.payoutSuccessPercent = source["payoutSuccessPercent"];
-	        this.payoutFailurePercent = source["payoutFailurePercent"];
-	        this.averageBetSize = source["averageBetSize"];
-	        this.averagePayoutSize = source["averagePayoutSize"];
+	        this.casinoEdgePercent = source["casinoEdgePercent"];
 	        this.averageNetPerRound = source["averageNetPerRound"];
-	        this.averageRoundsPerDay = source["averageRoundsPerDay"];
-	        this.averageRoundDurationS = source["averageRoundDurationS"];
 	        this.uniquePlayers = source["uniquePlayers"];
 	        this.bestGameByNet = source["bestGameByNet"];
 	        this.worstGameByNet = source["worstGameByNet"];
@@ -349,7 +303,6 @@ export namespace main {
 	    byGame: Record<string, GameStats>;
 	    byItem: ItemStats[];
 	    byPlayer: PlayerStats[];
-	    streaks: StreakStats;
 	    issues: IssueStats;
 	    trends: TrendStats;
 	
@@ -365,7 +318,6 @@ export namespace main {
 	        this.byGame = this.convertValues(source["byGame"], GameStats, true);
 	        this.byItem = this.convertValues(source["byItem"], ItemStats);
 	        this.byPlayer = this.convertValues(source["byPlayer"], PlayerStats);
-	        this.streaks = this.convertValues(source["streaks"], StreakStats);
 	        this.issues = this.convertValues(source["issues"], IssueStats);
 	        this.trends = this.convertValues(source["trends"], TrendStats);
 	    }
@@ -438,7 +390,6 @@ export namespace main {
 	        this.nothing = source["nothing"];
 	    }
 	}
-	
 	
 	export class TradeItem {
 	    Name: string;

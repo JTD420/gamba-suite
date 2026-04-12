@@ -123,6 +123,10 @@ var (
 	tradeLimitMonitorDeadline time.Time
 	tradeLimitGracePeriod     = 30 * time.Second
 	lastTradeLimitNotice      string
+	// Rate-limiting for public shouts triggered by trade coverage/limit
+	lastTradeCoverageShoutAt time.Time
+	lastTradeLimitShoutAt    time.Time
+	tradeShoutCooldown       = 45 * time.Second
 	// Whether the partner has accepted during the current open trade.
 	// Keep this sticky until the trade closes so we can re-arm auto-accept
 	// after temporary limit violations are corrected without forcing the
@@ -364,17 +368,22 @@ func (a *App) rejectTradeForLimitViolation(v *tradeLimitViolation) {
 	}
 	msg := formatTradeLimitViolationMessage(v)
 	a.AddLogMsg("[TRADE_LIMIT] " + msg)
-	// Decide whether to shout. Always shout for quantity violations so the
-	// player is informed each time they push an over-limit quantity. For
-	// unique-item violations we may still dedupe by message text.
-	shouldShout := v.TooMuchQuantity || msg != lastTradeLimitNotice
+	// Decide whether to shout. Prefer to dedupe by message text but also
+	// enforce a cooldown so repeated partner changes don't spam public chat
+	// and trigger self-mute. We still log the event regardless.
+	changed := msg != lastTradeLimitNotice
 	lastTradeLimitNotice = msg
 
-	if shouldShout {
+	now := time.Now()
+	allowed := lastTradeLimitShoutAt.IsZero() || now.Sub(lastTradeLimitShoutAt) > tradeShoutCooldown
+	if (v.TooMuchQuantity || changed) && allowed {
+		lastTradeLimitShoutAt = now
 		go func(m string) {
 			time.Sleep(350 * time.Millisecond)
 			ext.Send(out.SHOUT, m)
 		}(msg)
+	} else {
+		a.AddLogMsg("[TRADE_LIMIT] shout suppressed by cooldown/suppression")
 	}
 
 	// Start a short-lived grace timer instead of closing immediately so the
@@ -4339,9 +4348,19 @@ func (a *App) extractTradeItemAndQuantity(field string) (string, int, bool) {
 
 	if match := stripItemNameRe.FindString(field); match != "" {
 		a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] fallback strict matched=%q inside=%q", match, field))
-		if name, qty, ok := a.normalizeTradeFieldClassWithQty(match); ok {
-			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS_PARSE_FALLBACK] matched %q inside %q", match, field))
-			return name, qty, true
+		// Try to accept a strict pattern match even when it isn't yet known
+		// in the catalog or current hand. This helps detect incoming items
+		// that the dealer doesn't have (e.g., petals) so shortage logic can
+		// close the trade promptly instead of silently ignoring the field.
+		if normalized, ok := normalizeClassKeyWithVariant(match); ok {
+			// Prefer the verified path when available (catalog/hand check).
+			if name, qty, ok2 := a.normalizeTradeFieldClassWithQty(match); ok2 {
+				a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS_PARSE_FALLBACK] matched %q inside %q (verified)", match, field))
+				return name, qty, true
+			}
+			// Accept the unverified normalized class to allow shortage detection.
+			a.AddLogMsg(fmt.Sprintf("[TRADE_ITEMS_PARSE_FALLBACK] strict fallback accepted %q inside %q (unverified)", normalized, field))
+			return normalized, 1, true
 		}
 		a.AddLogMsg(fmt.Sprintf("[TRADE_PARSE_DEBUG] fallback strict match %q rejected by normalisation/raw-check", match))
 	}
@@ -5444,6 +5463,15 @@ func (a *App) notifyTradeQuantityCoverage() {
 	lastTradeCoverageNotice = msg
 	lastTradeBlockNotice = msg
 
+	// Rate-limit public shouts so repeated incoming updates don't spam chat.
+	now := time.Now()
+	shouldShout := changed && (lastTradeCoverageShoutAt.IsZero() || now.Sub(lastTradeCoverageShoutAt) > tradeShoutCooldown)
+	if shouldShout {
+		lastTradeCoverageShoutAt = now
+	} else {
+		a.AddLogMsg("[TRADE_COVERAGE] shout suppressed by cooldown")
+	}
+
 	partnerName := strings.TrimSpace(lastTradePartnerName)
 	if partnerName == "" {
 		partnerName = "Player"
@@ -5451,8 +5479,8 @@ func (a *App) notifyTradeQuantityCoverage() {
 
 	a.AddLogMsg(fmt.Sprintf("[TRADE_COVERAGE] immediate shortage close with %s: %s", partnerName, msg))
 
-	go func(m string) {
-		if changed {
+	go func(m string, shout bool) {
+		if shout {
 			time.Sleep(350 * time.Millisecond)
 			ext.Send(out.SHOUT, m)
 		}
@@ -5462,7 +5490,7 @@ func (a *App) notifyTradeQuantityCoverage() {
 
 		time.Sleep(1500 * time.Millisecond)
 		a.reopenDealerIdle("insufficient hand stock")
-	}(msg)
+	}(msg, shouldShout)
 
 	a.noteCurrentGameHistory("Trade closed immediately because dealer hand could not cover payout")
 }

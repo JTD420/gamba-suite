@@ -398,8 +398,8 @@
           </div>
           <div class="stat-card">
             <div class="stat-icon">✅</div>
-            <div class="stat-label">Completed %</div>
-            <div class="stat-value">{{ formatNumber(activeStats.overall.completedRoundPercent || 0, 2) }}%</div>
+            <div class="stat-label">Completed Rounds</div>
+            <div class="stat-value">{{ activeStats.overall.completedRounds || 0 }}</div>
           </div>
           <div class="stat-card">
             <div class="stat-icon">💰</div>
@@ -411,12 +411,12 @@
           <div class="stat-card">
             <div class="stat-icon">🎯</div>
             <div class="stat-label">RTP %</div>
-            <div class="stat-value">{{ formatNumber(activeStats.overall.rtpPercent || 0, 2) }}</div>
+            <div class="stat-value">{{ formatNumber(activeStats.overall.rtpPercent || 0, 2) }}%</div>
           </div>
           <div class="stat-card">
             <div class="stat-icon">📈</div>
-            <div class="stat-label">Profit Margin %</div>
-            <div class="stat-value">{{ formatNumber(activeStats.overall.profitMarginPercent || 0, 2) }}%</div>
+            <div class="stat-label">Casino Edge %</div>
+            <div class="stat-value">{{ formatNumber(activeStats.overall.casinoEdgePercent || 0, 2) }}%</div>
           </div>
           <div class="stat-card">
             <div class="stat-icon">👥</div>
@@ -424,14 +424,14 @@
             <div class="stat-value">{{ activeStats.overall.uniquePlayers || 0 }}</div>
           </div>
           <div class="stat-card">
-            <div class="stat-icon">🎲</div>
-            <div class="stat-label">Avg Bet</div>
-            <div class="stat-value">{{ formatNumber(activeStats.overall.averageBetSize || 0, 2) }}</div>
+            <div class="stat-icon">🏆</div>
+            <div class="stat-label">Best Game</div>
+            <div class="stat-value stat-value-small">{{ activeStats.overall.bestGameByNet || '—' }}</div>
           </div>
           <div class="stat-card">
-            <div class="stat-icon">🏷️</div>
-            <div class="stat-label">Avg Payout</div>
-            <div class="stat-value">{{ formatNumber(activeStats.overall.averagePayoutSize || 0, 2) }}</div>
+            <div class="stat-icon">⚠️</div>
+            <div class="stat-label">Worst Game</div>
+            <div class="stat-value stat-value-small">{{ activeStats.overall.worstGameByNet || '—' }}</div>
           </div>
         </div>
 
@@ -447,20 +447,20 @@
             <div class="stat-value">{{ formatNumber(activeStats.overall.playerWinRate || 0, 2) }}%</div>
           </div>
           <div class="stat-card small">
-            <div class="stat-label">Payout Success %</div>
-            <div class="stat-value">{{ formatNumber(activeStats.overall.payoutSuccessPercent || 0, 2) }}%</div>
-          </div>
-          <div class="stat-card small">
-            <div class="stat-label">Payout Failure %</div>
-            <div class="stat-value">{{ formatNumber(activeStats.overall.payoutFailurePercent || 0, 2) }}%</div>
+            <div class="stat-label">Issue Rate %</div>
+            <div class="stat-value">{{ formatNumber(activeStats.overall.issueRate || 0, 2) }}%</div>
           </div>
           <div class="stat-card small">
             <div class="stat-label">Avg Net / Round</div>
             <div class="stat-value">{{ formatNumber(activeStats.overall.averageNetPerRound || 0, 2) }}</div>
           </div>
           <div class="stat-card small">
-            <div class="stat-label">Avg Rounds / Day</div>
-            <div class="stat-value">{{ formatNumber(activeStats.overall.averageRoundsPerDay || 0, 2) }}</div>
+            <div class="stat-label">Best Item</div>
+            <div class="stat-value stat-value-small">{{ formatItemName(activeStats.overall.bestItemByNet || '') || '—' }}</div>
+          </div>
+          <div class="stat-card small">
+            <div class="stat-label">Worst Item</div>
+            <div class="stat-value stat-value-small">{{ formatItemName(activeStats.overall.worstItemByNet || '') || '—' }}</div>
           </div>
         </div>
 
@@ -470,34 +470,36 @@
           <div v-for="g in ['Poker','21','13','Tri']" :key="g" class="game-card small stats-game-card">
             <div class="game-card-title">{{ g }}</div>
             <div class="game-card-summary">Rounds: {{ (activeStats.byGame && activeStats.byGame[g]) ? activeStats.byGame[g].totalRounds : 0 }}</div>
-            <div class="game-card-summary">Player %: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].playerWinRate || 0,2) + '%' : '0%' }}</div>
-            <div class="game-card-summary">Dealer %: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].dealerWinRate || 0,2) + '%' : '0%' }}</div>
-            <div class="game-card-summary">Issue %: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].issueRatePercent || 0,2) + '%' : '0%' }}</div>
-            <div class="game-card-summary">RTP %: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].rtpPercent || 0,2) + '%' : '0%' }}</div>
+            <div class="game-card-summary">Player Win %: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].playerWinRate || 0, 2) + '%' : '0%' }}</div>
+            <div class="game-card-summary">Dealer Win %: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].dealerWinRate || 0, 2) + '%' : '0%' }}</div>
+            <div class="game-card-summary">RTP %: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].rtpPercent || 0, 2) + '%' : '0%' }}</div>
+            <div class="game-card-summary">Edge %: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].casinoEdgePercent || 0, 2) + '%' : '0%' }}</div>
+            <div class="game-card-summary">Avg Net / Round: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].averageNetPerRound || 0, 2) : '0.00' }}</div>
             <div class="game-card-summary net-badge" :class="(activeStats.byGame && activeStats.byGame[g] && activeStats.byGame[g].netItems >= 0) ? 'positive' : 'negative'">
               <span>{{ (activeStats.byGame && activeStats.byGame[g]) ? formatSigned(activeStats.byGame[g].netItems) : '0' }}</span>
             </div>
-            <div class="game-card-summary">Avg Bet: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].averageBetSize || 0,2) : '0' }}</div>
-            <div class="game-card-summary">Avg Payout: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].averagePayoutSize || 0,2) : '0' }}</div>
-            <div class="game-card-summary">Health: {{ (activeStats.byGame && activeStats.byGame[g]) ? (activeStats.byGame[g].healthLabel || 'Neutral') : 'Neutral' }}</div>
           </div>
         </div>
 
         <!-- Item Performance Table -->
         <h3 class="section-title">Item Performance</h3>
         <table class="catalog-table stats-table">
-          <thead><tr><th>Item</th><th>Bet In</th><th>Payout Out</th><th>Net</th><th>Net %</th><th>Poker</th><th>21</th><th>13</th><th>Tri</th></tr></thead>
+          <thead><tr><th>Item</th><th>Bet In</th><th>Payout Out</th><th>Net</th><th>Status</th><th>Games</th><th>Casino Wins</th><th>Casino Losses</th><th>Win %</th><th>Poker</th><th>21</th><th>13</th><th>Tri</th></tr></thead>
           <tbody>
-            <tr v-for="(it, idx) in (activeStats.byItem || []).slice(0,50)" :key="it.name + '-' + idx">
+            <tr v-for="(it, idx) in (activeStats.byItem || []).slice(0, 50)" :key="it.name + '-' + idx">
               <td>{{ formatItemName(it.name) }}</td>
               <td>{{ it.betIn }}</td>
               <td>{{ it.payoutOut }}</td>
               <td :class="it.net >= 0 ? 'positive' : 'negative'">{{ formatSigned(it.net) }}</td>
-              <td>{{ formatNumber(it.netSharePercent || 0,2) }}%</td>
-              <td>{{ (it.byGameNet && it.byGameNet.Poker) ? it.byGameNet.Poker : 0 }}</td>
-              <td>{{ (it.byGameNet && it.byGameNet['21']) ? it.byGameNet['21'] : 0 }}</td>
-              <td>{{ (it.byGameNet && it.byGameNet['13']) ? it.byGameNet['13'] : 0 }}</td>
-              <td>{{ (it.byGameNet && it.byGameNet.Tri) ? it.byGameNet.Tri : 0 }}</td>
+              <td :class="it.net >= 0 ? 'positive' : 'negative'">{{ it.status || 'Even' }}</td>
+              <td>{{ it.gamesPlayed || 0 }}</td>
+              <td>{{ it.casinoWins || 0 }}</td>
+              <td>{{ it.casinoLosses || 0 }}</td>
+              <td>{{ formatNumber(it.casinoWinRate || 0, 2) }}%</td>
+              <td :class="((it.byGameNet && it.byGameNet.Poker) || 0) >= 0 ? 'positive' : 'negative'">{{ (it.byGameNet && it.byGameNet.Poker) ? formatSigned(it.byGameNet.Poker) : '0' }}</td>
+              <td :class="((it.byGameNet && it.byGameNet['21']) || 0) >= 0 ? 'positive' : 'negative'">{{ (it.byGameNet && it.byGameNet['21']) ? formatSigned(it.byGameNet['21']) : '0' }}</td>
+              <td :class="((it.byGameNet && it.byGameNet['13']) || 0) >= 0 ? 'positive' : 'negative'">{{ (it.byGameNet && it.byGameNet['13']) ? formatSigned(it.byGameNet['13']) : '0' }}</td>
+              <td :class="((it.byGameNet && it.byGameNet.Tri) || 0) >= 0 ? 'positive' : 'negative'">{{ (it.byGameNet && it.byGameNet.Tri) ? formatSigned(it.byGameNet.Tri) : '0' }}</td>
             </tr>
           </tbody>
         </table>
@@ -505,17 +507,21 @@
         <!-- Player Performance Table -->
         <h3 class="section-title">Player Performance</h3>
         <table class="catalog-table stats-table">
-          <thead><tr><th>Player</th><th>Rounds</th><th>Win %</th><th>Issue %</th><th>Bet In</th><th>Payout Out</th><th>Net</th><th>Net %</th></tr></thead>
+          <thead><tr><th>Player</th><th>Rounds</th><th>Overall Win %</th><th>Bet In</th><th>Payout Out</th><th>Net</th><th>Avg / Game</th><th>Status</th><th>Poker</th><th>21</th><th>13</th><th>Tri</th></tr></thead>
           <tbody>
-            <tr v-for="(p, idx) in (activeStats.byPlayer || []).slice(0,50)" :key="p.playerName + '-' + idx">
+            <tr v-for="(p, idx) in (activeStats.byPlayer || []).slice(0, 50)" :key="p.playerName + '-' + idx">
               <td>{{ p.playerName }}</td>
               <td>{{ p.totalRounds }}</td>
-              <td>{{ formatNumber(p.playerWinRate || 0,2) }}%</td>
-              <td>{{ formatNumber(p.issueRatePercent || 0,2) }}%</td>
+              <td>{{ formatNumber(p.playerWinRate || 0, 2) }}%</td>
               <td>{{ p.betItemsIn }}</td>
               <td>{{ p.payoutItemsOut }}</td>
               <td :class="p.netAgainstCasino >= 0 ? 'positive' : 'negative'">{{ formatSigned(p.netAgainstCasino) }}</td>
-              <td>{{ formatNumber(p.netSharePercent || 0,2) }}%</td>
+              <td :class="p.averageNetPerGame >= 0 ? 'positive' : 'negative'">{{ formatNumber(p.averageNetPerGame || 0, 2) }}</td>
+              <td :class="p.isProfitable ? 'negative' : 'positive'">{{ p.isProfitable ? 'Player Up' : 'Casino Up' }}</td>
+              <td>{{ formatNumber((p.byGameWinRate && p.byGameWinRate.Poker) || 0, 2) }}%</td>
+              <td>{{ formatNumber((p.byGameWinRate && p.byGameWinRate['21']) || 0, 2) }}%</td>
+              <td>{{ formatNumber((p.byGameWinRate && p.byGameWinRate['13']) || 0, 2) }}%</td>
+              <td>{{ formatNumber((p.byGameWinRate && p.byGameWinRate.Tri) || 0, 2) }}%</td>
             </tr>
           </tbody>
         </table>
@@ -2085,6 +2091,16 @@ input[type="text"]::placeholder {
 .stat-value.positive { color: #2ecc71; }
 .stat-value.negative { color: #e74c3c; }
 .stat-num { font-weight: 800; }
+.stat-value-small {
+  font-size: 16px;
+  line-height: 1.3;
+}
+.stats-performance-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
 
 .stats-game-grid { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
 .stats-game-card { position: relative; }

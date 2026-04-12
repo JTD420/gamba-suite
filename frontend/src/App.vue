@@ -372,215 +372,41 @@
       </div>
     </div>
 
-    <!-- Logs tab -->
+    <!-- Stats tab -->
     <div v-if="activeTab === 'Stats'">
       <h2 class="section-title">Casino Stats</h2>
-      <p class="config-intro">Summary computed from saved game history (game_history.json). Toggle time range to view.</p>
-
-      <div class="stats-range-controls">
-        <button :class="['tab-btn', { active: statsRangeKey === 'all_time' }]" @click="loadStats('all_time')">All time</button>
-        <button :class="['tab-btn', { active: statsRangeKey === 'today' }]" @click="loadStats('today')">Today</button>
-        <button :class="['tab-btn', { active: statsRangeKey === 'last_7_days' }]" @click="loadStats('last_7_days')">7 days</button>
-        <button :class="['tab-btn', { active: statsRangeKey === 'last_30_days' }]" @click="loadStats('last_30_days')">30 days</button>
+      <div style="display:flex;justify-content:center;gap:8px;margin-bottom:12px;">
+        <button :class="['copy-btn', { 'active': statsRangeKey === 'all_time' }]" @click="loadStats('all_time')">All time</button>
+        <button :class="['copy-btn', { 'active': statsRangeKey === 'today' }]" @click="loadStats('today')">Today</button>
       </div>
-
-      <div v-if="!activeStats || Object.keys(activeStats).length === 0">
-        <div class="trade-empty">Loading stats...</div>
+      <div v-if="!activeStats || Object.keys(activeStats || {}).length === 0" class="trade-empty">
+        No stats available.
       </div>
-
       <div v-else>
-        <!-- KPI Row -->
-        <div class="stats-summary-grid">
-          <div class="stat-card">
-            <div class="stat-icon">🔢</div>
-            <div class="stat-label">Total Rounds</div>
-            <div class="stat-value">{{ activeStats.overall.totalRounds || 0 }}</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-icon">✅</div>
-            <div class="stat-label">Completed Rounds</div>
-            <div class="stat-value">{{ activeStats.overall.completedRounds || 0 }}</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-icon">💰</div>
-            <div class="stat-label">Net Total</div>
-            <div :class="['stat-value', (activeStats.overall.netItems || 0) >= 0 ? 'positive' : 'negative']">
-              <span class="stat-num">{{ formatSigned(activeStats.overall.netItems || 0) }}</span>
-            </div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-icon">🎯</div>
-            <div class="stat-label">RTP %</div>
-            <div class="stat-value">{{ formatNumber(activeStats.overall.rtpPercent || 0, 2) }}%</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-icon">📈</div>
-            <div class="stat-label">Casino Edge %</div>
-            <div class="stat-value">{{ formatNumber(activeStats.overall.casinoEdgePercent || 0, 2) }}%</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-icon">👥</div>
-            <div class="stat-label">Unique Players</div>
-            <div class="stat-value">{{ activeStats.overall.uniquePlayers || 0 }}</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-icon">🏆</div>
-            <div class="stat-label">Best Game</div>
-            <div class="stat-value stat-value-small">{{ activeStats.overall.bestGameByNet || '—' }}</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-icon">⚠️</div>
-            <div class="stat-label">Worst Game</div>
-            <div class="stat-value stat-value-small">{{ activeStats.overall.worstGameByNet || '—' }}</div>
+        <div class="game-guide-block">
+          <div class="game-guide-label">Overall</div>
+          <div class="game-guide-text">
+            Player wins: {{ (activeStats && activeStats.overall && activeStats.overall.playerWins) || 0 }} ({{ formatNumber((activeStats && activeStats.overall && activeStats.overall.playerWinRate) || 0) }}%) —
+            Dealer wins: {{ (activeStats && activeStats.overall && activeStats.overall.dealerWins) || 0 }} ({{ formatNumber((activeStats && activeStats.overall && activeStats.overall.dealerWinRate) || 0) }}%) —
+            Completed rounds: {{ (activeStats && activeStats.overall && activeStats.overall.completedRounds) || 0 }}
           </div>
         </div>
-
-        <!-- Performance Row -->
-        <h3 class="section-title">Performance</h3>
-        <div class="stats-performance-grid">
-          <div class="stat-card small">
-            <div class="stat-label">Dealer Win %</div>
-            <div class="stat-value">{{ formatNumber(activeStats.overall.dealerWinRate || 0, 2) }}%</div>
-          </div>
-          <div class="stat-card small">
-            <div class="stat-label">Player Win %</div>
-            <div class="stat-value">{{ formatNumber(activeStats.overall.playerWinRate || 0, 2) }}%</div>
-          </div>
-          <div class="stat-card small">
-            <div class="stat-label">Issue Rate %</div>
-            <div class="stat-value">{{ formatNumber(activeStats.overall.issueRate || 0, 2) }}%</div>
-          </div>
-          <div class="stat-card small">
-            <div class="stat-label">Avg Net / Round</div>
-            <div class="stat-value">{{ formatNumber(activeStats.overall.averageNetPerRound || 0, 2) }}</div>
-          </div>
-          <div class="stat-card small">
-            <div class="stat-label">Best Item</div>
-            <div class="stat-value stat-value-small">{{ formatItemName(activeStats.overall.bestItemByNet || '') || '—' }}</div>
-          </div>
-          <div class="stat-card small">
-            <div class="stat-label">Worst Item</div>
-            <div class="stat-value stat-value-small">{{ formatItemName(activeStats.overall.worstItemByNet || '') || '—' }}</div>
-          </div>
+        <div class="game-guide-block">
+          <div class="game-guide-label">By Game</div>
+          <table class="catalog-table">
+            <thead><tr><th>Game</th><th>Player Wins</th><th>Dealer Wins</th><th>Player %</th><th>Dealer %</th><th>Rounds</th></tr></thead>
+            <tbody>
+              <tr v-for="g in gameKeys" :key="g">
+                <td>{{ (g === 'TriH' || g === 'TriL' || g === 'Tri') ? 'Tri' : (g === 'Other' ? 'Other' : g) }}</td>
+                <td>{{ (activeStats && activeStats.byGame && activeStats.byGame[g] && activeStats.byGame[g].playerWins) || 0 }}</td>
+                <td>{{ (activeStats && activeStats.byGame && activeStats.byGame[g] && activeStats.byGame[g].dealerWins) || 0 }}</td>
+                <td>{{ formatNumber((activeStats && activeStats.byGame && activeStats.byGame[g] && activeStats.byGame[g].playerWinRate) || 0) }}%</td>
+                <td>{{ formatNumber((activeStats && activeStats.byGame && activeStats.byGame[g] && activeStats.byGame[g].dealerWinRate) || 0) }}%</td>
+                <td>{{ (activeStats && activeStats.byGame && activeStats.byGame[g] && activeStats.byGame[g].completedRounds) || 0 }}</td>
+              </tr>
+            </tbody>
+          </table>
         </div>
-
-        <!-- Per-Game Cards -->
-        <h3 class="section-title">Per-Game</h3>
-        <div class="game-card-grid stats-game-grid">
-          <div v-for="g in ['Poker','21','13','Tri']" :key="g" class="game-card small stats-game-card">
-            <div class="game-card-title">{{ g }}</div>
-            <div class="game-card-summary">Rounds: {{ (activeStats.byGame && activeStats.byGame[g]) ? activeStats.byGame[g].totalRounds : 0 }}</div>
-            <div class="game-card-summary">Player Win %: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].playerWinRate || 0, 2) + '%' : '0%' }}</div>
-            <div class="game-card-summary">Dealer Win %: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].dealerWinRate || 0, 2) + '%' : '0%' }}</div>
-            <div class="game-card-summary">RTP %: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].rtpPercent || 0, 2) + '%' : '0%' }}</div>
-            <div class="game-card-summary">Edge %: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].casinoEdgePercent || 0, 2) + '%' : '0%' }}</div>
-            <div class="game-card-summary">Avg Net / Round: {{ (activeStats.byGame && activeStats.byGame[g]) ? formatNumber(activeStats.byGame[g].averageNetPerRound || 0, 2) : '0.00' }}</div>
-            <div class="game-card-summary net-badge" :class="(activeStats.byGame && activeStats.byGame[g] && activeStats.byGame[g].netItems >= 0) ? 'positive' : 'negative'">
-              <span>{{ (activeStats.byGame && activeStats.byGame[g]) ? formatSigned(activeStats.byGame[g].netItems) : '0' }}</span>
-            </div>
-          </div>
-        </div>
-
-        <!-- Item Performance Table -->
-        <h3 class="section-title">Item Performance</h3>
-        <table class="catalog-table stats-table">
-          <thead><tr><th>Item</th><th>Bet In</th><th>Payout Out</th><th>Net</th><th>Status</th><th>Games</th><th>Casino Wins</th><th>Casino Losses</th><th>Win %</th><th>Poker</th><th>21</th><th>13</th><th>Tri</th></tr></thead>
-          <tbody>
-            <tr v-for="(it, idx) in (activeStats.byItem || []).slice(0, 50)" :key="it.name + '-' + idx">
-              <td>{{ formatItemName(it.name) }}</td>
-              <td>{{ it.betIn }}</td>
-              <td>{{ it.payoutOut }}</td>
-              <td :class="it.net >= 0 ? 'positive' : 'negative'">{{ formatSigned(it.net) }}</td>
-              <td :class="it.net >= 0 ? 'positive' : 'negative'">{{ it.status || 'Even' }}</td>
-              <td>{{ it.gamesPlayed || 0 }}</td>
-              <td>{{ it.casinoWins || 0 }}</td>
-              <td>{{ it.casinoLosses || 0 }}</td>
-              <td>{{ formatNumber(it.casinoWinRate || 0, 2) }}%</td>
-              <td :class="((it.byGameNet && it.byGameNet.Poker) || 0) >= 0 ? 'positive' : 'negative'">{{ (it.byGameNet && it.byGameNet.Poker) ? formatSigned(it.byGameNet.Poker) : '0' }}</td>
-              <td :class="((it.byGameNet && it.byGameNet['21']) || 0) >= 0 ? 'positive' : 'negative'">{{ (it.byGameNet && it.byGameNet['21']) ? formatSigned(it.byGameNet['21']) : '0' }}</td>
-              <td :class="((it.byGameNet && it.byGameNet['13']) || 0) >= 0 ? 'positive' : 'negative'">{{ (it.byGameNet && it.byGameNet['13']) ? formatSigned(it.byGameNet['13']) : '0' }}</td>
-              <td :class="((it.byGameNet && it.byGameNet.Tri) || 0) >= 0 ? 'positive' : 'negative'">{{ (it.byGameNet && it.byGameNet.Tri) ? formatSigned(it.byGameNet.Tri) : '0' }}</td>
-            </tr>
-          </tbody>
-        </table>
-
-        <!-- Player Performance Table -->
-        <h3 class="section-title">Player Performance</h3>
-        <table class="catalog-table stats-table">
-          <thead><tr><th>Player</th><th>Rounds</th><th>Overall Win %</th><th>Bet In</th><th>Payout Out</th><th>Net</th><th>Avg / Game</th><th>Status</th><th>Poker</th><th>21</th><th>13</th><th>Tri</th></tr></thead>
-          <tbody>
-            <tr v-for="(p, idx) in (activeStats.byPlayer || []).slice(0, 50)" :key="p.playerName + '-' + idx">
-              <td>{{ p.playerName }}</td>
-              <td>{{ p.totalRounds }}</td>
-              <td>{{ formatNumber(p.playerWinRate || 0, 2) }}%</td>
-              <td>{{ p.betItemsIn }}</td>
-              <td>{{ p.payoutItemsOut }}</td>
-              <td :class="p.netAgainstCasino >= 0 ? 'positive' : 'negative'">{{ formatSigned(p.netAgainstCasino) }}</td>
-              <td :class="p.averageNetPerGame >= 0 ? 'positive' : 'negative'">{{ formatNumber(p.averageNetPerGame || 0, 2) }}</td>
-              <td :class="p.isProfitable ? 'negative' : 'positive'">{{ p.isProfitable ? 'Player Up' : 'Casino Up' }}</td>
-              <td>{{ formatNumber((p.byGameWinRate && p.byGameWinRate.Poker) || 0, 2) }}%</td>
-              <td>{{ formatNumber((p.byGameWinRate && p.byGameWinRate['21']) || 0, 2) }}%</td>
-              <td>{{ formatNumber((p.byGameWinRate && p.byGameWinRate['13']) || 0, 2) }}%</td>
-              <td>{{ formatNumber((p.byGameWinRate && p.byGameWinRate.Tri) || 0, 2) }}%</td>
-            </tr>
-          </tbody>
-        </table>
-
-        <!-- Issues / Operational Stats -->
-        <h3 class="section-title">Issues</h3>
-        <table class="catalog-table stats-table">
-          <thead><tr><th>Issue Type</th><th>Count</th><th>% of Issues</th><th>% of Rounds</th></tr></thead>
-          <tbody>
-            <tr>
-              <td>Total Issues</td>
-              <td>{{ activeStats.issues.totalIssues || 0 }}</td>
-              <td>100%</td>
-              <td>{{ formatNumber(((activeStats.issues.totalIssues || 0) / Math.max(1, (activeStats.overall.totalRounds || 0))) * 100,2) }}%</td>
-            </tr>
-            <tr>
-              <td>Game Choice Timeouts</td>
-              <td>{{ activeStats.issues.gameChoiceTimeouts || 0 }}</td>
-              <td>{{ formatNumber(((activeStats.issues.gameChoiceTimeouts || 0) / Math.max(1, (activeStats.issues.totalIssues || 0))) * 100,2) }}%</td>
-              <td>{{ formatNumber(((activeStats.issues.gameChoiceTimeouts || 0) / Math.max(1, (activeStats.overall.totalRounds || 0))) * 100,2) }}%</td>
-            </tr>
-            <tr>
-              <td>Payout Timeouts</td>
-              <td>{{ activeStats.issues.payoutTimeouts || 0 }}</td>
-              <td>{{ formatNumber(((activeStats.issues.payoutTimeouts || 0) / Math.max(1, (activeStats.issues.totalIssues || 0))) * 100,2) }}%</td>
-              <td>{{ formatNumber(((activeStats.issues.payoutTimeouts || 0) / Math.max(1, (activeStats.overall.totalRounds || 0))) * 100,2) }}%</td>
-            </tr>
-            <tr>
-              <td>Payout Cancels</td>
-              <td>{{ activeStats.issues.payoutCancelFlags || 0 }}</td>
-              <td>{{ formatNumber(((activeStats.issues.payoutCancelFlags || 0) / Math.max(1, (activeStats.issues.totalIssues || 0))) * 100,2) }}%</td>
-              <td>{{ formatNumber(((activeStats.issues.payoutCancelFlags || 0) / Math.max(1, (activeStats.overall.totalRounds || 0))) * 100,2) }}%</td>
-            </tr>
-            <tr v-for="(count, reason) in (activeStats.issues.byReason || {})" :key="reason">
-              <td>{{ reason }}</td>
-              <td>{{ count }}</td>
-              <td>{{ formatNumber((count / Math.max(1, (activeStats.issues.totalIssues || 0))) * 100,2) }}%</td>
-              <td>{{ formatNumber((count / Math.max(1, (activeStats.overall.totalRounds || 0))) * 100,2) }}%</td>
-            </tr>
-          </tbody>
-        </table>
-
-        <!-- Trends -->
-        <h3 class="section-title">Daily Trends</h3>
-        <table class="catalog-table stats-table">
-          <thead><tr><th>Day</th><th>Rounds</th><th>Net</th><th>Issues</th><th>RTP %</th></tr></thead>
-          <tbody>
-            <tr v-for="(d, idx) in (activeStats.trends && activeStats.trends.daily) || []" :key="d.day + '-' + idx">
-              <td>{{ d.day }}</td>
-              <td>{{ d.totalRounds }}</td>
-              <td :class="d.netItems >= 0 ? 'positive' : 'negative'">{{ formatSigned(d.netItems) }}</td>
-              <td>{{ d.issueRounds }}</td>
-              <td>{{ formatNumber(d.rtpPercent || 0,2) }}%</td>
-            </tr>
-          </tbody>
-        </table>
-
-        <h3 class="section-title">Raw Stats (debug)</h3>
-        <pre class="monospace-wrap">{{ JSON.stringify(activeStats, null, 2) }}</pre>
       </div>
     </div>
 
@@ -837,6 +663,13 @@ export default {
     },
     activeStats() {
       return this.casinoStatsMap[this.statsRangeKey] || {};
+    },
+    gameKeys() {
+      const keys = (this.activeStats && this.activeStats.byGame) ? Object.keys(this.activeStats.byGame) : [];
+      const preferred = ['Poker', '21', '13', 'Tri'];
+      const presentPreferred = preferred.filter(k => keys.includes(k));
+      const rest = keys.filter(k => !preferred.includes(k)).sort();
+      return presentPreferred.concat(rest);
     },
   },
   methods: {
@@ -1125,10 +958,12 @@ export default {
     },
     async loadStats(rangeKey) {
       this.statsRangeKey = rangeKey;
-      if (this.casinoStatsMap[rangeKey]) return;
       try {
-        const s = await window.go.main.App.GetCasinoStatsJSON(rangeKey);
-        this.casinoStatsMap[rangeKey] = JSON.parse(s || '{}') || {};
+        const jsonStr = await window.go.main.App.GetCasinoStatsJSON(rangeKey);
+        const parsed = JSON.parse(jsonStr || '{}') || {};
+        this.casinoStatsMap[rangeKey] = parsed;
+        if (rangeKey === 'all_time') this.casinoStats = parsed;
+        if (rangeKey === 'today') this.casinoStatsToday = parsed;
       } catch (e) {
         this.casinoStatsMap[rangeKey] = {};
       }
@@ -1185,23 +1020,9 @@ export default {
   },
   async mounted() {
     await this.refreshGameHistory();
-      // initial fetch of stats
-      try {
-        const s = await window.go.main.App.GetCasinoStatsJSON("all_time");
-        this.casinoStats = JSON.parse(s || '{}') || {};
-        this.casinoStatsMap['all_time'] = this.casinoStats;
-      } catch (e) {
-        this.casinoStats = {};
-        this.casinoStatsMap['all_time'] = {};
-      }
-      try {
-        const s2 = await window.go.main.App.GetCasinoStatsJSON("today");
-        this.casinoStatsToday = JSON.parse(s2 || '{}') || {};
-        this.casinoStatsMap['today'] = this.casinoStatsToday;
-      } catch (e) {
-        this.casinoStatsToday = {};
-        this.casinoStatsMap['today'] = {};
-      }
+      // Fetch minimal stats for ranges
+      await this.loadStats('all_time');
+      await this.loadStats('today');
     window.runtime.EventsOn("logUpdate", (message) => {
       this.log = message.split('\n');
       this.scrollBox('logbox');

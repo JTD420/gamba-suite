@@ -1150,7 +1150,27 @@ func (a *App) captureCurrentGameHistoryPayoutItems(items []TradeItem, note strin
 	a.AddLogMsg("[GAME_HISTORY] captureCurrentGameHistoryPayoutItems start")
 	a.gameHistoryMu.Lock()
 	if !a.updateCurrentGameHistoryLocked(func(entry *GameHistoryEntry) {
-		entry.PayoutItems = cloneTradeItems(items)
+		// If explicit payout items provided, use them. Otherwise, attempt
+		// to infer payout from the recorded bet items (2x each) so history
+		// isn't left with an empty payout list when the trade echo is delayed.
+		if len(items) > 0 {
+			entry.PayoutItems = cloneTradeItems(items)
+		} else if len(entry.BetItems) > 0 {
+			inferred := make([]TradeItem, 0, len(entry.BetItems))
+			for _, b := range entry.BetItems {
+				if b.Quantity <= 0 {
+					continue
+				}
+				inferred = append(inferred, TradeItem{Name: b.Name, Quantity: b.Quantity * 2, RawData: b.RawData})
+			}
+			entry.PayoutItems = inferred
+			if len(inferred) > 0 {
+				entry.Notes = append(entry.Notes, "Predicted payout (2x bet)")
+			}
+		} else {
+			entry.PayoutItems = cloneTradeItems(items)
+		}
+
 		if strings.TrimSpace(note) != "" {
 			entry.Notes = append(entry.Notes, note)
 		}
@@ -1708,6 +1728,23 @@ func handleTradePacket(a *App, e *g.Intercept) {
 
 			// Send the trade items summary to chat
 			a.sendTradeCompletionMessage()
+
+			// Record predicted payout items for history as 2x the bet items
+			// This ensures the frontend shows a sensible payout count even when
+			// an explicit payout trade flow was not used.
+			payoutPred := make([]TradeItem, 0, len(gameBetItems))
+			for _, it := range gameBetItems {
+				if it.Quantity <= 0 {
+					continue
+				}
+				payoutPred = append(payoutPred, TradeItem{Name: it.Name, Quantity: it.Quantity * 2, RawData: it.RawData})
+			}
+			if len(payoutPred) > 0 {
+				a.captureCurrentGameHistoryPayoutItems(payoutPred, "Predicted payout (2x bet)", true)
+			} else {
+				// Still mark history complete even if no payout items were found
+				a.captureCurrentGameHistoryPayoutItems([]TradeItem{}, "No payout items recorded", true)
+			}
 			go func() {
 				if ok := a.forceRefreshHandSnapshot("trade completed"); ok {
 					a.AddLogMsg("[TRADE_COMPLETED] forced hand refresh complete after trade")

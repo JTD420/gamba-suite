@@ -143,15 +143,21 @@ func (a *App) evaluateBlackjackHand() {
 			return
 		}
 
-		// Once the player reaches 15 or more, auto-stay instead of prompting.
-		// With one remaining hit die capped at 6, any total from 15-21 can no
-		// longer improve without either staying on the current value or risking a bust.
-		if blackjackPlayerTotal >= 15 {
-			a.AddLogMsg(fmt.Sprintf("[BJ] player total %d; auto-stay and moving to dealer roll", blackjackPlayerTotal))
-			log.Printf("[BJ] player total %d; auto-stay and moving to dealer roll", blackjackPlayerTotal)
-			a.startBlackjackDealerTurn(fmt.Sprintf("player reached %d auto-stay", blackjackPlayerTotal))
-			isBJRolling = false
-			isHitting = false
+		if blackjackPlayerTotal < 15 {
+			a.AddLogMsg(fmt.Sprintf("[BJ] player total %d < 15; auto-hit", blackjackPlayerTotal))
+			log.Printf("[BJ] player total %d < 15; auto-hit", blackjackPlayerTotal)
+			if blackjackHitInFlight {
+				a.AddLogMsg("[BJ] player auto-hit deferred: hit already in flight")
+				log.Printf("[BJ] player auto-hit deferred: hit already in flight")
+				go func() {
+					time.Sleep(150 * time.Millisecond)
+					a.evaluateBlackjackHand()
+				}()
+				return
+			}
+			blackjackHitInFlight = true
+			isHitting = true
+			go a.hitBjDice()
 			return
 		}
 
@@ -352,6 +358,24 @@ func (a *App) evaluate13Hand() {
 			a.start13DealerTurn("player reached 13 auto-stay")
 			is13Rolling = false
 			is13Hitting = false
+			return
+		}
+
+		if thirteenPlayerTotal < 7 {
+			a.AddLogMsg(fmt.Sprintf("[13] player total %d < 7; auto-hit", thirteenPlayerTotal))
+			log.Printf("[13] player total %d < 7; auto-hit", thirteenPlayerTotal)
+			if thirteenHitInFlight {
+				a.AddLogMsg("[13] player auto-hit deferred: hit already in flight")
+				log.Printf("[13] player auto-hit deferred: hit already in flight")
+				go func() {
+					time.Sleep(150 * time.Millisecond)
+					a.evaluate13Hand()
+				}()
+				return
+			}
+			thirteenHitInFlight = true
+			is13Hitting = true
+			go a.hit13Dice()
 			return
 		}
 

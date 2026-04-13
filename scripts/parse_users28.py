@@ -1,173 +1,162 @@
 #!/usr/bin/env python3
-"""Debug parser for Habbo Origins USERS(28).
-
-This is now optional/debug-only.
-The Go app should no longer depend on this script for live trade/chat identity.
-
-It parses:
-[count:int]
-repeat count times:
-  [roomIndex:int]
-  [name:string]
-  [figure:string]
-  [gender:string]
-  [motto:string]
-  [x:int]
-  [y:int]
-  [z:string]
-  [poolFigure:string]
-  [badgeCode:string]
-  [entityType:int]
-"""
 import argparse
-import binascii
 import json
 import re
 import sys
-from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+
+FIGURE_RE = re.compile(r'^(hr|hd|ch|lg|sh|ea|ha|fa|ca|wa)-\d+-\d+')
+MOTTO_SKIP_RE = re.compile(r'^[A-Z]{3,4}\d')
 
 
-def vl64_decode_len(first_byte: int) -> int:
-    return (first_byte >> 3) & 7
+def read_packet_bytes(input_path: Optional[str]) -> bytes:
+    if input_path:
+        with open(input_path, 'rb') as f:
+            return f.read()
+    return sys.stdin.buffer.read()
 
 
-def vl64_decode(b: bytes) -> int:
-    if len(b) == 0:
-        raise ValueError("vl64: empty")
-    if (b[0] & 0x40) != 0x40:
-        raise ValueError(f"vl64: invalid first byte {b[0]:02x}")
-    value = int(b[0] & 3)
-    n = vl64_decode_len(b[0])
-    if n <= 0:
-        raise ValueError("vl64: length 0")
-    for i in range(1, n):
-        if (b[i] & 0x40) != 0x40:
-            raise ValueError(f"vl64: invalid byte {b[i]:02x}")
-        value |= int(b[i] & 0x3f) << (2 + 6 * (i - 1))
-    if (b[0] & 4) != 0:
-        value *= -1
-    return value
+def split_packet_fields(packet: bytes) -> List[str]:
+    return [part.decode('ascii', errors='ignore').strip() for part in packet.split(b'\x02')]
 
 
-def b64_decode(b: bytes) -> int:
-    v = 0
-    for i in range(len(b)):
-        if (b[i] & 0x40) != 0x40:
-            raise ValueError(f"b64: invalid byte {b[i]:02x}")
-        v |= int(b[i] & 0x3f) << ((len(b) - i - 1) * 6)
-    return v
+def vl64_chunk_length(text: str) -> int:
+    if not text:
+        return 0
+    length = (ord(text[0]) >> 3) & 7
+    if length <= 0:
+        length = 1
+    return length
 
 
-def hex_from_hexdump(txt: str) -> bytes:
-    pairs = re.findall(r"\b[0-9a-fA-F]{2}\b", txt)
-    if pairs:
-        return bytes(int(x, 16) for x in pairs)
-    cleaned = re.sub(r"[^0-9a-fA-F]", "", txt)
-    if len(cleaned) % 2 == 1:
-        cleaned = cleaned[:-1]
-    return bytes.fromhex(cleaned)
+def decode_vl64(chunk: str) -> Optional[int]:
+    if not chunk:
+        return None
+    try:
+        vals = [ord(c) for c in chunk]
+        first = vals[0]
+        total_bytes = (first >> 3) & 7
+        if total_bytes <= 0:
+            total_bytes = 1
+        negative = (first & 4) != 0
+        value = first & 3
+        shift = 2
+        for b in vals[1:total_bytes]:
+            value |= (b & 0x3F) << shift
+            shift += 6
+        if negative:
+            value = -value
+        return value
+    except Exception:
+        return None
 
 
-class Reader:
-    def __init__(self, data: bytes):
-        self.data = data
-        self.pos = 0
-
-    def read_integer(self) -> int:
-        if self.pos >= len(self.data):
-            raise ValueError("integer: out of data")
-        n = vl64_decode_len(self.data[self.pos])
-        if n <= 0 or self.pos + n > len(self.data):
-            raise ValueError(f"integer: invalid length {n} at {self.pos}")
-        chunk = self.data[self.pos:self.pos+n]
-        self.pos += n
-        return vl64_decode(chunk)
-
-    def read_string(self) -> str:
-        end = self.data.find(b"\x02", self.pos)
-        if end == -1:
-            raise ValueError(f"string terminator not found from {self.pos}")
-        raw = self.data[self.pos:end]
-        self.pos = end + 1
-        return raw.decode("latin-1", errors="replace")
-
-
-def parse_users28(data: bytes):
-    if len(data) >= 2:
-        try:
-            if b64_decode(data[:2]) == 28:
-                data = data[2:]
-        except Exception:
-            pass
-
-    r = Reader(data)
-    count = r.read_integer()
-    users = []
+def read_fixed_vl64_prefix(text: str, count: int) -> Tuple[List[str], str]:
+    parts: List[str] = []
+    remaining = text
     for _ in range(count):
-        room_index = r.read_integer()
-        name = r.read_string()
-        figure = r.read_string()
-        gender = r.read_string()
-        motto = r.read_string()
-        x = r.read_integer()
-        y = r.read_integer()
-        z = r.read_string()
-        pool_figure = r.read_string()
-        badge_code = r.read_string()
-        entity_type = r.read_integer()
+        if not remaining:
+            break
+        length = vl64_chunk_length(remaining)
+        current = remaining[:length]
+        parts.append(current)
+        remaining = remaining[length:]
+    return parts, remaining
 
-        token_hex = None
-        if len(name) >= 5:
-            prefix = name[:4]
-            tail = name[4:]
-            if all(64 <= ord(c) <= 125 for c in prefix) and tail and tail[0].isupper():
-                token_hex = prefix.encode("latin-1").hex()
-                name = tail
+
+def prefix_count_from_live_block(text: str) -> int:
+    if not text:
+        return 3
+    first_len = vl64_chunk_length(text)
+    if first_len == 2:
+        return 5
+    return 3
+
+
+def extract_entity_and_username(name_block: str) -> Dict[str, object]:
+    original = name_block
+    working = name_block
+    if working.startswith('@\\'):
+        working = working[2:]
+
+    num_ints = prefix_count_from_live_block(working)
+    parsed_ints, remaining = read_fixed_vl64_prefix(working, num_ints)
+
+    chat_id_raw = parsed_ints[-2] if len(parsed_ints) >= 2 else ''
+    trade_id_raw = parsed_ints[-1] if len(parsed_ints) >= 1 else ''
+    entity_id = ''.join(parsed_ints)
+
+    return {
+        'entity_id': entity_id,
+        'chat_id_raw': chat_id_raw,
+        'trade_id_raw': trade_id_raw,
+        'chat_id': decode_vl64(chat_id_raw),
+        'trade_id': decode_vl64(trade_id_raw),
+        'username': remaining,
+        'raw_name_block': original,
+    }
+
+
+def parse_users28(packet: bytes) -> List[Dict[str, object]]:
+    fields = split_packet_fields(packet)
+    users: List[Dict[str, object]] = []
+
+    for i, field in enumerate(fields):
+        if not FIGURE_RE.match(field):
+            continue
+        if i == 0:
+            continue
+
+        parsed = extract_entity_and_username(fields[i - 1])
+        sex = fields[i + 1] if i + 1 < len(fields) else ''
+
+        motto = ''
+        if i + 2 < len(fields):
+            candidate = fields[i + 2]
+            if (
+                len(candidate) > 5
+                and not MOTTO_SKIP_RE.match(candidate)
+                and candidate not in {'Istd', 'std'}
+            ):
+                motto = candidate
 
         users.append({
-            "name": name,
-            "detected_name": name,
-            "aliases": [name] if name else [],
-            "token_hex": token_hex,
-            "short_token": None,
-            "chat_id": room_index,
-            "room_index": room_index,
-            "figureString": figure,
-            "motto": motto,
-            "gender": gender,
-            "x": x,
-            "y": y,
-            "z": z,
-            "poolFigure": pool_figure,
-            "badgeCode": badge_code,
-            "entityType": entity_type,
-            "figure_match": False,
-            "matched_alias": None,
+            'username': parsed['username'],
+            'trade_id': parsed['trade_id'],
+            'trade_id_raw': parsed['trade_id_raw'],
+            'chat_id': parsed['chat_id'],
+            'chat_id_raw': parsed['chat_id_raw'],
+            'entity_id': parsed['entity_id'],
+            'figure': field,
+            'sex': sex,
+            'motto': motto,
         })
-    return {"users": users, "trades": []}
+
+    users.sort(key=lambda u: (
+        u.get('chat_id') if isinstance(u.get('chat_id'), int) and u.get('chat_id') is not None else -1,
+        u.get('trade_id') if isinstance(u.get('trade_id'), int) and u.get('trade_id') is not None else -1,
+        str(u.get('username', '')),
+    ))
+    return users
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--hex", "-x")
-    p.add_argument("--file", "-f")
-    p.add_argument("--json", action="store_true")
-    args = p.parse_args()
+def main() -> int:
+    parser = argparse.ArgumentParser(description='Parse raw USERS[28] packet bytes into JSON.')
+    parser.add_argument('--input', help='Path to a file containing the exact raw packet bytes.')
+    parser.add_argument('--json', action='store_true', help='Emit JSON only.')
+    args = parser.parse_args()
 
-    if args.hex:
-        data = hex_from_hexdump(args.hex)
-    elif args.file:
-        data = Path(args.file).read_bytes()
-    else:
-        print("Need --hex or --file", file=sys.stderr)
-        sys.exit(1)
+    packet = read_packet_bytes(args.input)
+    users = parse_users28(packet)
 
-    out = parse_users28(data)
     if args.json:
-        print(json.dumps(out, ensure_ascii=False))
-    else:
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+        sys.stdout.write(json.dumps(users, ensure_ascii=False, separators=(',', ':')))
+        return 0
+
+    for user in users:
+        sys.stdout.write(json.dumps(user, ensure_ascii=False) + '\n')
+    return 0
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    raise SystemExit(main())

@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -162,26 +163,22 @@ var (
 	lastRoomUsersRequestAt time.Time
 	roomUsersReqMu         sync.Mutex
 	roomReadySeen          bool
-	// Canonical USERS28 registry: single source-of-truth for parsed users
+	// Canonical USERS28 registry: source of truth is the Python parser only.
 	users28Canonical          = map[string]ParsedUsers28User{}
-	users28ByToken            = map[string]string{}
-	users28ByIndex            = map[int]string{} // roomIndex -> name
-	users28ByShortToken       = map[string]string{}
-	roomIdentityByShortToken  = map[string]RoomIdentityEntry{}
+	users28ByToken            = map[string]ParsedUsers28User{}
+	users28ByIndex            = map[int]ParsedUsers28User{} // parsed chat_id -> user
+	users28ByTradeID          = map[int]ParsedUsers28User{} // parsed trade_id -> user
 	recentTradePartnerByToken = map[string]string{}
 	recentTradePartnerSeenAt  = map[string]time.Time{}
 	recentTradePartnerMu      sync.Mutex
-	// parsedUserInfoByToken stores parsed JSON returned by the Python helper
-	parsedUserInfoByToken = map[string]map[string]interface{}{}
-	parsedUserInfoMu      sync.Mutex
-	users28Mu             sync.Mutex
-	headerSniffUntil      time.Time
-	headerSniffSeen       = map[uint16]bool{}
-	headerSniffMu         sync.Mutex
-	currentTradeItems     []TradeItem
-	currentOwnTradeItems  []TradeItem
-	tradeItemsMu          sync.Mutex
-	lastAddItemWasOurs    bool
+	users28Mu                 sync.Mutex
+	headerSniffUntil          time.Time
+	headerSniffSeen           = map[uint16]bool{}
+	headerSniffMu             sync.Mutex
+	currentTradeItems         []TradeItem
+	currentOwnTradeItems      []TradeItem
+	tradeItemsMu              sync.Mutex
+	lastAddItemWasOurs        bool
 	// lastAddItemByUsAt records when we observed an outgoing TRADE_ADDITEM
 	// packet. Use this timestamp in debugging to detect races between the
 	// outgoing add and the subsequent server TRADE_ITEMS update.
@@ -429,38 +426,30 @@ func normalizeUsers28Name(name string, tokenHex string) string {
 
 type RoomIdentityEntry struct {
 	Name      string `json:"name"`
-	Token     string `json:"token"`
 	Short     string `json:"short"`
 	ChatIndex int    `json:"chatIndex"`
 	RoomIndex int    `json:"roomIndex"`
+	Token     string `json:"token"`
+	TradeID   string `json:"tradeId,omitempty"`
+	EntityID  string `json:"entityId,omitempty"`
 }
 
-// ParsedUsers28Result represents the parsed USERS28 result built directly in Go.
+// ParsedUsers28Result is the exact structured result returned by the Python helper.
 type ParsedUsers28Result struct {
-	Users  []ParsedUsers28User  `json:"users"`
-	Trades []ParsedUsers28Trade `json:"trades"`
+	Users []ParsedUsers28User `json:"users"`
 }
 
 type ParsedUsers28User struct {
-	Name         string                 `json:"name"`
-	DetectedName string                 `json:"detected_name"`
-	Aliases      []string               `json:"aliases"`
-	TokenHex     string                 `json:"token_hex"`
-	ShortToken   string                 `json:"short_token"`
-	ChatID       int                    `json:"chat_id"`
-	RoomIndex    int                    `json:"room_index"`
-	FigureString string                 `json:"figureString"`
-	Motto        string                 `json:"motto"`
-	Gender       string                 `json:"gender"`
-	X            int                    `json:"x"`
-	Y            int                    `json:"y"`
-	Z            string                 `json:"z"`
-	PoolFigure   string                 `json:"poolFigure"`
-	BadgeCode    string                 `json:"badgeCode"`
-	EntityType   int                    `json:"entityType"`
-	FigureMatch  bool                   `json:"figure_match"`
-	MatchedAlias string                 `json:"matched_alias"`
-	Origins      map[string]interface{} `json:"origins"`
+	Username   string `json:"username"`
+	TradeID    int    `json:"trade_id"`
+	TradeIDRaw string `json:"trade_id_raw"`
+	ChatID     int    `json:"chat_id"`
+	ChatIDRaw  string `json:"chat_id_raw"`
+	EntityID   string `json:"entity_id,omitempty"`
+	Figure     string `json:"figure,omitempty"`
+	Sex        string `json:"sex,omitempty"`
+	Motto      string `json:"motto,omitempty"`
+	TokenHex   string `json:"token_hex,omitempty"`
 }
 
 type ParsedUsers28Trade struct {
@@ -510,6 +499,8 @@ type App struct {
 	ctx                  context.Context
 	currentDealerName    string
 	currentRoomName      string
+	users28PythonExec    string
+	users28ParserScript  string
 }
 
 type PokerDisplayConfig struct {
@@ -532,15 +523,39 @@ type AutoShoutConfig struct {
 }
 
 func NewApp(ext *g.Ext, assets embed.FS) *App {
-	return &App{
+	a := &App{
 		ext:    ext,
 		assets: assets,
 	}
+	a.initUsers28ParserCommand()
+	return a
 }
 
 // getCurrentDealerName returns the configured dealer name, preferring an
 // explicitly set value on the App instance, then environment overrides,
 // then a sensible default.
+
+func (a *App) initUsers28ParserCommand() {
+	if a == nil {
+		return
+	}
+	if strings.TrimSpace(a.users28ParserScript) == "" {
+		a.users28ParserScript = filepath.Join("scripts", "parse_users28.py")
+	}
+	if strings.TrimSpace(a.users28PythonExec) != "" {
+		return
+	}
+	if p, err := exec.LookPath("python3"); err == nil {
+		a.users28PythonExec = p
+		return
+	}
+	if p, err := exec.LookPath("python"); err == nil {
+		a.users28PythonExec = p
+		return
+	}
+	// leave empty and let the runner report a clear error later
+}
+
 func (a *App) getCurrentDealerName() string {
 	if a != nil {
 		if n := strings.TrimSpace(a.currentDealerName); n != "" {
@@ -1210,6 +1225,7 @@ func (a *App) setupExt() {
 	a.ext.Intercept(out.SHOUT).With(a.handleTalk)
 	a.ext.InterceptAll(func(e *g.Intercept) {
 		handleMutePacket(e)
+		handleRoomResetPacket(a, e)
 		handleTradePacket(a, e)
 		handleUsers28Packet(a, e)
 		handleIncomingHeaderSniff(a, e)
@@ -1773,11 +1789,14 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			if activeRound {
 				partnerName := strings.TrimSpace(lastTradePartnerName)
 				if partnerName != "" && !strings.EqualFold(partnerName, "Unknown") {
-					incomingToken := extractTradeTokenFromPacket(e.Packet.Data)
-					if partnerToken, ok := lookupTokenByName(partnerName); ok {
-						a.AddLogMsg(fmt.Sprintf("[TRADE_BLOCK_DEBUG] active partner=%q expectedToken=%q incomingToken=%q", partnerName, partnerToken, incomingToken))
-						if incomingToken != "" && incomingToken == partnerToken {
-							a.AddLogMsg(fmt.Sprintf("[TRADE_BLOCK] allowing trade from active partner %q by token match", partnerName))
+					incomingTraderID := 0
+					if id, ok := decodeLeadingVL64(e.Packet.Data); ok {
+						incomingTraderID = id
+					}
+					if expectedID, ok := lookupUsers28TradeIDByName(partnerName); ok {
+						a.AddLogMsg(fmt.Sprintf("[TRADE_BLOCK_DEBUG] active partner=%q expectedChatID=%d incomingChatID=%d", partnerName, expectedID, incomingTraderID))
+						if incomingTraderID > 0 && incomingTraderID == expectedID {
+							a.AddLogMsg(fmt.Sprintf("[TRADE_BLOCK] allowing trade from active partner %q by exact parsed chat_id match", partnerName))
 							allowed = true
 						}
 					}
@@ -1813,9 +1832,12 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		// During payout mode, someone else opened a trade with us — close it and let the payout loop retry
 		isPayoutTradeOpen := false
 		if payoutActive {
-			incomingToken := extractTradeTokenFromPacket(e.Packet.Data)
-			expectedToken, _ := lookupTokenByName(payoutTargetName)
-			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] incoming trade-open while payout active: sent=%t target=%q targetID=%d expectedToken=%q incomingToken=%q matchedRecentOutgoing=%t", payoutTradeSent, payoutTargetName, payoutTargetID, expectedToken, incomingToken, matchedRecentOutgoing))
+			incomingTraderID := 0
+			if id, ok := decodeLeadingVL64(e.Packet.Data); ok {
+				incomingTraderID = id
+			}
+			expectedID, _ := lookupUsers28TradeIDByName(payoutTargetName)
+			a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] incoming trade-open while payout active: sent=%t target=%q targetID=%d expectedChatID=%d incomingChatID=%d matchedRecentOutgoing=%t", payoutTradeSent, payoutTargetName, payoutTargetID, expectedID, incomingTraderID, matchedRecentOutgoing))
 			if payoutTradeSent {
 				// Our outgoing TRADE_OPEN was accepted — this is the payout trade opening successfully
 				savedPayoutTargetID := payoutTargetID
@@ -1913,86 +1935,21 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		}
 
 		if len(e.Packet.Data) >= 1 {
-			// Refresh users immediately on every trade-open so token/name caches have
-			// a chance to populate before we decide the partner is unknown.
 			go requestRoomUsers(a)
 
-			// Prefer token-based resolution first. In observed TRADE_OPEN packets the
-			// first 4 bytes reliably match the USERS28 token for the partner, while
-			// blindly decoding a leading VL64 can produce implausible values like
-			// 134636 and incorrectly mark real users as Unknown.
-			if len(e.Packet.Data) >= 4 {
-				rawToken := e.Packet.Data[:4]
-				tradeTokenHex := hex.EncodeToString(rawToken)
-				lastTradePartnerToken = tradeTokenHex
-
-				if name, ok := lookupUsers28Token(tradeTokenHex); ok {
+			if id, ok := decodeLeadingVL64(e.Packet.Data); ok {
+				lastTradePartnerID = id
+				if name, ok := lookupUsers28TradeID(id); ok {
 					lastTradePartnerName = name
-					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] token hex %q matched name %q", tradeTokenHex, name))
-				} else if waitedName, waitedOk := waitForUsers28TokenName(tradeTokenHex, 1200*time.Millisecond); waitedOk {
-					lastTradePartnerName = waitedName
-					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] token hex %q matched name %q after wait", tradeTokenHex, waitedName))
+					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] resolved partner from parsed USERS28 trade_id %d -> %q", id, name))
+				} else if name, ok := waitForUsers28TradeIDName(id, 1200*time.Millisecond); ok {
+					lastTradePartnerName = name
+					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] resolved partner after wait from parsed USERS28 trade_id %d -> %q", id, name))
 				} else {
-					// Try short-token (first 2 bytes) as a fallback.
-					short := string(rawToken[:2])
-					if isLikelyChatToken(short) {
-						users28Mu.Lock()
-						if n, ok := users28ByShortToken[short]; ok {
-							lastTradePartnerName = n
-							a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] short token %q matched name %q", short, n))
-						}
-						users28Mu.Unlock()
-					}
+					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] parsed USERS28 has no current user for trade_id %d", id))
 				}
-
-				// If we have a name but not a room index yet, reverse-resolve the room index.
-				if lastTradePartnerID <= 0 && lastTradePartnerName != "" && !strings.EqualFold(lastTradePartnerName, "Unknown") {
-					if idx, ok := waitForUsers28RoomIndexByName(lastTradePartnerName, 500*time.Millisecond); ok {
-						lastTradePartnerID = idx
-						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] resolved room index %d from token-matched name %q", idx, lastTradePartnerName))
-					}
-				}
-
-				// Final token-based fallback that resolves both room index and name.
-				if lastTradePartnerName == "" || strings.EqualFold(lastTradePartnerName, "Unknown") || lastTradePartnerID <= 0 {
-					if idx, name, ok := resolveTradeTokenToRoomIndex(string(rawToken)); ok {
-						if lastTradePartnerID <= 0 {
-							lastTradePartnerID = idx
-						}
-						if lastTradePartnerName == "" || strings.EqualFold(lastTradePartnerName, "Unknown") {
-							lastTradePartnerName = name
-						}
-						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] resolved token to room index %d and name %q", idx, name))
-					}
-				}
-			}
-
-			// Only trust the leading VL64 as the room index when it is plausible and
-			// can be confirmed by the USERS28 cache. Otherwise keep the token-based
-			// resolution above and ignore the implausible decode.
-			vlen := gencoding.VL64DecodeLen(e.Packet.Data[0])
-			if vlen > 0 && vlen <= len(e.Packet.Data) {
-				traderRoomIndex := gencoding.VL64Decode(e.Packet.Data[:vlen])
-				a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] leading VL64 candidate room index %d", traderRoomIndex))
-				if isPlausibleTradeRoomIndex(traderRoomIndex) {
-					if indexName, indexOk := lookupUsers28Index(traderRoomIndex); indexOk {
-						lastTradePartnerID = traderRoomIndex
-						if lastTradePartnerName == "" || strings.EqualFold(lastTradePartnerName, "Unknown") {
-							lastTradePartnerName = indexName
-						}
-						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] confirmed room index %d as %q", traderRoomIndex, indexName))
-					} else if waitedName, waitedOk := waitForUsers28IndexName(traderRoomIndex, 500*time.Millisecond); waitedOk {
-						lastTradePartnerID = traderRoomIndex
-						if lastTradePartnerName == "" || strings.EqualFold(lastTradePartnerName, "Unknown") {
-							lastTradePartnerName = waitedName
-						}
-						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] confirmed room index %d as %q after wait", traderRoomIndex, waitedName))
-					} else {
-						a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] plausible room index %d was not present in USERS28 cache", traderRoomIndex))
-					}
-				} else {
-					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] ignoring implausible leading VL64 room index %d", traderRoomIndex))
-				}
+			} else {
+				a.AddLogMsg("[TRADE_OPEN] unable to decode incoming trade-open trade_id")
 			}
 		}
 
@@ -2008,14 +1965,8 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			partnerID := lastTradePartnerID
 			outPreview := string(ext.NewPacket(out.TRADE_OPEN, partnerID).Data)
 			a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #%d] derived outgoing[%d] -> %s (partner id %d)", tradeOpenCount, 71, outPreview, partnerID))
-		} else if partnerID, ok := extractTradePartnerID(tradePayload); ok {
-			lastTradePartnerID = partnerID
-			lastTradePartnerName = "Unknown"
-			outPreview := string(ext.NewPacket(out.TRADE_OPEN, partnerID).Data)
-			a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #%d] fallback candidate outgoing[%d] -> %s (partner id %d)", tradeOpenCount, 71, outPreview, partnerID))
 		} else {
-			lastTradePartnerID = 0
-			a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #%d] unresolved reopen target: waiting for room-user mapping", tradeOpenCount))
+			a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #%d] unresolved reopen target from strict parsed USERS28 state", tradeOpenCount))
 		}
 		awaitingTradeOpen = false
 		dealerAcceptingTrades = false
@@ -2031,29 +1982,15 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		if partnerName == "" {
 			partnerName = "Unknown"
 		}
-		// If the incoming trade partner is unknown, try a short recovery window before rejecting.
 		if !isPayoutTradeOpen && !matchedRecentOutgoing {
 			if partnerName == "" || strings.EqualFold(partnerName, "Unknown") {
-				a.AddLogMsg("[TRADE_OPEN] partner unresolved on first pass, attempting recovery")
-				if recoveredName, recoveredID, ok := a.recoverUnknownTradePartner(e.Packet.Data, 2*time.Second); ok {
-					partnerName = normalizeUsername(strings.TrimSpace(recoveredName))
-					lastTradePartnerName = partnerName
-					if recoveredID > 0 {
-						lastTradePartnerID = recoveredID
-					}
-					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] recovered unknown partner as %q (id=%d)", partnerName, lastTradePartnerID))
-				} else {
-					notify := "Sorry can't see you right now, please try again or rejoin room"
-					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] unknown partner after recovery window, cancelling trade: %s", notify))
-					e.Block()
-					ext.Send(out.TRADE_CLOSE)
-					ext.Send(out.SHOUT, notify)
-					return
-				}
+				notify := "Sorry can't identify you from the current room-user state, please rejoin room and try again"
+				a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] unresolved partner from strict parsed USERS28 state, cancelling trade: %s", notify))
+				e.Block()
+				ext.Send(out.TRADE_CLOSE)
+				ext.Send(out.SHOUT, notify)
+				return
 			}
-		}
-		if partnerName != "" && !strings.EqualFold(partnerName, "Unknown") && strings.TrimSpace(lastTradePartnerToken) != "" {
-			rememberRecentTradePartner(lastTradePartnerToken, partnerName)
 		}
 		openMsg := fmt.Sprintf("Trade Opened: \"%s\"", partnerName)
 		shouldAnnounceTradeOpen := true
@@ -2444,8 +2381,8 @@ func startPayout(a *App, targetID int, targetName string) {
 					a.AddLogMsg(fmt.Sprintf("[PAYOUT] refreshed %s target from ROOM_USERS index %d -> %d", targetName, targetID, resolvedID))
 					targetID = resolvedID
 					payoutTargetID = resolvedID
-				} else if resolvedID, ok := waitForUsers28RoomIndexByName(targetName, 700*time.Millisecond); ok && resolvedID > 0 && resolvedID != targetID {
-					a.AddLogMsg(fmt.Sprintf("[PAYOUT] refreshed %s target from USERS28 room index %d -> %d", targetName, targetID, resolvedID))
+				} else if resolvedID, ok := waitForUsers28TradeIDByName(targetName, 700*time.Millisecond); ok && resolvedID > 0 && resolvedID != targetID {
+					a.AddLogMsg(fmt.Sprintf("[PAYOUT] refreshed %s target from USERS28 trade id %d -> %d", targetName, targetID, resolvedID))
 					targetID = resolvedID
 					payoutTargetID = resolvedID
 				} else if resolvedID, ok := waitForUsers28NameIndex(targetName, 700*time.Millisecond); ok {
@@ -3414,6 +3351,27 @@ func scanTradeOpenFields(data []byte) []string {
 	return lines
 }
 
+func users28UserEqual(a ParsedUsers28User, b ParsedUsers28User) bool {
+	return strings.TrimSpace(a.Username) == strings.TrimSpace(b.Username) &&
+		a.TradeID == b.TradeID &&
+		strings.TrimSpace(a.TradeIDRaw) == strings.TrimSpace(b.TradeIDRaw) &&
+		a.ChatID == b.ChatID &&
+		strings.TrimSpace(a.ChatIDRaw) == strings.TrimSpace(b.ChatIDRaw) &&
+		strings.TrimSpace(a.EntityID) == strings.TrimSpace(b.EntityID) &&
+		strings.TrimSpace(a.Figure) == strings.TrimSpace(b.Figure) &&
+		strings.TrimSpace(a.Sex) == strings.TrimSpace(b.Sex) &&
+		strings.TrimSpace(a.Motto) == strings.TrimSpace(b.Motto) &&
+		strings.TrimSpace(a.TokenHex) == strings.TrimSpace(b.TokenHex)
+}
+
+func parseUsers28Int(raw string) int {
+	v, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
 func handleUsers28Packet(a *App, e *g.Intercept) {
 	if e.Packet.Header.Dir != g.In || e.Packet.Header.Value != 28 {
 		return
@@ -3426,241 +3384,52 @@ func handleUsers28Packet(a *App, e *g.Intercept) {
 		a.AddLogMsg(fmt.Sprintf("[USERS28_PY] parser failed: %v", err))
 		return
 	}
+	if parsed == nil || len(parsed.Users) == 0 {
+		a.AddLogMsg(fmt.Sprintf("[USERS28_PY] parser returned no users for len=%d", len(e.Packet.Data)))
+		return
+	}
 
-	// Build a single canonical users map for this packet, then atomically
-	// replace the global registry and derived caches. This ensures a single
-	// authoritative source for user lookups and avoids scattered updates.
+	joined := make([]string, 0)
+	changed := make([]string, 0)
+
 	users28Mu.Lock()
-	prev := map[string]RoomIdentityEntry{}
-	for k, v := range roomIdentityByShortToken {
-		prev[k] = v
-	}
-	oldCanonical := map[string]ParsedUsers28User{}
-	for k, v := range users28Canonical {
-		oldCanonical[k] = v
-	}
-	oldByToken := map[string]string{}
-	for k, v := range users28ByToken {
-		oldByToken[k] = v
-	}
-	oldByIndex := map[int]string{}
-	for k, v := range users28ByIndex {
-		oldByIndex[k] = v
-	}
-	oldByShort := map[string]string{}
-	for k, v := range users28ByShortToken {
-		oldByShort[k] = v
-	}
-	oldRoomIdentity := map[string]RoomIdentityEntry{}
-	for k, v := range roomIdentityByShortToken {
-		oldRoomIdentity[k] = v
-	}
-	users28Mu.Unlock()
-
-	canonicalLocal := map[string]ParsedUsers28User{}
-	byTokenLocal := map[string]string{}
-	// Origins USERS28 sometimes yields one good room index followed by garbage for later users.
-	// When that happens, keep the valid index and infer subsequent nearby indices sequentially.
-	prevValidRoomIndex := 0
-	byIndexLocal := map[int]string{}
-	byShortLocal := map[string]string{}
-	roomIdentityLocal := map[string]RoomIdentityEntry{}
-	parsedInfoLocal := map[string]map[string]interface{}{}
-
 	for _, u := range parsed.Users {
-		rawName := strings.TrimSpace(u.DetectedName)
-		if rawName == "" {
-			rawName = strings.TrimSpace(u.Name)
-		}
-		name := normalizeUsername(strings.TrimSpace(u.Name))
-		if name == "" {
-			name = normalizeUsername(rawName)
-		}
-		token := strings.TrimSpace(u.TokenHex)
-		short := strings.TrimSpace(u.ShortToken)
-
-		if name == "" {
+		username := strings.TrimSpace(u.Username)
+		if username == "" {
 			continue
 		}
-		if token != "" {
-			rememberRecentTradePartner(token, name)
+		key := strings.ToLower(username)
+		oldUser, exists := users28Canonical[key]
+		if !exists {
+			joined = append(joined, u.Username)
+		} else if !users28UserEqual(oldUser, u) {
+			changed = append(changed, fmt.Sprintf("%s(chat:%d->%d trade:%s->%s)", u.Username, oldUser.ChatID, u.ChatID, oldUser.TradeIDRaw, u.TradeIDRaw))
 		}
 
-		if rawName != "" && rawName != name {
-			a.AddLogMsg(fmt.Sprintf("[USERS28_FIX] cleaned name %q -> %q figureMatch=%t alias=%q", rawName, name, u.FigureMatch, u.MatchedAlias))
+		users28Canonical[key] = u
+		if token := strings.TrimSpace(u.TokenHex); token != "" {
+			users28ByToken[token] = u
 		}
-
-		roomIndex := u.RoomIndex
-		if !isPlausibleUsers28RoomIndex(roomIndex) {
-			if prevValidRoomIndex > 0 {
-				roomIndex = prevValidRoomIndex + 1
-				a.AddLogMsg(fmt.Sprintf("[USERS28_FIX] inferred room index %d for %q from previous valid index %d", roomIndex, name, prevValidRoomIndex))
-			} else {
-				roomIndex = 0
-			}
+		if u.ChatID > 0 {
+			users28ByIndex[u.ChatID] = u
 		}
-		if roomIndex > 0 {
-			prevValidRoomIndex = roomIndex
+		if u.TradeID > 0 {
+			users28ByTradeID[u.TradeID] = u
 		}
-
-		// In Origins chat packets, the speaking index matches the room index.
-		// Do not derive this from short tokens like "R]" because that creates fake ids such as 1181.
-		chatIndex := 0
-		if isPlausibleUsers28RoomIndex(roomIndex) {
-			chatIndex = roomIndex
-		} else if isPlausibleUsers28RoomIndex(u.ChatID) {
-			chatIndex = u.ChatID
-		}
-		if short == "" && roomIndex > 0 {
-			short = shortTokenFromIndex(roomIndex)
-		}
-
-		u.RoomIndex = roomIndex
-		u.ChatID = chatIndex
-
-		// canonical key: prefer token_hex, otherwise a name-based key
-		key := token
-		if key == "" {
-			key = "name:" + strings.ToLower(name)
-		}
-		canonicalLocal[key] = u
-
-		if token != "" {
-			byTokenLocal[token] = name
-			if decoded, err := hex.DecodeString(token); err == nil && len(decoded) == 4 {
-				byTokenLocal[string(decoded)] = name
-			}
-			parsedInfoLocal[token] = map[string]interface{}{
-				"name":          name,
-				"detected_name": rawName,
-				"token_hex":     u.TokenHex,
-				"short_token":   u.ShortToken,
-				"chat_id":       chatIndex,
-				"room_index":    u.RoomIndex,
-				"figureString":  u.FigureString,
-				"motto":         u.Motto,
-				"figure_match":  u.FigureMatch,
-				"matched_alias": u.MatchedAlias,
-				"origins":       u.Origins,
-			}
-		}
-
-		if isPlausibleUsers28RoomIndex(u.RoomIndex) {
-			byIndexLocal[u.RoomIndex] = name
-		}
-		if isPlausibleUsers28RoomIndex(chatIndex) {
-			byIndexLocal[chatIndex] = name
-		}
-		if short != "" {
-			byShortLocal[short] = name
-			roomIdentityLocal[short] = RoomIdentityEntry{
-				Name:      name,
-				Token:     token,
-				Short:     short,
-				ChatIndex: chatIndex,
-				RoomIndex: u.RoomIndex,
-			}
-		}
-
-		a.AddLogMsg(fmt.Sprintf(
-			"[USERS28_PY] stored name=%q detected=%q roomIndex=%d chatID=%d short=%q token=%q gender=%q x=%d y=%d figureMatch=%t alias=%q",
-			name, rawName, u.RoomIndex, chatIndex, short, token, u.Gender, u.X, u.Y, u.FigureMatch, u.MatchedAlias,
-		))
-		log.Printf(
-			"[USERS28_PY] stored name=%q detected=%q roomIndex=%d chatID=%d short=%q token=%q gender=%q x=%d y=%d figureMatch=%t alias=%q",
-			name, rawName, u.RoomIndex, chatIndex, short, token, u.Gender, u.X, u.Y, u.FigureMatch, u.MatchedAlias,
-		)
-	}
-
-	partialUsers28Update := len(canonicalLocal) > 0 && len(oldCanonical) >= 3 && len(canonicalLocal) < len(oldCanonical)/2 && len(e.Packet.Data) < 300
-	if partialUsers28Update {
-		a.AddLogMsg(fmt.Sprintf("[USERS28_PARTIAL] merge-only update len=%d parsed=%d prev=%d", len(e.Packet.Data), len(canonicalLocal), len(oldCanonical)))
-		for k, v := range oldCanonical {
-			if _, ok := canonicalLocal[k]; !ok {
-				canonicalLocal[k] = v
-			}
-		}
-		for k, v := range oldByToken {
-			if _, ok := byTokenLocal[k]; !ok {
-				byTokenLocal[k] = v
-			}
-		}
-		for k, v := range oldByIndex {
-			if _, ok := byIndexLocal[k]; !ok {
-				byIndexLocal[k] = v
-			}
-		}
-		for k, v := range oldByShort {
-			if _, ok := byShortLocal[k]; !ok {
-				byShortLocal[k] = v
-			}
-		}
-		for k, v := range oldRoomIdentity {
-			if _, ok := roomIdentityLocal[k]; !ok {
-				roomIdentityLocal[k] = v
-			}
-		}
-	}
-
-	// Detect changes vs previous canonical registry for diagnostics
-	for k, newU := range canonicalLocal {
-		if oldU, ok := oldCanonical[k]; ok {
-			if oldU.FigureString != newU.FigureString || oldU.RoomIndex != newU.RoomIndex || normalizeUsername(oldU.Name) != normalizeUsername(newU.Name) {
-				a.AddLogMsg(fmt.Sprintf("[USERS28_CHANGE] token=%q name %q->%q room %d->%d figureChanged=%t", k, oldU.Name, newU.Name, oldU.RoomIndex, newU.RoomIndex, oldU.FigureString != newU.FigureString))
-			}
-		}
-	}
-
-	// Atomically replace global registries with local built maps
-	users28Mu.Lock()
-	users28Canonical = canonicalLocal
-	users28ByToken = byTokenLocal
-	users28ByIndex = byIndexLocal
-	users28ByShortToken = byShortLocal
-	roomIdentityByShortToken = roomIdentityLocal
-	users28Mu.Unlock()
-
-	parsedUserInfoMu.Lock()
-	parsedUserInfoByToken = parsedInfoLocal
-	parsedUserInfoMu.Unlock()
-
-	// Compute joined / left based on short-token identity snapshot
-	joined := make([]string, 0)
-	left := make([]string, 0)
-	users28Mu.Lock()
-	for short, curr := range roomIdentityByShortToken {
-		if _, ok := prev[short]; !ok {
-			joined = append(joined, fmt.Sprintf("%s(%s)", curr.Name, short))
-		}
-	}
-	for short, old := range prev {
-		if _, ok := roomIdentityByShortToken[short]; !ok {
-			left = append(left, fmt.Sprintf("%s(%s)", old.Name, short))
-		}
+		a.AddLogMsg(fmt.Sprintf("[ROOM_USERS_DEBUG] stored user=%s chat_id=%d chat_raw=%s trade_id=%d trade_raw=%s", u.Username, u.ChatID, u.ChatIDRaw, u.TradeID, u.TradeIDRaw))
 	}
 	users28Mu.Unlock()
 
-	if partialUsers28Update {
-		left = nil
-	}
 	sort.Strings(joined)
-	sort.Strings(left)
+	sort.Strings(changed)
 	if len(joined) > 0 {
 		a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] joined: %s", strings.Join(joined, ", ")))
 	}
-	if len(left) > 0 {
-		a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] left: %s", strings.Join(left, ", ")))
+	if len(changed) > 0 {
+		a.AddLogMsg(fmt.Sprintf("[ROOM_USERS] replaced: %s", strings.Join(changed, ", ")))
 	}
 
 	a.emitRoomIdentityUpdate()
-
-	for _, u := range parsed.Users {
-		cleanName := normalizeUsername(u.Name)
-		a.AddLogMsg(fmt.Sprintf("[USERS28] header=%d token=%q short=%q name=%q roomIndex=%d", e.Packet.Header.Value, u.TokenHex, u.ShortToken, cleanName, u.RoomIndex))
-		if isPlausibleUsers28RoomIndex(u.ChatID) {
-			a.AddLogMsg(fmt.Sprintf("[USERS28_DEBUG] name=%q roomIndex=%d chatIndex=%d short=%q token=%q", cleanName, u.RoomIndex, u.ChatID, u.ShortToken, u.TokenHex))
-		}
-	}
 }
 
 func clearRoomUserCaches(a *App) {
@@ -3669,20 +3438,21 @@ func clearRoomUserCaches(a *App) {
 	roomMu.Unlock()
 
 	users28Mu.Lock()
+	clear(users28Canonical)
 	clear(users28ByToken)
 	clear(users28ByIndex)
-	clear(users28ByShortToken)
-	clear(roomIdentityByShortToken)
+	clear(users28ByTradeID)
 	users28Mu.Unlock()
 
-	// clear parsed external info as room membership changed
-	parsedUserInfoMu.Lock()
-	for k := range parsedUserInfoByToken {
-		delete(parsedUserInfoByToken, k)
-	}
-	parsedUserInfoMu.Unlock()
-
 	a.emitRoomIdentityUpdate()
+}
+
+func handleRoomResetPacket(a *App, e *g.Intercept) {
+	if e.Packet.Header.Dir != g.In || e.Packet.Header.Value != 54 {
+		return
+	}
+	clearRoomUserCaches(a)
+	a.AddLogMsg("[ROOM_USERS] cleared cached room users due to FLATINFO[54]")
 }
 
 func (a *App) resetDealerSessionState(reason string) {
@@ -3732,34 +3502,68 @@ func (a *App) resetDealerSessionState(reason string) {
 func lookupUsers28Token(token string) (string, bool) {
 	users28Mu.Lock()
 	defer users28Mu.Unlock()
-	name, ok := users28ByToken[token]
-	name = normalizeUsername(name)
-	if !ok || strings.TrimSpace(name) == "" {
+	u, ok := users28ByToken[strings.TrimSpace(token)]
+	if !ok || strings.TrimSpace(u.Username) == "" {
 		return "", false
 	}
-	return name, true
+	return u.Username, true
 }
 
 func lookupUsers28Index(index int) (string, bool) {
 	users28Mu.Lock()
 	defer users28Mu.Unlock()
-	name, ok := users28ByIndex[index]
-	if (!ok || strings.TrimSpace(name) == "") && index > 0 {
-		if short := shortTokenFromIndex(index); short != "" {
-			if byShort, ok2 := users28ByShortToken[short]; ok2 {
-				name = byShort
-				ok = true
-			}
+	u, ok := users28ByIndex[index]
+	if !ok || strings.TrimSpace(u.Username) == "" {
+		return "", false
+	}
+	return u.Username, true
+}
+
+func lookupUsers28TradeID(id int) (string, bool) {
+	users28Mu.Lock()
+	defer users28Mu.Unlock()
+	u, ok := users28ByTradeID[id]
+	if !ok || strings.TrimSpace(u.Username) == "" {
+		return "", false
+	}
+	return u.Username, true
+}
+
+func lookupUsers28TradeIDByName(name string) (int, bool) {
+	needle := strings.ToLower(strings.TrimSpace(name))
+	if needle == "" {
+		return 0, false
+	}
+	users28Mu.Lock()
+	defer users28Mu.Unlock()
+	for id, user := range users28ByTradeID {
+		if strings.ToLower(strings.TrimSpace(user.Username)) == needle && id > 0 {
+			return id, true
 		}
 	}
-	if !ok {
-		return "", false
+	return 0, false
+}
+
+func waitForUsers28TradeIDName(id int, timeout time.Duration) (string, bool) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if name, ok := lookupUsers28TradeID(id); ok {
+			return name, true
+		}
+		time.Sleep(75 * time.Millisecond)
 	}
-	name = normalizeUsername(name)
-	if name == "" {
-		return "", false
+	return "", false
+}
+
+func waitForUsers28TradeIDByName(name string, timeout time.Duration) (int, bool) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if id, ok := lookupUsers28TradeIDByName(name); ok {
+			return id, true
+		}
+		time.Sleep(75 * time.Millisecond)
 	}
-	return name, true
+	return 0, false
 }
 
 func waitForUsers28IndexName(index int, timeout time.Duration) (string, bool) {
@@ -3786,7 +3590,7 @@ func waitForUsers28TokenName(token string, timeout time.Duration) (string, bool)
 
 func rememberRecentTradePartner(token string, name string) {
 	token = strings.TrimSpace(token)
-	name = normalizeUsername(strings.TrimSpace(name))
+	name = strings.TrimSpace(name)
 	if token == "" || name == "" {
 		return
 	}
@@ -3813,86 +3617,13 @@ func lookupRecentTradePartner(token string, maxAge time.Duration) (string, bool)
 		delete(recentTradePartnerSeenAt, token)
 		return "", false
 	}
-	name = normalizeUsername(name)
-	if name == "" {
+	if strings.TrimSpace(name) == "" {
 		return "", false
 	}
 	return name, true
 }
 
 func (a *App) recoverUnknownTradePartner(packetData []byte, timeout time.Duration) (string, int, bool) {
-	deadline := time.Now().Add(timeout)
-	tradeTokenHex := ""
-	tradeShort := ""
-	if len(packetData) >= 4 {
-		rawToken := packetData[:4]
-		tradeTokenHex = hex.EncodeToString(rawToken)
-		tradeShort = string(rawToken[:2])
-	}
-
-	for {
-		go requestRoomUsers(a)
-
-		if tradeTokenHex != "" {
-			if name, ok := lookupUsers28Token(tradeTokenHex); ok {
-				idx := 0
-				if resolvedIdx, ok := waitForUsers28RoomIndexByName(name, 250*time.Millisecond); ok {
-					idx = resolvedIdx
-				}
-				rememberRecentTradePartner(tradeTokenHex, name)
-				return name, idx, true
-			}
-			if name, ok := lookupRecentTradePartner(tradeTokenHex, 10*time.Minute); ok {
-				idx := 0
-				if resolvedIdx, ok := waitForUsers28RoomIndexByName(name, 250*time.Millisecond); ok {
-					idx = resolvedIdx
-				}
-				return name, idx, true
-			}
-			if idx, name, ok := resolveTradeTokenToRoomIndex(string(packetData[:4])); ok {
-				rememberRecentTradePartner(tradeTokenHex, name)
-				return normalizeUsername(name), idx, true
-			}
-		}
-
-		if tradeShort != "" && isLikelyChatToken(tradeShort) {
-			users28Mu.Lock()
-			name, ok := users28ByShortToken[tradeShort]
-			users28Mu.Unlock()
-			name = normalizeUsername(name)
-			if ok && name != "" {
-				idx := 0
-				if resolvedIdx, ok := waitForUsers28RoomIndexByName(name, 250*time.Millisecond); ok {
-					idx = resolvedIdx
-				}
-				if tradeTokenHex != "" {
-					rememberRecentTradePartner(tradeTokenHex, name)
-				}
-				return name, idx, true
-			}
-		}
-
-		if len(packetData) > 0 {
-			vlen := gencoding.VL64DecodeLen(packetData[0])
-			if vlen > 0 && vlen <= len(packetData) {
-				idx := gencoding.VL64Decode(packetData[:vlen])
-				if isPlausibleTradeRoomIndex(idx) {
-					if name, ok := lookupUsers28Index(idx); ok {
-						if tradeTokenHex != "" {
-							rememberRecentTradePartner(tradeTokenHex, name)
-						}
-						return name, idx, true
-					}
-				}
-			}
-		}
-
-		if time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(125 * time.Millisecond)
-	}
-
 	return "", 0, false
 }
 
@@ -3905,26 +3636,15 @@ func isPlausibleUsers28RoomIndex(index int) bool {
 }
 
 func lookupUsers28NameIndex(name string) (int, bool) {
-	needle := strings.ToLower(normalizeUsername(name))
+	needle := strings.ToLower(strings.TrimSpace(name))
 	if needle == "" {
 		return 0, false
 	}
 
 	users28Mu.Lock()
 	defer users28Mu.Unlock()
-	for _, entry := range roomIdentityByShortToken {
-		if strings.ToLower(strings.TrimSpace(entry.Name)) != needle {
-			continue
-		}
-		if isPlausibleUsers28RoomIndex(entry.ChatIndex) {
-			return entry.ChatIndex, true
-		}
-		if isPlausibleUsers28RoomIndex(entry.RoomIndex) {
-			return entry.RoomIndex, true
-		}
-	}
-	for idx, cachedName := range users28ByIndex {
-		if strings.ToLower(strings.TrimSpace(cachedName)) == needle && isPlausibleUsers28RoomIndex(idx) {
+	for idx, user := range users28ByIndex {
+		if strings.ToLower(strings.TrimSpace(user.Username)) == needle && isPlausibleUsers28RoomIndex(idx) {
 			return idx, true
 		}
 	}
@@ -3932,19 +3652,7 @@ func lookupUsers28NameIndex(name string) (int, bool) {
 }
 
 func lookupUsers28RoomIndexByName(name string) (int, bool) {
-	needle := strings.ToLower(normalizeUsername(name))
-	if needle == "" {
-		return 0, false
-	}
-
-	users28Mu.Lock()
-	defer users28Mu.Unlock()
-	for _, entry := range roomIdentityByShortToken {
-		if entry.RoomIndex > 0 && strings.ToLower(strings.TrimSpace(entry.Name)) == needle {
-			return entry.RoomIndex, true
-		}
-	}
-	return 0, false
+	return lookupUsers28NameIndex(name)
 }
 
 func waitForUsers28RoomIndexByName(name string, timeout time.Duration) (int, bool) {
@@ -4048,30 +3756,7 @@ func chatIndexFromShortToken(token string) (idx int, ok bool) {
 }
 
 func lookupRoomIdentityByChatIndex(index int) (string, bool) {
-	if index <= 0 {
-		return "", false
-	}
-
-	users28Mu.Lock()
-	defer users28Mu.Unlock()
-
-	if name, ok := users28ByIndex[index]; ok {
-		name = strings.TrimSpace(name)
-		if name != "" {
-			return name, true
-		}
-	}
-
-	for _, entry := range roomIdentityByShortToken {
-		if entry.ChatIndex == index || entry.RoomIndex == index {
-			name := strings.TrimSpace(entry.Name)
-			if name != "" {
-				return name, true
-			}
-		}
-	}
-
-	return "", false
+	return lookupUsers28Index(index)
 }
 
 func shortTokenCandidates(token string) []string {
@@ -4094,47 +3779,22 @@ func shortTokenCandidates(token string) []string {
 	return out
 }
 
-// runUsers28PythonParser writes the binary packet to a temporary file and
-// invokes the Python parser with --file <tmp> --json, returning typed
-// ParsedUsers28Result.
+// runUsers28PythonParser writes the exact raw packet bytes to a temporary file,
+// invokes the Python parser with --input <tmp> --json, and unmarshals the JSON.
 func runUsers28PythonParser(a *App, packetData []byte) (*ParsedUsers28Result, error) {
-	entries := extractUsers28Entries(string(packetData))
-	if len(entries) > 0 {
-		result := &ParsedUsers28Result{
-			Users:  make([]ParsedUsers28User, 0, len(entries)),
-			Trades: []ParsedUsers28Trade{},
+	scriptPath := filepath.Join("scripts", "parse_users28.py")
+	py := ""
+
+	if a != nil {
+		a.initUsers28ParserCommand()
+		if strings.TrimSpace(a.users28ParserScript) != "" {
+			scriptPath = a.users28ParserScript
 		}
-		for _, entry := range entries {
-			cleanName := strings.TrimSpace(entry.Name)
-			if cleanName == "" {
-				continue
-			}
-			tokenHex := ""
-			if entry.Token != "" {
-				tokenHex = hex.EncodeToString([]byte(entry.Token))
-			}
-			shortToken := strings.TrimSpace(entry.ShortToken)
-			if shortToken == "" && entry.RoomIndex > 0 {
-				shortToken = shortTokenFromIndex(entry.RoomIndex)
-			}
-			result.Users = append(result.Users, ParsedUsers28User{
-				Name:         cleanName,
-				DetectedName: cleanName,
-				Aliases:      []string{cleanName},
-				TokenHex:     tokenHex,
-				ShortToken:   shortToken,
-				ChatID:       entry.RoomIndex,
-				RoomIndex:    entry.RoomIndex,
-			})
-		}
-		if len(result.Users) > 0 {
-			return result, nil
-		}
+		py = strings.TrimSpace(a.users28PythonExec)
 	}
 
-	scriptPath := filepath.Join("scripts", "parse_users28.py")
 	if _, err := os.Stat(scriptPath); err != nil {
-		return nil, fmt.Errorf("users28 parser produced no users and %s is unavailable", scriptPath)
+		return nil, fmt.Errorf("users28 parser unavailable: %w", err)
 	}
 
 	tmpFile, err := os.CreateTemp("", "users28_*.bin")
@@ -4148,53 +3808,47 @@ func runUsers28PythonParser(a *App, packetData []byte) (*ParsedUsers28Result, er
 		tmpFile.Close()
 		return nil, err
 	}
-	tmpFile.Close()
-
-	py := "python"
-	if p, err := exec.LookPath("pythonw"); err == nil {
-		py = p
-	} else if p, err := exec.LookPath("python"); err == nil {
-		py = p
-	} else if p, err := exec.LookPath("python3"); err == nil {
-		py = p
-	} else {
-		return nil, fmt.Errorf("python not found in PATH")
+	if err := tmpFile.Close(); err != nil {
+		return nil, err
 	}
 
-	cmd := exec.Command(py, scriptPath, "--file", tmpPath, "--json")
+	if py == "" {
+		if p, err := exec.LookPath("python3"); err == nil {
+			py = p
+		} else if p, err := exec.LookPath("python"); err == nil {
+			py = p
+		} else {
+			return nil, fmt.Errorf("python not found in PATH")
+		}
+		if a != nil {
+			a.users28PythonExec = py
+		}
+	}
+
+	cmd := exec.Command(py, scriptPath, "--input", tmpPath, "--json")
 	cmd.Dir = "."
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		if a != nil && a.ctx != nil {
-			runtime.EventsEmit(a.ctx, "pyParserStdout", stdout.String())
-			runtime.EventsEmit(a.ctx, "pyParserStderr", stderr.String())
+		if a != nil {
+			a.AddLogMsg(fmt.Sprintf("[USERS28_PY] python parser failed: %v stderr=%s", err, strings.TrimSpace(stderr.String())))
 		}
 		return nil, fmt.Errorf("python parser failed: %w stderr=%s", err, stderr.String())
 	}
 
-	if a != nil && a.ctx != nil {
-		if stdout.Len() > 0 {
-			runtime.EventsEmit(a.ctx, "pyParserStdout", stdout.String())
-		}
-		if stderr.Len() > 0 {
-			runtime.EventsEmit(a.ctx, "pyParserStderr", stderr.String())
-		}
-	}
-
-	var parsed ParsedUsers28Result
-	if err := json.Unmarshal(stdout.Bytes(), &parsed); err != nil {
+	var users []ParsedUsers28User
+	if err := json.Unmarshal(stdout.Bytes(), &users); err != nil {
 		return nil, fmt.Errorf("failed to decode parser json: %w output=%s", err, stdout.String())
 	}
 
-	return &parsed, nil
+	return &ParsedUsers28Result{Users: users}, nil
 }
 
-// runParseUsersScript invokes the Python helper to parse a USERS/TRade blob
-// and returns a map keyed by token_hex (or name) -> parsed JSON object.
 func runParseUsersScript(a *App, data []byte) (map[string]map[string]interface{}, error) {
 	parsed, err := runUsers28PythonParser(a, data)
 	if err != nil {
@@ -4205,25 +3859,17 @@ func runParseUsersScript(a *App, data []byte) (map[string]map[string]interface{}
 	for _, u := range parsed.Users {
 		key := strings.TrimSpace(u.TokenHex)
 		if key == "" {
-			key = strings.ToLower(strings.TrimSpace(u.Name))
+			key = strings.ToLower(strings.TrimSpace(u.Username))
 		}
 		res[key] = map[string]interface{}{
-			"name":          u.Name,
-			"detected_name": u.DetectedName,
-			"aliases":       u.Aliases,
-			"token_hex":     u.TokenHex,
-			"short_token":   u.ShortToken,
-			"chat_id":       u.ChatID,
-			"room_index":    u.RoomIndex,
-			"figureString":  u.FigureString,
-			"motto":         u.Motto,
-			"gender":        u.Gender,
-			"x":             u.X,
-			"y":             u.Y,
-			"z":             u.Z,
-			"poolFigure":    u.PoolFigure,
-			"badgeCode":     u.BadgeCode,
-			"entityType":    u.EntityType,
+			"username":  u.Username,
+			"trade_id":  u.TradeID,
+			"chat_id":   u.ChatID,
+			"entity_id": u.EntityID,
+			"figure":    u.Figure,
+			"sex":       u.Sex,
+			"motto":     u.Motto,
+			"token_hex": u.TokenHex,
 		}
 	}
 	return res, nil
@@ -4573,8 +4219,8 @@ func (a *App) OpenLastTrade() {
 		if idx, ok := lookupRoomEntityIndexByName(lastTradePartnerName); ok && idx > 0 && idx != lastTradePartnerID {
 			a.AddLogMsg(fmt.Sprintf("Open Last Trade refreshed partner index from ROOM_USERS: %s (%d -> %d)", lastTradePartnerName, lastTradePartnerID, idx))
 			lastTradePartnerID = idx
-		} else if idx, ok := lookupUsers28NameIndex(lastTradePartnerName); ok && idx > 0 && idx != lastTradePartnerID {
-			a.AddLogMsg(fmt.Sprintf("Open Last Trade refreshed partner index from USERS28: %s (%d -> %d)", lastTradePartnerName, lastTradePartnerID, idx))
+		} else if idx, ok := lookupUsers28TradeIDByName(lastTradePartnerName); ok && idx > 0 && idx != lastTradePartnerID {
+			a.AddLogMsg(fmt.Sprintf("Open Last Trade refreshed partner trade id from USERS28: %s (%d -> %d)", lastTradePartnerName, lastTradePartnerID, idx))
 			lastTradePartnerID = idx
 		}
 	}
@@ -5730,7 +5376,7 @@ func (a *App) sendTradeCompletionMessage() {
 	}
 
 	if partnerName == "" || strings.EqualFold(partnerName, "Unknown") {
-		if resolved, ok := lookupUsers28Index(partnerID); ok {
+		if resolved, ok := lookupUsers28TradeID(partnerID); ok {
 			partnerName = normalizeUsername(strings.TrimSpace(resolved))
 			lastTradePartnerName = partnerName
 		} else if resolved, ok := lookupUsers28Token(partnerToken); ok {
@@ -5976,35 +5622,8 @@ func (a *App) handleRoomUsers(e *g.Intercept) {
 		}
 	}
 
-	// Keep USERS28-like caches warm from the structured USERS list too.
-	users28Mu.Lock()
-	for idx, entity := range parsedUsers {
-		name := strings.TrimSpace(entity.Name)
-		token := ""
-		if entityToken, clean, ok := splitTokenAndName(name); ok {
-			name = clean
-			token = entityToken
-			users28ByToken[entityToken] = clean
-			for _, short := range shortTokenCandidates(entityToken) {
-				users28ByShortToken[short] = clean
-			}
-		}
-		if name != "" {
-			users28ByIndex[idx] = name
-			if short := shortTokenFromIndex(idx); isLikelyChatToken(short) {
-				users28ByShortToken[short] = name
-				roomIdentityByShortToken[short] = RoomIdentityEntry{
-					Name:      name,
-					Token:     token,
-					Short:     short,
-					ChatIndex: idx,
-					RoomIndex: idx,
-				}
-			}
-		}
-	}
-	users28Mu.Unlock()
-	a.emitRoomIdentityUpdate()
+	// Do not populate USERS28 caches from structured room.Entity packets.
+	// USERS[28] parsed by Python is the only room-user source of truth.
 
 	roomMu.Lock()
 	for index, entity := range parsedUsers {
@@ -6045,21 +5664,23 @@ func shouldRefreshRoomUsers() bool {
 
 func (a *App) emitRoomIdentityUpdate() {
 	users28Mu.Lock()
-	entries := make([]RoomIdentityEntry, 0, len(roomIdentityByShortToken))
-	for _, entry := range roomIdentityByShortToken {
-		entries = append(entries, entry)
+	entries := make([]RoomIdentityEntry, 0, len(users28Canonical))
+	for _, user := range users28Canonical {
+		entries = append(entries, RoomIdentityEntry{
+			Name:      strings.TrimSpace(user.Username),
+			Short:     "",
+			ChatIndex: user.ChatID,
+			RoomIndex: user.TradeID,
+			Token:     strings.TrimSpace(user.TokenHex),
+			TradeID:   strings.TrimSpace(user.TradeIDRaw),
+			EntityID:  strings.TrimSpace(user.EntityID),
+		})
 	}
 	users28Mu.Unlock()
 
 	sort.Slice(entries, func(i, j int) bool {
 		if entries[i].ChatIndex == entries[j].ChatIndex {
 			return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name)
-		}
-		if entries[i].ChatIndex <= 0 {
-			return false
-		}
-		if entries[j].ChatIndex <= 0 {
-			return true
 		}
 		return entries[i].ChatIndex < entries[j].ChatIndex
 	})
@@ -6076,41 +5697,7 @@ func resolveChatSenderName(index int) (string, bool) {
 	if index <= 0 {
 		return "", false
 	}
-
-	// Prefer the structured room user cache.
-	roomMu.Lock()
-	entity, ok := roomEntities[index]
-	roomMu.Unlock()
-	if ok {
-		name := strings.TrimSpace(entity.Name)
-		if _, clean, ok2 := splitTokenAndName(name); ok2 {
-			name = clean
-		}
-		if name != "" {
-			return name, true
-		}
-	}
-
-	// Fall back to the USERS28 scan cache.
-	name, ok := lookupUsers28Index(index)
-	if ok {
-		return name, true
-	}
-
-	// Fall back to live room identity map keyed by short token -> name.
-	if mappedName, mappedOk := lookupRoomIdentityByChatIndex(index); mappedOk {
-		return mappedName, true
-	}
-
-	// Final fallback: match via 2-char chat token (e.g. "SD", "QD", "RD").
-	short := shortTokenFromIndex(index)
-	if !isLikelyChatToken(short) {
-		return "", false
-	}
-	users28Mu.Lock()
-	name, ok = users28ByShortToken[short]
-	users28Mu.Unlock()
-	return name, ok
+	return lookupUsers28Index(index)
 }
 
 func startIncomingHeaderSniff(duration time.Duration) {
@@ -6193,12 +5780,11 @@ func describeTradeRoomCandidates(ext *g.Ext) []string {
 	lines := make([]string, 0, len(indices))
 	for _, index := range indices {
 		entity := roomEntities[index]
-		token, cleanName, hasToken := splitTokenAndName(entity.Name)
+		_, cleanName, hasToken := splitTokenAndName(entity.Name)
 		displayName := entity.Name
 		if hasToken {
 			displayName = cleanName
 			users28Mu.Lock()
-			users28ByToken[token] = cleanName
 			users28Mu.Unlock()
 		}
 		libraryPayload := string(ext.NewPacket(out.TRADE_OPEN, index).Data)
@@ -8362,7 +7948,7 @@ func extractTradeTokenFromPacket(data []byte) string {
 	return string(data[vlen : vlen+4])
 }
 
-// lookupTokenByName reverses users28ByToken to find the 4-byte token for a name.
+// lookupTokenByName reverses parsed USERS28 token_hex values to find the token for a username.
 func lookupTokenByName(name string) (string, bool) {
 	needle := strings.ToLower(strings.TrimSpace(name))
 	if needle == "" {
@@ -8370,8 +7956,8 @@ func lookupTokenByName(name string) (string, bool) {
 	}
 	users28Mu.Lock()
 	defer users28Mu.Unlock()
-	for token, n := range users28ByToken {
-		if strings.ToLower(strings.TrimSpace(n)) == needle {
+	for token, u := range users28ByToken {
+		if strings.ToLower(strings.TrimSpace(u.Username)) == needle {
 			return token, true
 		}
 	}

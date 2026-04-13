@@ -47,6 +47,11 @@ var (
 	stableTradePartnerID                 int
 	stableTradePartnerName               string
 	stableTradePartnerToken              string
+	tradeStarterTradeID                  int
+	tradeStarterChatID                   int
+	tradeStarterName                     string
+	tradeStarterToken                    string
+	tradeStarterLocked                   bool
 	tradeAutoFlowID                      int
 	tradeAutoAccepted                    bool
 	tradeAutoConfirmed                   bool
@@ -1924,6 +1929,11 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			lastTradePartnerName = ""
 			lastTradePartnerID = 0
 			lastTradePartnerToken = ""
+			tradeStarterTradeID = 0
+			tradeStarterChatID = 0
+			tradeStarterName = ""
+			tradeStarterToken = ""
+			tradeStarterLocked = false
 		}
 
 		for _, decodeLine := range decodeTradeOpenPacket(e.Packet) {
@@ -1937,20 +1947,76 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		if len(e.Packet.Data) >= 1 {
 			go requestRoomUsers(a)
 
+			tradeToken := strings.TrimSpace(extractTradeTokenFromPacket(e.Packet.Data))
+			if tradeToken != "" {
+				lastTradePartnerToken = tradeToken
+				tradeStarterToken = tradeToken
+			}
+
 			if id, ok := decodeLeadingVL64(e.Packet.Data); ok {
 				lastTradePartnerID = id
-				if name, ok := lookupUsers28TradeID(id); ok {
-					lastTradePartnerName = name
-					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] resolved partner from parsed USERS28 trade_id %d -> %q", id, name))
-				} else if name, ok := waitForUsers28TradeIDName(id, 1200*time.Millisecond); ok {
-					lastTradePartnerName = name
-					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] resolved partner after wait from parsed USERS28 trade_id %d -> %q", id, name))
-				} else {
-					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] parsed USERS28 has no current user for trade_id %d", id))
-				}
+				tradeStarterTradeID = id
 			} else {
 				a.AddLogMsg("[TRADE_OPEN] unable to decode incoming trade-open trade_id")
 			}
+
+			resolved := false
+			if tradeStarterToken != "" {
+				if user, ok := lookupUsers28UserByToken(tradeStarterToken); ok {
+					tradeStarterName = strings.TrimSpace(user.Username)
+					tradeStarterChatID = user.ChatID
+					if user.TradeID > 0 {
+						tradeStarterTradeID = user.TradeID
+						lastTradePartnerID = user.TradeID
+					}
+					if strings.TrimSpace(user.TokenHex) != "" {
+						tradeStarterToken = strings.TrimSpace(user.TokenHex)
+						lastTradePartnerToken = tradeStarterToken
+					}
+					lastTradePartnerName = tradeStarterName
+					tradeStarterLocked = tradeStarterName != ""
+					resolved = tradeStarterLocked
+					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] resolved starter from trade token %q -> name=%q chat_id=%d trade_id=%d", tradeStarterToken, tradeStarterName, tradeStarterChatID, tradeStarterTradeID))
+				}
+			}
+
+			if !resolved && tradeStarterTradeID > 0 {
+				if user, ok := lookupUsers28UserByTradeID(tradeStarterTradeID); ok {
+					tradeStarterName = strings.TrimSpace(user.Username)
+					tradeStarterChatID = user.ChatID
+					if strings.TrimSpace(user.TokenHex) != "" {
+						tradeStarterToken = strings.TrimSpace(user.TokenHex)
+						lastTradePartnerToken = tradeStarterToken
+					}
+					lastTradePartnerName = tradeStarterName
+					tradeStarterLocked = tradeStarterName != ""
+					resolved = tradeStarterLocked
+					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] resolved starter from parsed USERS28 trade_id %d -> name=%q chat_id=%d", tradeStarterTradeID, tradeStarterName, tradeStarterChatID))
+				} else if name, ok := waitForUsers28TradeIDName(tradeStarterTradeID, 1200*time.Millisecond); ok {
+					tradeStarterName = strings.TrimSpace(name)
+					lastTradePartnerName = tradeStarterName
+					if chatIdx, ok := waitForUsers28RoomIndexByName(tradeStarterName, 900*time.Millisecond); ok {
+						tradeStarterChatID = chatIdx
+					}
+					tradeStarterLocked = tradeStarterName != ""
+					resolved = tradeStarterLocked
+					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] resolved starter after wait from parsed USERS28 trade_id %d -> name=%q chat_id=%d", tradeStarterTradeID, tradeStarterName, tradeStarterChatID))
+				} else {
+					a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN] parsed USERS28 has no current user for trade_id %d", tradeStarterTradeID))
+				}
+			}
+
+			if tradeStarterLocked && tradeStarterChatID <= 0 && tradeStarterName != "" {
+				if chatIdx, ok := lookupRoomEntityIndexByName(tradeStarterName); ok && chatIdx > 0 {
+					tradeStarterChatID = chatIdx
+				} else if chatIdx, ok := waitForUsers28RoomIndexByName(tradeStarterName, 900*time.Millisecond); ok && chatIdx > 0 {
+					tradeStarterChatID = chatIdx
+				} else if chatIdx, ok := lookupUsers28RoomIndexByName(tradeStarterName); ok && chatIdx > 0 {
+					tradeStarterChatID = chatIdx
+				}
+			}
+
+			a.AddLogMsg(fmt.Sprintf("[TRADE_STARTER] locked=%t name=%q trade_id=%d chat_id=%d token=%q", tradeStarterLocked, tradeStarterName, tradeStarterTradeID, tradeStarterChatID, tradeStarterToken))
 		}
 
 		tradePayload := strings.TrimSpace(string(e.Packet.Data))
@@ -1973,10 +2039,19 @@ func handleTradePacket(a *App, e *g.Intercept) {
 		dealerTradeWindowOpen = false
 		log.Printf("[TRADE_OPEN #%d] %s", tradeOpenCount, lastTradeOpen)
 		a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN #%d] %s", tradeOpenCount, lastTradeOpen))
-		stableTradePartnerID = lastTradePartnerID
-		stableTradePartnerName = strings.TrimSpace(lastTradePartnerName)
-		stableTradePartnerToken = strings.TrimSpace(lastTradePartnerToken)
-		a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN_STABLE] name=%q id=%d token=%q", stableTradePartnerName, stableTradePartnerID, stableTradePartnerToken))
+		stableTradePartnerID = tradeStarterTradeID
+		if stableTradePartnerID <= 0 {
+			stableTradePartnerID = lastTradePartnerID
+		}
+		stableTradePartnerName = strings.TrimSpace(tradeStarterName)
+		if stableTradePartnerName == "" {
+			stableTradePartnerName = strings.TrimSpace(lastTradePartnerName)
+		}
+		stableTradePartnerToken = strings.TrimSpace(tradeStarterToken)
+		if stableTradePartnerToken == "" {
+			stableTradePartnerToken = strings.TrimSpace(lastTradePartnerToken)
+		}
+		a.AddLogMsg(fmt.Sprintf("[TRADE_OPEN_STABLE] name=%q id=%d token=%q chat_id=%d", stableTradePartnerName, stableTradePartnerID, stableTradePartnerToken, tradeStarterChatID))
 
 		partnerName := strings.TrimSpace(lastTradePartnerName)
 		if partnerName == "" {
@@ -3471,6 +3546,11 @@ func (a *App) resetDealerSessionState(reason string) {
 	lastTradePartnerID = 0
 	lastTradePartnerName = ""
 	lastTradePartnerToken = ""
+	tradeStarterTradeID = 0
+	tradeStarterChatID = 0
+	tradeStarterName = ""
+	tradeStarterToken = ""
+	tradeStarterLocked = false
 	stableTradePartnerID = 0
 	stableTradePartnerName = ""
 	stableTradePartnerToken = ""
@@ -3542,6 +3622,30 @@ func lookupUsers28TradeIDByName(name string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+func lookupUsers28UserByTradeID(id int) (ParsedUsers28User, bool) {
+	users28Mu.Lock()
+	defer users28Mu.Unlock()
+	u, ok := users28ByTradeID[id]
+	if !ok {
+		return ParsedUsers28User{}, false
+	}
+	return u, true
+}
+
+func lookupUsers28UserByToken(token string) (ParsedUsers28User, bool) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return ParsedUsers28User{}, false
+	}
+	users28Mu.Lock()
+	defer users28Mu.Unlock()
+	u, ok := users28ByToken[token]
+	if !ok {
+		return ParsedUsers28User{}, false
+	}
+	return u, true
 }
 
 func waitForUsers28TradeIDName(id int, timeout time.Duration) (string, bool) {
@@ -4483,6 +4587,11 @@ func (a *App) reopenDealerIdle(reason string) {
 	lastTradePartnerID = 0
 	lastTradePartnerName = ""
 	lastTradePartnerToken = ""
+	tradeStarterTradeID = 0
+	tradeStarterChatID = 0
+	tradeStarterName = ""
+	tradeStarterToken = ""
+	tradeStarterLocked = false
 	stableTradePartnerID = 0
 	stableTradePartnerName = ""
 	stableTradePartnerToken = ""
@@ -4599,6 +4708,11 @@ func (a *App) openDealerAfterRound() {
 	lastTradePartnerName = ""
 	lastTradePartnerID = 0
 	lastTradePartnerToken = ""
+	tradeStarterTradeID = 0
+	tradeStarterChatID = 0
+	tradeStarterName = ""
+	tradeStarterToken = ""
+	tradeStarterLocked = false
 
 	ok := a.forceRefreshHandSnapshot("openDealerAfterRound")
 
@@ -5414,28 +5528,31 @@ func (a *App) sendTradeCompletionMessage() {
 	second := "Shout pkr, 21, 13, TriH, TriL"
 	awaitingGameChoice = true
 	gameChoiceUnreadableWarned = false
-	awaitingGameChoicePartnerName = normalizeUsername(strings.TrimSpace(lastTradePartnerName))
+	awaitingGameChoicePartnerName = normalizeUsername(strings.TrimSpace(tradeStarterName))
+	if awaitingGameChoicePartnerName == "" || strings.EqualFold(awaitingGameChoicePartnerName, "Unknown") {
+		awaitingGameChoicePartnerName = normalizeUsername(strings.TrimSpace(lastTradePartnerName))
+	}
 	if awaitingGameChoicePartnerName == "" || strings.EqualFold(awaitingGameChoicePartnerName, "Unknown") {
 		awaitingGameChoicePartnerName = normalizeUsername(strings.TrimSpace(stableTradePartnerName))
 	}
 
 	awaitingGameChoicePartnerID = 0
-	if isPlausibleUsers28RoomIndex(lastTradePartnerID) {
-		awaitingGameChoicePartnerID = lastTradePartnerID
-	} else if isPlausibleUsers28RoomIndex(stableTradePartnerID) {
-		awaitingGameChoicePartnerID = stableTradePartnerID
+	if tradeStarterChatID > 0 {
+		awaitingGameChoicePartnerID = tradeStarterChatID
 	}
 
-	if chatIdx, ok := lookupRoomEntityIndexByName(awaitingGameChoicePartnerName); ok && chatIdx > 0 {
-		awaitingGameChoicePartnerID = chatIdx
-	} else if chatIdx, ok := waitForUsers28RoomIndexByName(awaitingGameChoicePartnerName, 900*time.Millisecond); ok && chatIdx > 0 {
-		awaitingGameChoicePartnerID = chatIdx
-	} else if chatIdx, ok := lookupUsers28RoomIndexByName(awaitingGameChoicePartnerName); ok && chatIdx > 0 {
-		awaitingGameChoicePartnerID = chatIdx
+	if awaitingGameChoicePartnerID <= 0 && awaitingGameChoicePartnerName != "" {
+		if chatIdx, ok := lookupRoomEntityIndexByName(awaitingGameChoicePartnerName); ok && chatIdx > 0 {
+			awaitingGameChoicePartnerID = chatIdx
+		} else if chatIdx, ok := waitForUsers28RoomIndexByName(awaitingGameChoicePartnerName, 900*time.Millisecond); ok && chatIdx > 0 {
+			awaitingGameChoicePartnerID = chatIdx
+		} else if chatIdx, ok := lookupUsers28RoomIndexByName(awaitingGameChoicePartnerName); ok && chatIdx > 0 {
+			awaitingGameChoicePartnerID = chatIdx
+		}
 	}
 
-	a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE_DEBUG] partner=%q lastTradePartnerID=%d stableTradePartnerID=%d awaitingGameChoicePartnerID=%d",
-		awaitingGameChoicePartnerName, lastTradePartnerID, stableTradePartnerID, awaitingGameChoicePartnerID))
+	a.AddLogMsg(fmt.Sprintf("[TRADE_MESSAGE_DEBUG] starter=%q starterTradeID=%d starterChatID=%d awaitingGameChoicePartnerID=%d stableTradePartnerID=%d",
+		awaitingGameChoicePartnerName, tradeStarterTradeID, tradeStarterChatID, awaitingGameChoicePartnerID, stableTradePartnerID))
 
 	a.startGameChoiceTimeoutMonitor()
 
@@ -5697,7 +5814,10 @@ func resolveChatSenderName(index int) (string, bool) {
 	if index <= 0 {
 		return "", false
 	}
-	return lookupUsers28Index(index)
+	if name, ok := lookupUsers28Index(index); ok {
+		return name, true
+	}
+	return lookupRoomEntityNameByIndex(index)
 }
 
 func startIncomingHeaderSniff(duration time.Duration) {
@@ -7653,86 +7773,28 @@ func (a *App) handleIncomingChat(e *g.Intercept) {
 
 	// senderName already resolved above.
 
-	// Accept only if sender matches by room index OR by name.
+	// Accept only if sender matches the locked trade starter.
 	indexMatch := awaitingGameChoicePartnerID > 0 && index == awaitingGameChoicePartnerID
 	nameMatch := awaitingGameChoicePartnerName != "" && strings.EqualFold(senderName, awaitingGameChoicePartnerName)
-	// Fallback 1: stored ID may be a USERS28/virtual id instead of chat index;
-	// look up the partner's chat index via roomEntities by name.
+
 	if !indexMatch && !nameMatch && awaitingGameChoicePartnerName != "" {
 		if expectedIdx, ok := lookupRoomEntityIndexByName(awaitingGameChoicePartnerName); ok && expectedIdx > 0 && expectedIdx == index {
 			indexMatch = true
 		}
 	}
-	// Fallback 2: look up the partner's chat index via the users28ByIndex cache.
 	if !indexMatch && !nameMatch && awaitingGameChoicePartnerName != "" {
 		if expectedIdx, ok := lookupUsers28RoomIndexByName(awaitingGameChoicePartnerName); ok && expectedIdx > 0 && expectedIdx == index {
 			indexMatch = true
 		}
 	}
-	// Fallback 3: if this incoming index maps to the same trade partner name, accept it.
 	if !indexMatch && !nameMatch {
-		partnerName := strings.TrimSpace(awaitingGameChoicePartnerName)
-		if partnerName == "" || strings.EqualFold(partnerName, "Unknown") {
-			partnerName = strings.TrimSpace(lastTradePartnerName)
-		}
-		if partnerName != "" && !strings.EqualFold(partnerName, "Unknown") {
-			if mappedName, ok := lookupRoomIdentityByChatIndex(index); ok {
-				if strings.EqualFold(strings.TrimSpace(mappedName), partnerName) {
-					nameMatch = true
-					senderName = mappedName
-					a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] accepted %q by partner-name match: index %d -> %q", choice, index, mappedName))
-				}
-			}
+		if mappedName, ok := lookupRoomIdentityByChatIndex(index); ok && awaitingGameChoicePartnerName != "" && strings.EqualFold(strings.TrimSpace(mappedName), awaitingGameChoicePartnerName) {
+			nameMatch = true
+			senderName = mappedName
 		}
 	}
 	if !indexMatch && !nameMatch {
-		partnerUnknown := strings.TrimSpace(awaitingGameChoicePartnerName) == "" || strings.EqualFold(strings.TrimSpace(awaitingGameChoicePartnerName), "Unknown")
-		senderKnown := strings.TrimSpace(senderName) != "" && !strings.EqualFold(strings.TrimSpace(senderName), "Unknown")
-		if partnerUnknown {
-			if senderKnown {
-				nameMatch = true
-				awaitingGameChoicePartnerName = strings.TrimSpace(senderName)
-				lastTradePartnerName = strings.TrimSpace(senderName)
-				if strings.TrimSpace(stableTradePartnerName) == "" || strings.EqualFold(stableTradePartnerName, "Unknown") {
-					stableTradePartnerName = strings.TrimSpace(senderName)
-				}
-				a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] accepted %q from resolved sender %q while partner name was unknown", choice, senderName))
-			} else if (awaitingGameChoicePartnerID <= 0 || awaitingGameChoicePartnerID > 512) && index > 0 && index <= 512 {
-				// Last-resort path when trade partner id is unresolved or in a different id space.
-				indexMatch = true
-				a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] accepted %q by index fallback (incoming=%d expected=%d partner=%q)", choice, index, awaitingGameChoicePartnerID, awaitingGameChoicePartnerName))
-			}
-		}
-	}
-	if !indexMatch && !nameMatch {
-		if awaitingGameChoice && awaitingGameChoicePartnerID == 0 && index > 0 && index <= 512 {
-			awaitingGameChoicePartnerID = index
-			lastTradePartnerID = index
-			if stableTradePartnerID <= 0 {
-				stableTradePartnerID = index
-			}
-			if strings.TrimSpace(senderName) != "" && !strings.EqualFold(strings.TrimSpace(senderName), "Unknown") {
-				resolvedName := normalizeUsername(strings.TrimSpace(senderName))
-				awaitingGameChoicePartnerName = resolvedName
-				lastTradePartnerName = resolvedName
-				if strings.TrimSpace(stableTradePartnerName) == "" || strings.EqualFold(stableTradePartnerName, "Unknown") {
-					stableTradePartnerName = resolvedName
-				}
-				if token, ok := lookupTokenByName(resolvedName); ok {
-					if strings.TrimSpace(lastTradePartnerToken) == "" {
-						lastTradePartnerToken = token
-					}
-					if strings.TrimSpace(stableTradePartnerToken) == "" {
-						stableTradePartnerToken = token
-					}
-				}
-			}
-			a.AddLogMsg(fmt.Sprintf("[GAME_SELECT_BIND] bound partner=%q to chat index %d from live chat", awaitingGameChoicePartnerName, awaitingGameChoicePartnerID))
-			indexMatch = true
-		}
-	}
-	if !indexMatch && !nameMatch {
-		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] ignoring %q from %q (index %d); waiting for %q (index %d)", choice, senderName, index, awaitingGameChoicePartnerName, awaitingGameChoicePartnerID))
+		a.AddLogMsg(fmt.Sprintf("[GAME_SELECT] ignoring %q from %q (index %d); waiting for locked starter %q (index %d trade_id=%d)", choice, senderName, index, awaitingGameChoicePartnerName, awaitingGameChoicePartnerID, tradeStarterTradeID))
 		return
 	}
 

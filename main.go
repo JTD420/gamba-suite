@@ -6491,10 +6491,7 @@ func (a *App) finalizeTriRound() {
 		playerWins = false
 	}
 
-	// TEMPORARY: force player to win Tri High for testing. Remove this block later.
-	if triMode == "high" {
-		playerWins = true
-	}
+	// Respect computed `playerWins`; removed temporary forced-win test code.
 
 	winnerName := "Dealer"
 	if playerWins {

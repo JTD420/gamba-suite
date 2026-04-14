@@ -82,6 +82,31 @@ def extract_entity_and_username(name_block: str) -> Dict[str, object]:
     num_ints = prefix_count_from_live_block(working)
     parsed_ints, remaining = read_fixed_vl64_prefix(working, num_ints)
 
+    # If the prefix parser consumed all remaining text, the last parsed
+    # chunk is likely the username rather than an integer prefix.
+    if not remaining and parsed_ints:
+        remaining = parsed_ints.pop()
+
+    # If the remaining username portion is very short (e.g. "on"), it's
+    # likely the true username was split across the final prefix chunks.
+    # Merge any trailing alphabetic chunks from parsed_ints into `remaining`.
+    if remaining is not None and len(remaining) <= 2 and parsed_ints:
+        while parsed_ints and parsed_ints[-1].isalpha():
+            candidate = parsed_ints[-1]
+            # Avoid swallowing chunks that look like lowercase+uppercase
+            # suffixes (e.g. "cucM") which are likely prefix fragments.
+            if re.match(r'^[a-z]+[A-Z]$', candidate):
+                break
+            remaining = parsed_ints.pop() + remaining
+
+    # Heuristic: sometimes the last parsed chunk is a short alphabetic
+    # fragment that belongs to the username (e.g. "D" + "rHabloon"). If
+    # so, prepend it to the username and drop it from parsed prefixes.
+    if parsed_ints and remaining:
+        last_chunk = parsed_ints[-1]
+        if len(last_chunk) <= 2 and last_chunk.isalpha() and remaining[0].isalpha():
+            remaining = parsed_ints.pop() + remaining
+
     chat_id_raw = parsed_ints[-2] if len(parsed_ints) >= 2 else ''
     trade_id_raw = parsed_ints[-1] if len(parsed_ints) >= 1 else ''
     entity_id = ''.join(parsed_ints)
@@ -104,10 +129,9 @@ def parse_users28(packet: bytes) -> List[Dict[str, object]]:
     for i, field in enumerate(fields):
         if not FIGURE_RE.match(field):
             continue
-        if i == 0:
-            continue
-
-        parsed = extract_entity_and_username(fields[i - 1])
+        # Allow index 0 (there may be no preceding field); use safe indexing.
+        name_block = fields[i - 1] if i > 0 else ''
+        parsed = extract_entity_and_username(name_block)
         sex = fields[i + 1] if i + 1 < len(fields) else ''
 
         motto = ''

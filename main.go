@@ -2462,6 +2462,9 @@ func startPayout(a *App, targetID int, targetName string) {
 					payoutTargetID = resolvedID
 				} else if resolvedID, ok := waitForUsers28NameIndex(targetName, 700*time.Millisecond); ok {
 					a.AddLogMsg(fmt.Sprintf("[PAYOUT_DEBUG] generic USERS28 name->index fallback produced %d for %s (current target %d)", resolvedID, targetName, targetID))
+					// Use the resolved room/users28 index as the outgoing target
+					targetID = resolvedID
+					payoutTargetID = resolvedID
 				}
 			}
 

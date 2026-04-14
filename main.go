@@ -1792,23 +1792,76 @@ func handleTradePacket(a *App, e *g.Intercept) {
 			allowed := false
 
 			if activeRound {
-				partnerName := strings.TrimSpace(lastTradePartnerName)
-				if partnerName != "" && !strings.EqualFold(partnerName, "Unknown") {
-					incomingTraderID := 0
-					if id, ok := decodeLeadingVL64(e.Packet.Data); ok {
-						incomingTraderID = id
+				// Strict trade-id validation: build a set of expected trade IDs
+				// derived from the current game state (starter, stable copy,
+				// last partner, payout target and any resolved awaiting partner).
+				incomingTraderID := 0
+				if id, ok := decodeLeadingVL64(e.Packet.Data); ok {
+					incomingTraderID = id
+				}
+
+				expectedIDs := map[int]struct{}{}
+				if tradeStarterTradeID > 0 {
+					expectedIDs[tradeStarterTradeID] = struct{}{}
+				}
+				if stableTradePartnerID > 0 {
+					expectedIDs[stableTradePartnerID] = struct{}{}
+				}
+				if lastTradePartnerID > 0 {
+					expectedIDs[lastTradePartnerID] = struct{}{}
+				}
+				if payoutTargetID > 0 {
+					expectedIDs[payoutTargetID] = struct{}{}
+				}
+
+				// If we have an awaiting partner name for the current choice,
+				// try to resolve its trade_id too.
+				awaitingName := strings.TrimSpace(awaitingGameChoicePartnerName)
+				if awaitingName != "" {
+					if id, ok := lookupUsers28TradeIDByName(awaitingName); ok {
+						expectedIDs[id] = struct{}{}
 					}
-					if expectedID, ok := lookupUsers28TradeIDByName(partnerName); ok {
-						a.AddLogMsg(fmt.Sprintf("[TRADE_BLOCK_DEBUG] active partner=%q expectedChatID=%d incomingChatID=%d", partnerName, expectedID, incomingTraderID))
-						if incomingTraderID > 0 && incomingTraderID == expectedID {
-							a.AddLogMsg(fmt.Sprintf("[TRADE_BLOCK] allowing trade from active partner %q by exact parsed chat_id match", partnerName))
+				}
+
+				partnerName := strings.TrimSpace(lastTradePartnerName)
+				// Also include partnerName-derived id for backwards compatibility
+				if partnerName != "" && !strings.EqualFold(partnerName, "Unknown") {
+					if id, ok := lookupUsers28TradeIDByName(partnerName); ok {
+						expectedIDs[id] = struct{}{}
+					}
+				}
+
+				// Diagnostic log of the check
+				a.AddLogMsg(fmt.Sprintf("[TRADE_BLOCK_DEBUG] incomingChatID=%d expectedIDs=%v partner=%q activeRound=%t", incomingTraderID, expectedIDs, partnerName, activeRound))
+
+				// If we resolved any expected IDs, require an exact match.
+				matched := false
+				if len(expectedIDs) > 0 {
+					if incomingTraderID > 0 {
+						if _, ok := expectedIDs[incomingTraderID]; ok {
+							matched = true
+							a.AddLogMsg(fmt.Sprintf("[TRADE_BLOCK] allowing trade by exact trade_id match (%d)", incomingTraderID))
 							allowed = true
 						}
 					}
 				}
 
+				// Fallback: keep previous behavior when no expected IDs were
+				// resolvable (best-effort name->trade_id match).
+				if !matched && len(expectedIDs) == 0 {
+					if partnerName != "" && !strings.EqualFold(partnerName, "Unknown") {
+						if expectedID, ok := lookupUsers28TradeIDByName(partnerName); ok {
+							a.AddLogMsg(fmt.Sprintf("[TRADE_BLOCK_DEBUG] fallback active partner=%q expectedChatID=%d incomingChatID=%d", partnerName, expectedID, incomingTraderID))
+							if incomingTraderID > 0 && incomingTraderID == expectedID {
+								a.AddLogMsg(fmt.Sprintf("[TRADE_BLOCK] allowing trade from active partner %q by fallback parsed chat_id match", partnerName))
+								allowed = true
+							}
+						}
+					}
+				}
+
 				if !allowed {
-					a.AddLogMsg("[TRADE_BLOCK] incoming trade blocked during active round")
+					a.AddLogMsg("[TRADE_BLOCK] incoming trade blocked during active round (trade_id mismatch)")
 
 					// Detailed guard state for diagnostics
 					a.AddLogMsg(fmt.Sprintf("[TRADE_GUARD] block reason=%s awaitingTradeOpen=%t dealerTradeWindowOpen=%t dealerGameActive=%t dealerResyncInProgress=%t", "incoming blocked during active round", awaitingTradeOpen, dealerTradeWindowOpen, dealerGameActive(), dealerResyncInProgress))
@@ -6436,6 +6489,11 @@ func (a *App) finalizeTriRound() {
 		playerWins = triPlayerTotal < triDealerTotal
 	default:
 		playerWins = false
+	}
+
+	// TEMPORARY: force player to win Tri High for testing. Remove this block later.
+	if triMode == "high" {
+		playerWins = true
 	}
 
 	winnerName := "Dealer"

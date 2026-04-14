@@ -15,6 +15,22 @@ import (
 func sendMessageWithDelay(message string) {
 	// sleep random between 250 and 500ms
 	time.Sleep(time.Duration(rand.Intn(250)+250) * time.Millisecond)
+	// Ensure we have an up-to-date frozen hand snapshot before posting the
+	// canonical "dealer open" announcement. This avoids announcing that we're
+	// open before inventory is ready for coverage checks.
+	if app != nil && strings.TrimSpace(message) == app.dealerOpenMessage() {
+		// Only enforce when strict snapshot lifecycle is active and a snapshot
+		// is not already ready. Avoids re-syncing on every periodic repost.
+		if strictTradeSnapshotLifecycle && !dealerSnapshotReady() {
+			app.AddLogMsg("[TRADE_HAND_SNAPSHOT] pre-dealer-open sync requested (sendMessageWithDelay)")
+			ok := app.forceRefreshHandSnapshot("sendMessageWithDelay: dealer open")
+			if !ok {
+				app.AddLogMsg("[TRADE_HAND_SNAPSHOT] forced refresh failed; skipping dealer open shout")
+				return
+			}
+		}
+	}
+
 	ext.Send(out.SHOUT, message)
 	log.Printf("Sent message: %s", message)
 }
